@@ -6,6 +6,11 @@ class LastWindowPosition {
 
     private let positionKey = "NSWindowLastPosition"
 
+    // Only the first window per app launch restores the saved position; subsequent
+    // new windows fall through to the normal cascade placement so they don't stack
+    // on top of the previously-focused window.
+    private var didRestoreOnce = false
+
     @discardableResult
     func save(_ window: NSWindow?) -> Bool {
         // We should only save the frame if the window is visible.
@@ -30,6 +35,8 @@ class LastWindowPosition {
     /// - Returns: `true` if the frame was modified, `false` if there was nothing to restore.
     @discardableResult
     func restore(_ window: NSWindow, origin restoreOrigin: Bool = true, size restoreSize: Bool = true) -> Bool {
+        // First window per launch restores; later windows fall through to cascade placement.
+        guard !didRestoreOnce else { return false }
         guard restoreOrigin || restoreSize else { return false }
 
         guard let values = UserDefaults.ghostty.array(forKey: positionKey) as? [Double],
@@ -62,6 +69,7 @@ class LastWindowPosition {
         }
 
         window.setFrame(newFrame, display: true)
+        didRestoreOnce = true
         return true
     }
 }
