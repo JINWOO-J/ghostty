@@ -6,6 +6,11 @@ class LastWindowPosition {
 
     private let positionKey = "NSWindowLastPosition"
 
+    // Only the first window per app launch restores the saved position; subsequent
+    // new windows fall through to the normal cascade placement so they don't stack
+    // on top of the previously-focused window.
+    private var didRestoreOnce = false
+
     func save(_ window: NSWindow) {
         let origin = window.frame.origin
         let point = [origin.x, origin.y]
@@ -13,6 +18,8 @@ class LastWindowPosition {
     }
 
     func restore(_ window: NSWindow) -> Bool {
+        guard !didRestoreOnce else { return false }
+
         guard let points = UserDefaults.standard.array(forKey: positionKey) as? [Double],
               points.count == 2 else { return false }
 
@@ -29,6 +36,7 @@ class LastWindowPosition {
         }
 
         window.setFrame(newFrame, display: true)
+        didRestoreOnce = true
         return true
     }
 }
