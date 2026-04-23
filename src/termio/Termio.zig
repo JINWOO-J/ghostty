@@ -709,6 +709,12 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
         log.warn("failed to get current time err={}", .{err});
     }
 
+    // Forward raw PTY bytes to any registered peer-federation tap.
+    // The mutex is already held here; the callback must be non-blocking.
+    if (self.renderer_state.pty_tap) |tap| {
+        tap.cb(tap.userdata, buf.ptr, buf.len);
+    }
+
     // If we have an inspector, we enter SLOW MODE because we need to
     // process a byte at a time alternating between the inspector handler
     // and the termio handler. This is very slow compared to our optimizations
