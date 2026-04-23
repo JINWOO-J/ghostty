@@ -20,6 +20,11 @@ terminal: *terminalpkg.Terminal,
 /// is not active and will be set when it is active.
 inspector: ?*Inspector = null,
 
+/// Raw PTY byte tap for peer federation. When set, every PTY output
+/// chunk is forwarded to the callback before being parsed. The callback
+/// is always invoked under this struct's mutex and MUST be non-blocking.
+pty_tap: ?PtyTap = null,
+
 /// Dead key state. This will render the current dead key preedit text
 /// over the cursor. This currently only ever renders a single codepoint.
 /// Preedit can in theory be multiple codepoints long but that is left as
@@ -29,6 +34,12 @@ preedit: ?Preedit = null,
 /// Mouse state. This only contains state relevant to what renderers
 /// need about the mouse.
 mouse: Mouse = .{},
+
+/// C-callable callback type for the PTY data tap (peer federation).
+pub const PtyTap = struct {
+    cb: *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void,
+    userdata: ?*anyopaque,
+};
 
 pub const Mouse = struct {
     /// The point on the viewport where the mouse currently is. We use

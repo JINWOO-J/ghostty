@@ -2245,3 +2245,21 @@ pub const CAPI = struct {
         }
     };
 };
+
+// MARK: - PTY data tap (peer federation, term-mesh fork)
+
+export fn ghostty_surface_set_pty_data_callback(
+    surface: *Surface,
+    cb: *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void,
+    userdata: ?*anyopaque,
+) void {
+    surface.core_surface.renderer_state.mutex.lock();
+    defer surface.core_surface.renderer_state.mutex.unlock();
+    surface.core_surface.renderer_state.pty_tap = .{ .cb = cb, .userdata = userdata };
+}
+
+export fn ghostty_surface_clear_pty_data_callback(surface: *Surface) void {
+    surface.core_surface.renderer_state.mutex.lock();
+    defer surface.core_surface.renderer_state.mutex.unlock();
+    surface.core_surface.renderer_state.pty_tap = null;
+}
