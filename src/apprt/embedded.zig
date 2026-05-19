@@ -1656,7 +1656,13 @@ pub const CAPI = struct {
         return true;
     }
 
-    export fn ghostty_surface_free_text(ptr: *Text) void {
+    export fn ghostty_surface_free_text(surface: *Surface, ptr: *Text) void {
+        // The `surface` parameter is required to match the C header ABI
+        // (ghostty.h declares this as a 2-arg function). Swift callers pass
+        // (surface, &text); without this parameter the ABI mismatch caused the
+        // first argument (surface) to be deinit'd as a Text and the real text
+        // buffer to leak on every call. See term-mesh memory-leak investigation.
+        _ = surface;
         ptr.deinit();
     }
 
