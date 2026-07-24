@@ -298,6 +298,13 @@ pub const App = struct {
         comptime action: apprt.Action.Key,
         value: apprt.Action.Value(action),
     ) !bool {
+        const userdata_lease: ?SurfaceUserdata.Lease = switch (target) {
+            .app => null,
+            .surface => |surface| surface.rt_surface.userdata.acquire() orelse
+                return false,
+        };
+        defer if (userdata_lease) |lease| lease.release();
+
         // Special case certain actions before they are sent to the
         // embedded apprt.
         self.performPreAction(target, action, value);
@@ -671,23 +678,116 @@ pub const UserdataReleaseCallback = *const fn (?*anyopaque) callconv(.c) void;
 
 const SurfaceUserdata = struct {
     value: ?*anyopaque = null,
-    release_cb: ?UserdataReleaseCallback = null,
+    state: State = .borrowed,
 
-    fn init(
+    const State = union(enum) {
+        borrowed,
+        owned: *Lifetime,
+        released,
+    };
+
+    const Lifetime = struct {
+        alloc: Allocator,
         value: ?*anyopaque,
         release_cb: UserdataReleaseCallback,
-    ) SurfaceUserdata {
+        references: std.atomic.Value(usize) = .{ .raw = 1 },
+
+        fn tryRetain(self: *Lifetime) bool {
+            var count = self.references.load(.seq_cst);
+            while (count > 0) {
+                assert(count < std.math.maxInt(usize));
+                if (self.references.cmpxchgWeak(
+                    count,
+                    count + 1,
+                    .seq_cst,
+                    .seq_cst,
+                )) |actual| {
+                    count = actual;
+                } else {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        fn release(self: *Lifetime) void {
+            const previous = self.references.fetchSub(1, .seq_cst);
+            assert(previous > 0);
+            if (previous != 1) return;
+
+            const alloc = self.alloc;
+            const value = self.value;
+            const release_cb = self.release_cb;
+            release_cb(value);
+            alloc.destroy(self);
+        }
+    };
+
+    const Lease = struct {
+        lifetime: ?*Lifetime,
+
+        fn release(self: Lease) void {
+            if (self.lifetime) |lifetime| lifetime.release();
+        }
+    };
+
+    fn init(
+        alloc: Allocator,
+        value: ?*anyopaque,
+        release_cb: ?UserdataReleaseCallback,
+    ) Allocator.Error!SurfaceUserdata {
+        const callback = release_cb orelse return .{ .value = value };
+        const lifetime = try alloc.create(Lifetime);
+        lifetime.* = .{
+            .alloc = alloc,
+            .value = value,
+            .release_cb = callback,
+        };
         return .{
             .value = value,
-            .release_cb = release_cb,
+            .state = .{ .owned = lifetime },
         };
     }
 
-    fn deinit(self: *SurfaceUserdata) void {
-        const release_cb = self.release_cb orelse return;
-        self.release_cb = null;
-        release_cb(self.value);
+    fn acquire(self: *const SurfaceUserdata) ?Lease {
+        return switch (self.state) {
+            .borrowed => .{ .lifetime = null },
+            .owned => |lifetime| if (lifetime.tryRetain())
+                .{ .lifetime = lifetime }
+            else
+                null,
+            .released => null,
+        };
+    }
+
+    fn abort(self: *SurfaceUserdata) void {
+        const lifetime = switch (self.state) {
+            .owned => |lifetime| lifetime,
+            .borrowed, .released => {
+                self.state = .released;
+                self.value = null;
+                return;
+            },
+        };
+        self.state = .released;
         self.value = null;
+        assert(lifetime.references.load(.seq_cst) == 1);
+        lifetime.alloc.destroy(lifetime);
+    }
+
+    fn deinit(self: *SurfaceUserdata) void {
+        const lifetime = switch (self.state) {
+            .owned => |lifetime| lifetime,
+            .borrowed, .released => {
+                self.state = .released;
+                self.value = null;
+                return;
+            },
+        };
+        self.state = .released;
+        self.value = null;
+        lifetime.release();
     }
 };
 
@@ -814,13 +914,17 @@ pub const Surface = struct {
         scrollback_limit_bytes: usize,
         userdata_release_cb: ?UserdataReleaseCallback,
     ) !void {
+        var userdata = try SurfaceUserdata.init(
+            app.core_app.alloc,
+            opts.userdata,
+            userdata_release_cb,
+        );
+        errdefer userdata.abort();
+
         self.* = .{
             .app = app,
             .platform = try .init(opts.platform_tag, opts.platform),
-            .userdata = if (userdata_release_cb) |release_cb|
-                .init(opts.userdata, release_cb)
-            else
-                .{ .value = opts.userdata },
+            .userdata = userdata,
             .core_surface = undefined,
             .content_scale = .{
                 .x = @floatCast(opts.scale_factor),
@@ -1071,22 +1175,26 @@ pub const Surface = struct {
         return self.app;
     }
 
-    pub fn close(self: *const Surface, process_alive: bool) void {
+    pub fn close(self: *Surface, process_alive: bool) void {
         const func = self.app.opts.close_surface orelse {
             log.info("runtime embedder does not support closing a surface", .{});
             return;
         };
+        const userdata_lease = self.userdata.acquire() orelse return;
+        defer userdata_lease.release();
 
         func(self.userdata.value, process_alive);
     }
 
     pub fn tmuxControl(
-        self: *const Surface,
+        self: *Surface,
         event: apprt.surface.Message.TmuxControlMsg.Event,
         id: u32,
         data: []const u8,
     ) void {
         const func = self.app.opts.tmux_control orelse return;
+        const userdata_lease = self.userdata.acquire() orelse return;
+        defer userdata_lease.release();
         func(self.userdata.value, event, id, data.ptr, data.len);
     }
 
@@ -1115,30 +1223,68 @@ pub const Surface = struct {
     }
 
     pub fn ioWriteCallback(self: *const Surface) ?IoWriteCallback {
-        return self.io_write_cb;
+        return if (self.io_write_cb != null) ioWrite else null;
     }
 
     pub fn ioWriteUserdata(self: *const Surface) ?*anyopaque {
-        return self.io_write_userdata;
+        return if (self.io_write_cb != null) @constCast(self) else null;
+    }
+
+    fn ioWrite(
+        userdata: ?*anyopaque,
+        data: [*]const u8,
+        len: usize,
+    ) callconv(.c) void {
+        const self: *Surface = @ptrCast(@alignCast(userdata.?));
+        const callback = self.io_write_cb orelse return;
+        const userdata_lease = self.userdata.acquire() orelse return;
+        defer userdata_lease.release();
+        callback(self.io_write_userdata, data, len);
     }
 
     pub fn ptyTeeCallback(self: *const Surface) ?PtyTeeCallback {
-        return self.pty_tee_cb;
+        return if (self.pty_tee_cb != null) ptyTee else null;
     }
 
     pub fn ptyTeeUserdata(self: *const Surface) ?*anyopaque {
-        return self.pty_tee_userdata;
+        return if (self.pty_tee_cb != null) @constCast(self) else null;
+    }
+
+    fn ptyTee(
+        userdata: ?*anyopaque,
+        data: [*]const u8,
+        len: usize,
+    ) callconv(.c) void {
+        const self: *Surface = @ptrCast(@alignCast(userdata.?));
+        const callback = self.pty_tee_cb orelse return;
+        const userdata_lease = self.userdata.acquire() orelse return;
+        defer userdata_lease.release();
+        callback(self.pty_tee_userdata, data, len);
     }
 
     pub fn suppressTerminalResponses(self: *const Surface) bool {
         return self.io_mode.suppressesTerminalResponses();
     }
 
-    pub fn rendererInstrumentation(self: *const Surface) renderer.Instrumentation {
+    pub fn rendererInstrumentation(self: *Surface) renderer.Instrumentation {
         return .{
-            .callback = self.renderer_event_cb,
-            .userdata = self.userdata.value,
+            .callback = if (self.renderer_event_cb != null)
+                rendererEvent
+            else
+                null,
+            .userdata = self,
         };
+    }
+
+    fn rendererEvent(
+        userdata: ?*anyopaque,
+        event: renderer.InstrumentationEvent,
+    ) callconv(.c) void {
+        const self: *Surface = @ptrCast(@alignCast(userdata.?));
+        const callback = self.renderer_event_cb orelse return;
+        const userdata_lease = self.userdata.acquire() orelse return;
+        defer userdata_lease.release();
+        callback(self.userdata.value, event);
     }
 
     pub fn getTitle(self: *Surface) ?[:0]const u8 {
@@ -1169,6 +1315,8 @@ pub const Surface = struct {
         errdefer alloc.destroy(state_ptr);
         state_ptr.* = state;
 
+        const userdata_lease = self.userdata.acquire() orelse return false;
+        defer userdata_lease.release();
         const started = self.app.opts.read_clipboard(
             self.userdata.value,
             @intCast(@intFromEnum(clipboard_type)),
@@ -1200,6 +1348,8 @@ pub const Surface = struct {
             error.UnsafePaste,
             error.UnauthorizedPaste,
             => {
+                const userdata_lease = self.userdata.acquire() orelse return;
+                defer userdata_lease.release();
                 self.app.opts.confirm_read_clipboard(
                     self.userdata.value,
                     str.ptr,
@@ -1219,7 +1369,7 @@ pub const Surface = struct {
     }
 
     pub fn setClipboard(
-        self: *const Surface,
+        self: *Surface,
         clipboard_type: apprt.Clipboard,
         contents: []const apprt.ClipboardContent,
         confirm: bool,
@@ -1234,6 +1384,8 @@ pub const Surface = struct {
             };
         }
 
+        const userdata_lease = self.userdata.acquire() orelse return;
+        defer userdata_lease.release();
         self.app.opts.write_clipboard(
             self.userdata.value,
             @intCast(@intFromEnum(clipboard_type)),
@@ -1267,16 +1419,27 @@ pub const Surface = struct {
     }
 
     pub fn renderNowWithToken(self: *Surface, token: u64) void {
-        const callback = self.render_presented_cb orelse {
+        if (self.render_presented_cb == null) {
             self.renderNow();
             return;
-        };
+        }
         self.core_surface.applyPendingResizeIfNeeded();
         self.core_surface.renderer_thread.renderNowWithPresentation(.{
-            .callback = callback,
-            .userdata = self.render_presented_userdata,
+            .callback = renderPresented,
+            .userdata = self,
             .token = token,
         });
+    }
+
+    fn renderPresented(
+        userdata: ?*anyopaque,
+        token: u64,
+    ) callconv(.c) void {
+        const self: *Surface = @ptrCast(@alignCast(userdata.?));
+        const callback = self.render_presented_cb orelse return;
+        const userdata_lease = self.userdata.acquire() orelse return;
+        defer userdata_lease.release();
+        callback(self.render_presented_userdata, token);
     }
 
     pub fn updateContentScale(self: *Surface, x: f64, y: f64) void {
@@ -1547,20 +1710,6 @@ test "surface action lifetime defers owner destruction until lease release" {
 }
 
 test "owned surface userdata releases after final action lease" {
-    const OwnedUserdata = if (@hasDecl(@This(), "SurfaceUserdata"))
-        @field(@This(), "SurfaceUserdata")
-    else
-        struct {
-            fn init(
-                _: ?*anyopaque,
-                _: *const fn (?*anyopaque) callconv(.c) void,
-            ) @This() {
-                return .{};
-            }
-
-            fn deinit(_: *@This()) void {}
-        };
-
     const ReleaseState = struct {
         releases: usize = 0,
 
@@ -1571,7 +1720,11 @@ test "owned surface userdata releases after final action lease" {
     };
 
     var state: ReleaseState = .{};
-    var userdata = OwnedUserdata.init(&state, ReleaseState.release);
+    var userdata = try SurfaceUserdata.init(
+        std.testing.allocator,
+        &state,
+        ReleaseState.release,
+    );
     var lifetime: SurfaceActionLifetime = .{};
     lifetime.retain();
 
@@ -1586,19 +1739,6 @@ test "owned surface userdata releases after final action lease" {
 }
 
 test "owned surface userdata remains alive through host callback lease" {
-    const CallbackLifetime = if (@hasDecl(SurfaceActionLifetime, "tryRetain"))
-        SurfaceActionLifetime
-    else
-        struct {
-            fn tryRetain(_: *@This()) bool {
-                return false;
-            }
-
-            fn release(_: *@This()) bool {
-                return false;
-            }
-        };
-
     const ReleaseState = struct {
         releases: usize = 0,
 
@@ -1609,14 +1749,18 @@ test "owned surface userdata remains alive through host callback lease" {
     };
 
     var state: ReleaseState = .{};
-    var userdata = SurfaceUserdata.init(&state, ReleaseState.release);
-    var lifetime: CallbackLifetime = .{};
+    var userdata = try SurfaceUserdata.init(
+        std.testing.allocator,
+        &state,
+        ReleaseState.release,
+    );
+    const callback_lease = userdata.acquire().?;
 
-    try std.testing.expect(lifetime.tryRetain());
-    if (lifetime.release()) userdata.deinit();
+    userdata.deinit();
     try std.testing.expectEqual(@as(usize, 0), state.releases);
+    try std.testing.expect(userdata.acquire() == null);
 
-    if (lifetime.release()) userdata.deinit();
+    callback_lease.release();
     try std.testing.expectEqual(@as(usize, 1), state.releases);
 }
 
