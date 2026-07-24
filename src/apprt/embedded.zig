@@ -1576,6 +1576,69 @@ test "surface action lifetime defers owner destruction until lease release" {
     try std.testing.expect(lifetime.release());
 }
 
+test "surface teardown waits for a cross-thread action lease" {
+    const Lifetime = if (@hasDecl(@This(), "SurfaceActionLifetime"))
+        @field(@This(), "SurfaceActionLifetime")
+    else
+        struct {};
+
+    if (comptime @hasDecl(Lifetime, "waitForActionsBeforeTeardown") and
+        @hasDecl(Lifetime, "releaseAction"))
+    {
+        const Context = struct {
+            lifetime: *Lifetime,
+            action_ready: std.Thread.ResetEvent = .{},
+            allow_action_return: std.Thread.ResetEvent = .{},
+            teardown_started: std.Thread.ResetEvent = .{},
+            teardown_finished: std.Thread.ResetEvent = .{},
+            action_released_final: std.atomic.Value(bool) = .{ .raw = true },
+
+            fn runAction(self: *@This()) void {
+                self.lifetime.retain();
+                self.action_ready.set();
+                self.allow_action_return.wait();
+                self.action_released_final.store(
+                    self.lifetime.releaseAction(),
+                    .release,
+                );
+            }
+
+            fn runTeardown(self: *@This()) void {
+                self.action_ready.wait();
+                self.teardown_started.set();
+                self.lifetime.waitForActionsBeforeTeardown();
+                self.teardown_finished.set();
+            }
+        };
+
+        var lifetime: Lifetime = .{};
+        var context: Context = .{ .lifetime = &lifetime };
+        const action_thread = try std.Thread.spawn(.{}, Context.runAction, .{&context});
+        defer action_thread.join();
+        const teardown_thread = try std.Thread.spawn(.{}, Context.runTeardown, .{&context});
+        defer teardown_thread.join();
+        defer context.allow_action_return.set();
+
+        context.teardown_started.wait();
+        try std.testing.expectError(
+            error.Timeout,
+            context.teardown_finished.timedWait(20 * std.time.ns_per_ms),
+        );
+
+        context.allow_action_return.set();
+        context.teardown_finished.wait();
+        try std.testing.expect(
+            !context.action_released_final.load(.acquire),
+        );
+        try std.testing.expectEqual(
+            @as(usize, 1),
+            lifetime.countForTesting(),
+        );
+    } else {
+        try std.testing.expect(false);
+    }
+}
+
 // The cmux integration combines the OpenGL platform payload (the largest
 // Platform.C variant) with the startup PTY tee fields. Keep the resulting C
 // layout pinned so every exact-revision consumer fails loudly on drift.
