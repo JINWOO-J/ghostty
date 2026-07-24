@@ -1764,6 +1764,66 @@ test "owned surface userdata remains alive through host callback lease" {
     try std.testing.expectEqual(@as(usize, 1), state.releases);
 }
 
+test "post-construction PTY tee retains owned userdata through callback" {
+    const ReleaseState = struct {
+        releases: usize = 0,
+
+        fn release(userdata: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.releases += 1;
+        }
+    };
+
+    const CallbackState = struct {
+        surface: *Surface,
+        release_state: *ReleaseState,
+        releases_during_callback: usize = 0,
+
+        fn callback(
+            userdata: ?*anyopaque,
+            _: [*]const u8,
+            _: usize,
+        ) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.surface.userdata.deinit();
+            self.releases_during_callback = self.release_state.releases;
+        }
+    };
+
+    var release_state: ReleaseState = .{};
+    var surface: Surface = undefined;
+    surface.userdata = try SurfaceUserdata.init(
+        std.testing.allocator,
+        &release_state,
+        ReleaseState.release,
+    );
+    surface.pty_tee_cb = null;
+    surface.pty_tee_userdata = null;
+
+    var callback_state: CallbackState = .{
+        .surface = &surface,
+        .release_state = &release_state,
+    };
+    CAPI.ghostty_surface_set_pty_tee_cb(
+        &surface,
+        CallbackState.callback,
+        &callback_state,
+    );
+
+    const data = "x";
+    surface.core_surface.io.pty_tee_cb.?(
+        surface.core_surface.io.pty_tee_userdata,
+        data.ptr,
+        data.len,
+    );
+
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        callback_state.releases_during_callback,
+    );
+    try std.testing.expectEqual(@as(usize, 1), release_state.releases);
+}
+
 // The cmux integration combines the OpenGL platform payload (the largest
 // Platform.C variant) with the startup PTY tee fields. Keep the resulting C
 // layout pinned so every exact-revision consumer fails loudly on drift.
