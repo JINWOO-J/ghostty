@@ -1262,6 +1262,17 @@ pub const Surface = struct {
         callback(self.pty_tee_userdata, data, len);
     }
 
+    fn setPtyTeeCallback(
+        self: *Surface,
+        callback: ?PtyTeeCallback,
+        userdata: ?*anyopaque,
+    ) void {
+        self.pty_tee_cb = callback;
+        self.pty_tee_userdata = userdata;
+        self.core_surface.io.pty_tee_cb = if (callback != null) ptyTee else null;
+        self.core_surface.io.pty_tee_userdata = if (callback != null) self else null;
+    }
+
     pub fn suppressTerminalResponses(self: *const Surface) bool {
         return self.io_mode.suppressesTerminalResponses();
     }
@@ -3977,11 +3988,10 @@ pub const CAPI = struct {
     /// matching grid. Upstream candidate.
     export fn ghostty_surface_set_pty_tee_cb(
         surface: *Surface,
-        cb: ?*const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void,
+        cb: ?PtyTeeCallback,
         userdata: ?*anyopaque,
     ) void {
-        surface.core_surface.io.pty_tee_cb = cb;
-        surface.core_surface.io.pty_tee_userdata = userdata;
+        surface.setPtyTeeCallback(cb, userdata);
     }
 
     /// Returns true if the surface currently has mouse capturing
