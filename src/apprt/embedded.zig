@@ -1029,26 +1029,36 @@ pub const Surface = struct {
     }
 
     pub fn deinit(self: *Surface) void {
-        // Stop new app actions before releasing the embedder's owner
-        // reference. An action already in progress retains this allocation and
-        // performs the final destruction after its reentrant host callback
-        // returns.
-        self.app.core_app.deleteSurface(self);
-        if (self.app_action_lifetime.release()) self.destroy();
+        self.deinitWith(destroyContents);
     }
 
-    /// Retain the opaque embedded surface while an app action is dispatched.
-    /// The core app calls this only while holding its surface registry lock,
-    /// so teardown cannot remove and release the owner reference first.
+    fn deinitWith(
+        self: *Surface,
+        comptime deinit_contents: fn (*Surface) void,
+    ) void {
+        const alloc = self.app.core_app.alloc;
+
+        // Stop new app actions first. Existing actions retain only this outer
+        // allocation, not the live renderer, IO, or callback state.
+        self.app.core_app.deleteSurface(self);
+        deinit_contents(self);
+        if (self.app_action_lifetime.release()) alloc.destroy(self);
+    }
+
+    /// Retain the opaque embedded surface allocation while an app action is
+    /// dispatched. Core teardown remains synchronous so host-owned callback
+    /// userdata may still be released when ghostty_surface_free returns.
     pub fn retainForAppAction(self: *Surface) void {
         self.app_action_lifetime.retain();
     }
 
     pub fn releaseForAppAction(self: *Surface) void {
-        if (self.app_action_lifetime.release()) self.destroy();
+        if (self.app_action_lifetime.release()) {
+            self.app.core_app.alloc.destroy(self);
+        }
     }
 
-    fn destroy(self: *Surface) void {
+    fn destroyContents(self: *Surface) void {
         const alloc = self.app.core_app.alloc;
 
         // Shut down our inspector
@@ -1059,7 +1069,6 @@ pub const Surface = struct {
 
         // Clean up our core surface so that all the rendering and IO stop.
         self.core_surface.deinit();
-        alloc.destroy(self);
     }
 
     /// Initialize the inspector instance. A surface can only have one
