@@ -664,15 +664,67 @@ pub const RenderPresentedCallback = *const fn (?*anyopaque, u64) callconv(.c) vo
 
 const SurfaceActionLifetime = struct {
     references: std.atomic.Value(usize) = .{ .raw = 1 },
+    mutex: std.Thread.Mutex = .{},
+    drained: std.Thread.Condition = .{},
+    active_actions: usize = 0,
+    active_thread: ?std.Thread.Id = null,
+    teardown_started: bool = false,
 
     fn retain(self: *SurfaceActionLifetime) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        assert(!self.teardown_started);
+        const current_thread = std.Thread.getCurrentId();
+        if (self.active_thread) |active_thread| {
+            // App mailbox actions are serialized. Nested actions are valid,
+            // but concurrent action dispatch from another thread is not.
+            assert(active_thread == current_thread);
+        } else {
+            self.active_thread = current_thread;
+        }
+        self.active_actions += 1;
+
         const previous = self.references.fetchAdd(1, .seq_cst);
         assert(previous > 0);
         assert(previous < std.math.maxInt(usize));
     }
 
-    /// Returns true when the caller released the final reference.
-    fn release(self: *SurfaceActionLifetime) bool {
+    /// Wait for an action running on another thread. A free re-entering from
+    /// the current host callback must continue immediately to avoid deadlock;
+    /// that callback's lease still keeps the outer allocation alive.
+    fn waitForActionsBeforeTeardown(self: *SurfaceActionLifetime) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        self.teardown_started = true;
+        const current_thread = std.Thread.getCurrentId();
+        while (self.active_actions > 0 and
+            self.active_thread.? != current_thread)
+        {
+            self.drained.wait(&self.mutex);
+        }
+    }
+
+    /// Returns true when an action released the final allocation reference.
+    fn releaseAction(self: *SurfaceActionLifetime) bool {
+        self.mutex.lock();
+        assert(self.active_actions > 0);
+        assert(self.active_thread.? == std.Thread.getCurrentId());
+        self.active_actions -= 1;
+        if (self.active_actions == 0) {
+            self.active_thread = null;
+            self.drained.broadcast();
+        }
+        self.mutex.unlock();
+
+        const previous = self.references.fetchSub(1, .seq_cst);
+        assert(previous > 0);
+        return previous == 1;
+    }
+
+    /// Returns true when the surface owner released the final reference.
+    fn releaseOwner(self: *SurfaceActionLifetime) bool {
         const previous = self.references.fetchSub(1, .seq_cst);
         assert(previous > 0);
         return previous == 1;
@@ -1038,11 +1090,13 @@ pub const Surface = struct {
     ) void {
         const alloc = self.app.core_app.alloc;
 
-        // Stop new app actions first. Existing actions retain only this outer
-        // allocation, not the live renderer, IO, or callback state.
+        // Stop new app actions first. Wait for an action on another thread;
+        // a reentrant action on this thread retains the outer allocation while
+        // the live renderer, IO, and callback state are torn down.
         self.app.core_app.deleteSurface(self);
+        self.app_action_lifetime.waitForActionsBeforeTeardown();
         deinit_contents(self);
-        if (self.app_action_lifetime.release()) alloc.destroy(self);
+        if (self.app_action_lifetime.releaseOwner()) alloc.destroy(self);
     }
 
     /// Retain the opaque embedded surface allocation while an app action is
@@ -1053,7 +1107,7 @@ pub const Surface = struct {
     }
 
     pub fn releaseForAppAction(self: *Surface) void {
-        if (self.app_action_lifetime.release()) {
+        if (self.app_action_lifetime.releaseAction()) {
             self.app.core_app.alloc.destroy(self);
         }
     }
@@ -1565,15 +1619,20 @@ test "surface action lifetime defers owner destruction until lease release" {
     else
         struct {
             fn retain(_: *@This()) void {}
-            fn release(_: *@This()) bool {
+            fn waitForActionsBeforeTeardown(_: *@This()) void {}
+            fn releaseOwner(_: *@This()) bool {
+                return false;
+            }
+            fn releaseAction(_: *@This()) bool {
                 return false;
             }
         };
 
     var lifetime: Lifetime = .{};
     lifetime.retain();
-    try std.testing.expect(!lifetime.release());
-    try std.testing.expect(lifetime.release());
+    lifetime.waitForActionsBeforeTeardown();
+    try std.testing.expect(!lifetime.releaseOwner());
+    try std.testing.expect(lifetime.releaseAction());
 }
 
 test "surface teardown waits for a cross-thread action lease" {
@@ -3775,9 +3834,11 @@ pub const CAPI = struct {
     /// matching grid. Upstream candidate.
     export fn ghostty_surface_set_pty_tee_cb(
         surface: *Surface,
-        cb: ?*const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void,
+        cb: ?PtyTeeCallback,
         userdata: ?*anyopaque,
     ) void {
+        surface.pty_tee_cb = cb;
+        surface.pty_tee_userdata = userdata;
         surface.core_surface.io.pty_tee_cb = cb;
         surface.core_surface.io.pty_tee_userdata = userdata;
     }
