@@ -684,6 +684,61 @@ const SurfaceActionLifetime = struct {
     }
 };
 
+test "embedded surface teardown completes before a retained action returns" {
+    if (comptime !@hasDecl(Surface, "deinitWith")) {
+        try std.testing.expect(false);
+        return;
+    }
+
+    const Callbacks = struct {
+        fn wakeup(_: ?*anyopaque) callconv(.c) void {}
+
+        fn action(
+            _: *App,
+            _: apprt.Target.C,
+            _: apprt.Action.C,
+        ) callconv(.c) bool {
+            return true;
+        }
+
+        fn teardown(surface: *Surface) void {
+            const completed: *bool = @ptrCast(@alignCast(surface.userdata.?));
+            completed.* = true;
+        }
+    };
+
+    var core_app: CoreApp = undefined;
+    try core_app.init(std.testing.allocator);
+    defer {
+        core_app.surfaces.deinit(std.testing.allocator);
+        core_app.font_grid_set.deinit();
+    }
+
+    var rt_app: App = undefined;
+    rt_app.core_app = &core_app;
+    rt_app.opts = undefined;
+    rt_app.opts.action = Callbacks.action;
+    rt_app.opts.wakeup = Callbacks.wakeup;
+
+    var teardown_completed = false;
+    var surface: Surface = undefined;
+    surface.app = &rt_app;
+    surface.userdata = &teardown_completed;
+    surface.core_surface.id = 22;
+    surface.app_action_lifetime = .{};
+    try core_app.surfaces.append(std.testing.allocator, &surface);
+
+    surface.retainForAppAction();
+    surface.deinitWith(Callbacks.teardown);
+
+    try std.testing.expect(teardown_completed);
+    try std.testing.expectEqual(@as(usize, 0), core_app.surfaces.items.len);
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        surface.app_action_lifetime.countForTesting(),
+    );
+}
+
 pub const Surface = struct {
     app: *App,
     platform: Platform,
