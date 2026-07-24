@@ -1512,6 +1512,45 @@ test "surface action lifetime defers owner destruction until lease release" {
     try std.testing.expect(lifetime.release());
 }
 
+test "owned surface userdata releases after final action lease" {
+    const OwnedUserdata = if (@hasDecl(@This(), "SurfaceUserdata"))
+        @field(@This(), "SurfaceUserdata")
+    else
+        struct {
+            fn init(
+                _: ?*anyopaque,
+                _: *const fn (?*anyopaque) callconv(.c) void,
+            ) @This() {
+                return .{};
+            }
+
+            fn deinit(_: *@This()) void {}
+        };
+
+    const ReleaseState = struct {
+        releases: usize = 0,
+
+        fn release(userdata: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.releases += 1;
+        }
+    };
+
+    var state: ReleaseState = .{};
+    var userdata = OwnedUserdata.init(&state, ReleaseState.release);
+    var lifetime: SurfaceActionLifetime = .{};
+    lifetime.retain();
+
+    if (lifetime.release()) userdata.deinit();
+    try std.testing.expectEqual(@as(usize, 0), state.releases);
+
+    if (lifetime.release()) userdata.deinit();
+    try std.testing.expectEqual(@as(usize, 1), state.releases);
+
+    userdata.deinit();
+    try std.testing.expectEqual(@as(usize, 1), state.releases);
+}
+
 // The cmux integration combines the OpenGL platform payload (the largest
 // Platform.C variant) with the startup PTY tee fields. Keep the resulting C
 // layout pinned so every exact-revision consumer fails loudly on drift.
