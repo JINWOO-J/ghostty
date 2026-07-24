@@ -264,13 +264,19 @@ pub const App = struct {
         self: *App,
         opts: Surface.Options,
         scrollback_limit_bytes: usize,
+        userdata_release_cb: ?UserdataReleaseCallback,
     ) !*Surface {
         // Grab a surface allocation because we're going to need it.
         var surface = try self.core_app.alloc.create(Surface);
         errdefer self.core_app.alloc.destroy(surface);
 
         // Create the surface
-        try surface.init(self, opts, scrollback_limit_bytes);
+        try surface.init(
+            self,
+            opts,
+            scrollback_limit_bytes,
+            userdata_release_cb,
+        );
         return surface;
     }
 
@@ -661,6 +667,29 @@ pub const IoWriteCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv
 pub const PtyTeeCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
 pub const RendererEventCallback = renderer.InstrumentationCallback;
 pub const RenderPresentedCallback = *const fn (?*anyopaque, u64) callconv(.c) void;
+pub const UserdataReleaseCallback = *const fn (?*anyopaque) callconv(.c) void;
+
+const SurfaceUserdata = struct {
+    value: ?*anyopaque = null,
+    release_cb: ?UserdataReleaseCallback = null,
+
+    fn init(
+        value: ?*anyopaque,
+        release_cb: UserdataReleaseCallback,
+    ) SurfaceUserdata {
+        return .{
+            .value = value,
+            .release_cb = release_cb,
+        };
+    }
+
+    fn deinit(self: *SurfaceUserdata) void {
+        const release_cb = self.release_cb orelse return;
+        self.release_cb = null;
+        release_cb(self.value);
+        self.value = null;
+    }
+};
 
 const SurfaceActionLifetime = struct {
     references: std.atomic.Value(usize) = .{ .raw = 1 },
@@ -687,7 +716,7 @@ const SurfaceActionLifetime = struct {
 pub const Surface = struct {
     app: *App,
     platform: Platform,
-    userdata: ?*anyopaque = null,
+    userdata: SurfaceUserdata = .{},
     core_surface: CoreSurface,
     app_action_lifetime: SurfaceActionLifetime = .{},
     content_scale: apprt.ContentScale,
@@ -783,11 +812,15 @@ pub const Surface = struct {
         app: *App,
         opts: Options,
         scrollback_limit_bytes: usize,
+        userdata_release_cb: ?UserdataReleaseCallback,
     ) !void {
         self.* = .{
             .app = app,
             .platform = try .init(opts.platform_tag, opts.platform),
-            .userdata = opts.userdata,
+            .userdata = if (userdata_release_cb) |release_cb|
+                .init(opts.userdata, release_cb)
+            else
+                .{ .value = opts.userdata },
             .core_surface = undefined,
             .content_scale = .{
                 .x = @floatCast(opts.scale_factor),
@@ -1004,6 +1037,7 @@ pub const Surface = struct {
 
         // Clean up our core surface so that all the rendering and IO stop.
         self.core_surface.deinit();
+        self.userdata.deinit();
         alloc.destroy(self);
     }
 
@@ -1043,7 +1077,7 @@ pub const Surface = struct {
             return;
         };
 
-        func(self.userdata, process_alive);
+        func(self.userdata.value, process_alive);
     }
 
     pub fn tmuxControl(
@@ -1053,7 +1087,7 @@ pub const Surface = struct {
         data: []const u8,
     ) void {
         const func = self.app.opts.tmux_control orelse return;
-        func(self.userdata, event, id, data.ptr, data.len);
+        func(self.userdata.value, event, id, data.ptr, data.len);
     }
 
     pub fn getContentScale(self: *const Surface) !apprt.ContentScale {
@@ -1103,7 +1137,7 @@ pub const Surface = struct {
     pub fn rendererInstrumentation(self: *const Surface) renderer.Instrumentation {
         return .{
             .callback = self.renderer_event_cb,
-            .userdata = self.userdata,
+            .userdata = self.userdata.value,
         };
     }
 
@@ -1136,7 +1170,7 @@ pub const Surface = struct {
         state_ptr.* = state;
 
         const started = self.app.opts.read_clipboard(
-            self.userdata,
+            self.userdata.value,
             @intCast(@intFromEnum(clipboard_type)),
             state_ptr,
         );
@@ -1167,7 +1201,7 @@ pub const Surface = struct {
             error.UnauthorizedPaste,
             => {
                 self.app.opts.confirm_read_clipboard(
-                    self.userdata,
+                    self.userdata.value,
                     str.ptr,
                     state,
                     state.*,
@@ -1201,7 +1235,7 @@ pub const Surface = struct {
         }
 
         self.app.opts.write_clipboard(
-            self.userdata,
+            self.userdata.value,
             @intCast(@intFromEnum(clipboard_type)),
             array.ptr,
             array.len,
@@ -2148,7 +2182,19 @@ pub const CAPI = struct {
         app: *App,
         opts: *const apprt.Surface.Options,
     ) ?*Surface {
-        return surface_new_(app, opts, 0) catch |err| {
+        return surface_new_(app, opts, 0, null) catch |err| {
+            log.err("error initializing surface err={}", .{err});
+            return null;
+        };
+    }
+
+    /// Create a surface that owns its userdata until final destruction.
+    export fn ghostty_surface_new_with_owned_userdata(
+        app: *App,
+        opts: *const apprt.Surface.Options,
+        userdata_release_cb: UserdataReleaseCallback,
+    ) ?*Surface {
+        return surface_new_(app, opts, 0, userdata_release_cb) catch |err| {
             log.err("error initializing surface err={}", .{err});
             return null;
         };
@@ -2161,7 +2207,7 @@ pub const CAPI = struct {
         opts: *const apprt.Surface.Options,
         scrollback_limit_bytes: usize,
     ) ?*Surface {
-        return surface_new_(app, opts, scrollback_limit_bytes) catch |err| {
+        return surface_new_(app, opts, scrollback_limit_bytes, null) catch |err| {
             log.err("error initializing surface err={}", .{err});
             return null;
         };
@@ -2171,8 +2217,13 @@ pub const CAPI = struct {
         app: *App,
         opts: *const apprt.Surface.Options,
         scrollback_limit_bytes: usize,
+        userdata_release_cb: ?UserdataReleaseCallback,
     ) !*Surface {
-        return try app.newSurface(opts.*, scrollback_limit_bytes);
+        return try app.newSurface(
+            opts.*,
+            scrollback_limit_bytes,
+            userdata_release_cb,
+        );
     }
 
     export fn ghostty_surface_free(ptr: *Surface) void {
@@ -2181,7 +2232,7 @@ pub const CAPI = struct {
 
     /// Returns the userdata associated with the surface.
     export fn ghostty_surface_userdata(surface: *Surface) ?*anyopaque {
-        return surface.userdata;
+        return surface.userdata.value;
     }
 
     /// Returns the app associated with a surface.
