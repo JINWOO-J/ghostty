@@ -1648,6 +1648,7 @@ test "surface teardown waits for a cross-thread action lease" {
             lifetime: *Lifetime,
             action_ready: std.Thread.ResetEvent = .{},
             allow_action_return: std.Thread.ResetEvent = .{},
+            action_finished: std.Thread.ResetEvent = .{},
             teardown_started: std.Thread.ResetEvent = .{},
             teardown_finished: std.Thread.ResetEvent = .{},
             action_released_final: std.atomic.Value(bool) = .{ .raw = true },
@@ -1660,6 +1661,7 @@ test "surface teardown waits for a cross-thread action lease" {
                     self.lifetime.releaseAction(),
                     .release,
                 );
+                self.action_finished.set();
             }
 
             fn runTeardown(self: *@This()) void {
@@ -1686,6 +1688,7 @@ test "surface teardown waits for a cross-thread action lease" {
 
         context.allow_action_return.set();
         context.teardown_finished.wait();
+        context.action_finished.wait();
         try std.testing.expect(
             !context.action_released_final.load(.acquire),
         );
