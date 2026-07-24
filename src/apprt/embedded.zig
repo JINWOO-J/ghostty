@@ -1585,6 +1585,41 @@ test "owned surface userdata releases after final action lease" {
     try std.testing.expectEqual(@as(usize, 1), state.releases);
 }
 
+test "owned surface userdata remains alive through host callback lease" {
+    const CallbackLifetime = if (@hasDecl(SurfaceActionLifetime, "tryRetain"))
+        SurfaceActionLifetime
+    else
+        struct {
+            fn tryRetain(_: *@This()) bool {
+                return false;
+            }
+
+            fn release(_: *@This()) bool {
+                return false;
+            }
+        };
+
+    const ReleaseState = struct {
+        releases: usize = 0,
+
+        fn release(userdata: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.releases += 1;
+        }
+    };
+
+    var state: ReleaseState = .{};
+    var userdata = SurfaceUserdata.init(&state, ReleaseState.release);
+    var lifetime: CallbackLifetime = .{};
+
+    try std.testing.expect(lifetime.tryRetain());
+    if (lifetime.release()) userdata.deinit();
+    try std.testing.expectEqual(@as(usize, 0), state.releases);
+
+    if (lifetime.release()) userdata.deinit();
+    try std.testing.expectEqual(@as(usize, 1), state.releases);
+}
+
 // The cmux integration combines the OpenGL platform payload (the largest
 // Platform.C variant) with the startup PTY tee fields. Keep the resulting C
 // layout pinned so every exact-revision consumer fails loudly on drift.
