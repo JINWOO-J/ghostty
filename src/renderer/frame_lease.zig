@@ -45,16 +45,10 @@ pub fn Pool(comptime slot_count: usize) type {
         available: std.Thread.Semaphore = .{ .permits = slot_count },
         slots: [slot_count]Slot = [_]Slot{.{}} ** slot_count,
         next_token: Token = 0,
-        defunct: bool = false,
-        /// Round-robin start for the next acquire. A fully serial producer
-        /// (iOS `render_now`: each frame completes before the next acquire)
-        /// always finds slot 0 free, so a first-free scan hands out the SAME
-        /// IOSurface every frame - and Core Animation dedupes same-object
-        /// `contents` assignments, leaving presented pixels frozen while the
-        /// GPU keeps drawing into the surface. Rotating the start guarantees
-        /// consecutive frames present distinct surfaces, like a pipelined
-        /// producer does naturally.
+        /// Start each search after the last acquired slot so a serial producer
+        /// still rotates IOSurfaces and forces Core Animation to recomposite.
         next_slot: usize = 0,
+        defunct: bool = false,
 
         /// Acquire one exact free slot. A null timeout waits indefinitely.
         pub fn acquire(
@@ -255,6 +249,22 @@ test "frame lease pool reuses the exact out-of-order released slot" {
     try std.testing.expect(pool.finish(replacement.token, false));
     try std.testing.expect(pool.releaseHost(first.token));
     try std.testing.expect(pool.releaseHost(third.token));
+}
+
+test "frame lease pool rotates slots for serial frames" {
+    const LeasePool = Pool(3);
+    var pool: LeasePool = .{};
+
+    var slots: [4]LeasePool.Lease = undefined;
+    for (&slots) |*lease| {
+        lease.* = try pool.acquire(null);
+        try std.testing.expect(pool.finish(lease.token, false));
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), slots[0].slot);
+    try std.testing.expectEqual(@as(usize, 1), slots[1].slot);
+    try std.testing.expectEqual(@as(usize, 2), slots[2].slot);
+    try std.testing.expectEqual(@as(usize, 0), slots[3].slot);
 }
 
 test "frame lease pool accepts release racing the presentation callback" {
