@@ -304,9 +304,14 @@ pub const Keyboard = struct {
     /// of the prior (namely since you can't bind modifier-only).
     last_trigger: ?u64 = null,
 
+    fn prepareBindingEvent(self: *Keyboard, event: input.KeyEvent) void {
+        const last = self.last_trigger orelse return;
+        if (last == event.bindingReleaseHash()) self.last_trigger = null;
+    }
+
     fn consumesBindingRelease(self: *const Keyboard, event: input.KeyEvent) bool {
         const last = self.last_trigger orelse return false;
-        return last == event.bindingHash();
+        return last == event.bindingReleaseHash();
     }
 
     fn consumeMenuAction(
@@ -320,7 +325,7 @@ pub const Keyboard = struct {
         }
         if (!value.isMenuEquivalentAction(action)) return false;
 
-        self.last_trigger = event.bindingHash();
+        self.last_trigger = event.bindingReleaseHash();
         return true;
     }
 };
@@ -361,6 +366,18 @@ test "keyboard menu action owns the paired release outside sequences and tables"
     // necessarily carries Super even though the consumed press did.
     release.mods = .{};
     try testing.expect(keyboard.consumesBindingRelease(release));
+    try testing.expect(keyboard.consumesBindingRelease(release));
+
+    var next_press = release;
+    next_press.action = .press;
+    keyboard.prepareBindingEvent(next_press);
+    try testing.expect(!keyboard.consumesBindingRelease(release));
+
+    try testing.expect(keyboard.consumeMenuAction(value, press, copy));
+    var repeat = release;
+    repeat.action = .repeat;
+    keyboard.prepareBindingEvent(repeat);
+    try testing.expect(!keyboard.consumesBindingRelease(release));
 }
 
 /// The configuration that a surface has, this is copied from the main
@@ -3399,8 +3416,11 @@ fn maybeHandleBinding(
             return null;
         },
 
-        // Carry on processing.
-        .press, .repeat => {},
+        // Resolve each press or repeat transactionally: expire any prior
+        // release identity for this key first, then record it again below only
+        // when this event is consumed. A forwarded event therefore keeps its
+        // eventual release, while duplicate release events remain consumed.
+        .press, .repeat => self.keyboard.prepareBindingEvent(event),
     }
 
     // Find an entry in the keybind set that matches our event.
@@ -3585,7 +3605,7 @@ fn maybeHandleBinding(
         self.endKeySequence(.drop, .retain);
 
         // Store our last trigger so we don't encode the release event
-        self.keyboard.last_trigger = event.bindingHash();
+        self.keyboard.last_trigger = event.bindingReleaseHash();
 
         if (insp_ev) |ev| {
             ev.binding = self.alloc.dupe(
