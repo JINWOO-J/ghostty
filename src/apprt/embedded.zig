@@ -718,12 +718,13 @@ const SurfaceActionLifetime = struct {
         self.mutex.lock();
         assert(self.active_actions > 0);
         assert(self.active_thread.? == std.Thread.getCurrentId());
-        self.active_actions -= 1;
-        if (self.active_actions == 0) {
-            self.active_thread = null;
-            self.drained.broadcast();
-        }
-        self.mutex.unlock();
+
+        // Release the allocation reference before publishing that all actions
+        // drained. A teardown waiter may destroy the app as soon as it observes
+        // zero active actions, so the action must not touch the surface or app
+        // after that wake becomes visible.
+        const previous = self.references.fetchSub(1, .seq_cst);
+        assert(previous > 0);
 
         if (builtin.is_test) {
             if (self.release_pause_for_testing) |pause| {
@@ -732,8 +733,13 @@ const SurfaceActionLifetime = struct {
             }
         }
 
-        const previous = self.references.fetchSub(1, .seq_cst);
-        assert(previous > 0);
+        self.active_actions -= 1;
+        if (self.active_actions == 0) {
+            self.active_thread = null;
+            self.drained.broadcast();
+        }
+        self.mutex.unlock();
+
         return previous == 1;
     }
 
