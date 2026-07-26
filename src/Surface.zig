@@ -357,6 +357,9 @@ test "keyboard menu action owns the paired release outside sequences and tables"
 
     var release = press;
     release.action = .release;
+    // Modifier key-up can arrive first, so the paired C release no longer
+    // necessarily carries Super even though the consumed press did.
+    release.mods = .{};
     try testing.expect(keyboard.consumesBindingRelease(release));
 }
 
