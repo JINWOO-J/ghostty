@@ -663,12 +663,19 @@ pub const RendererEventCallback = renderer.InstrumentationCallback;
 pub const RenderPresentedCallback = *const fn (?*anyopaque, u64) callconv(.c) void;
 
 const SurfaceActionLifetime = struct {
+    const ReleasePauseForTesting = struct {
+        reached: *std.Thread.ResetEvent,
+        continue_release: *std.Thread.ResetEvent,
+    };
+
     references: std.atomic.Value(usize) = .{ .raw = 1 },
     mutex: std.Thread.Mutex = .{},
     drained: std.Thread.Condition = .{},
     active_actions: usize = 0,
     active_thread: ?std.Thread.Id = null,
     teardown_started: bool = false,
+    release_pause_for_testing: if (builtin.is_test) ?ReleasePauseForTesting else void =
+        if (builtin.is_test) null else {},
 
     fn retain(self: *SurfaceActionLifetime) void {
         self.mutex.lock();
@@ -717,6 +724,13 @@ const SurfaceActionLifetime = struct {
             self.drained.broadcast();
         }
         self.mutex.unlock();
+
+        if (builtin.is_test) {
+            if (self.release_pause_for_testing) |pause| {
+                pause.reached.set();
+                pause.continue_release.wait();
+            }
+        }
 
         const previous = self.references.fetchSub(1, .seq_cst);
         assert(previous > 0);
@@ -1649,6 +1663,8 @@ test "surface teardown waits for a cross-thread action lease" {
             action_ready: std.Thread.ResetEvent = .{},
             allow_action_return: std.Thread.ResetEvent = .{},
             action_finished: std.Thread.ResetEvent = .{},
+            release_action_reached: std.Thread.ResetEvent = .{},
+            allow_release_completion: std.Thread.ResetEvent = .{},
             teardown_started: std.Thread.ResetEvent = .{},
             teardown_finished: std.Thread.ResetEvent = .{},
             action_released_final: std.atomic.Value(bool) = .{ .raw = true },
@@ -1674,11 +1690,16 @@ test "surface teardown waits for a cross-thread action lease" {
 
         var lifetime: Lifetime = .{};
         var context: Context = .{ .lifetime = &lifetime };
+        lifetime.release_pause_for_testing = .{
+            .reached = &context.release_action_reached,
+            .continue_release = &context.allow_release_completion,
+        };
         const action_thread = try std.Thread.spawn(.{}, Context.runAction, .{&context});
         defer action_thread.join();
         const teardown_thread = try std.Thread.spawn(.{}, Context.runTeardown, .{&context});
         defer teardown_thread.join();
         defer context.allow_action_return.set();
+        defer context.allow_release_completion.set();
 
         context.teardown_started.wait();
         try std.testing.expectError(
@@ -1687,6 +1708,12 @@ test "surface teardown waits for a cross-thread action lease" {
         );
 
         context.allow_action_return.set();
+        context.release_action_reached.wait();
+        try std.testing.expectError(
+            error.Timeout,
+            context.teardown_finished.timedWait(100 * std.time.ns_per_ms),
+        );
+        context.allow_release_completion.set();
         context.teardown_finished.wait();
         context.action_finished.wait();
         try std.testing.expect(
