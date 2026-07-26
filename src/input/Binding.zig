@@ -2128,6 +2128,16 @@ pub const Set = struct {
         /// A set of actions to take in response to a trigger.
         leaf_chained: LeafChained,
 
+        /// Returns true only when this value resolves to one non-chained action
+        /// equal to `action`. Leaders and chains retain distinct sequence
+        /// semantics and therefore never match.
+        pub fn isExactAction(self: Value, action: Action) bool {
+            return switch (self) {
+                .leaf => |leaf| leaf.action.equal(action),
+                .leader, .leaf_chained => false,
+            };
+        }
+
         /// Implements the formatter for the fmt package. This encodes the
         /// action back into the format used by parse.
         pub fn format(
