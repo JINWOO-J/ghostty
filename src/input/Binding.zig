@@ -4116,6 +4116,26 @@ test "set: performable is not part of reverse mappings" {
     }
 }
 
+test "set value: exact action match excludes custom and chained bindings" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const trigger = try Trigger.parse("super+c");
+    const copy: Action = .{ .copy_to_clipboard = .mixed };
+
+    var s: Set = .{};
+    defer s.deinit(alloc);
+
+    try s.parseAndPut(alloc, "performable:super+c=copy_to_clipboard");
+    try testing.expect(s.get(trigger).?.value_ptr.*.isExactAction(copy));
+
+    try s.parseAndPut(alloc, "performable:super+c=toggle_fullscreen");
+    try testing.expect(!s.get(trigger).?.value_ptr.*.isExactAction(copy));
+
+    try s.parseAndPut(alloc, "performable:super+c=copy_to_clipboard");
+    try s.parseAndPut(alloc, "chain=ignore");
+    try testing.expect(!s.get(trigger).?.value_ptr.*.isExactAction(copy));
+}
+
 test "set: overriding a mapping updates reverse" {
     const testing = std.testing;
     const alloc = testing.allocator;
