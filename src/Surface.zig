@@ -303,7 +303,62 @@ pub const Keyboard = struct {
     /// a combination to be handled by different bindings before the release
     /// of the prior (namely since you can't bind modifier-only).
     last_trigger: ?u64 = null,
+
+    fn consumesBindingRelease(self: *const Keyboard, event: input.KeyEvent) bool {
+        const last = self.last_trigger orelse return false;
+        return last == event.bindingHash();
+    }
+
+    fn consumeMenuAction(
+        self: *Keyboard,
+        value: input.Binding.Set.Value,
+        event: input.KeyEvent,
+        action: input.Binding.Action,
+    ) bool {
+        if (self.sequence_set != null or self.table_stack.items.len > 0) {
+            return false;
+        }
+        if (!value.isMenuEquivalentAction(action)) return false;
+
+        self.last_trigger = event.bindingHash();
+        return true;
+    }
 };
+
+test "keyboard menu action owns the paired release outside sequences and tables" {
+    const testing = std.testing;
+    const copy: input.Binding.Action = .{ .copy_to_clipboard = .mixed };
+    const value: input.Binding.Set.Value = .{ .leaf = .{
+        .action = copy,
+        .flags = .{ .performable = true },
+    } };
+    const press: input.KeyEvent = .{
+        .action = .press,
+        .key = .key_c,
+        .mods = .{ .super = true },
+        .unshifted_codepoint = 'c',
+    };
+
+    var keyboard: Keyboard = .{};
+    var sequence_set: input.Binding.Set = .{};
+    keyboard.sequence_set = &sequence_set;
+    try testing.expect(!keyboard.consumeMenuAction(value, press, copy));
+
+    keyboard.sequence_set = null;
+    try keyboard.table_stack.append(testing.allocator, .{
+        .set = &sequence_set,
+        .once = true,
+    });
+    defer keyboard.table_stack.deinit(testing.allocator);
+    try testing.expect(!keyboard.consumeMenuAction(value, press, copy));
+
+    keyboard.table_stack.clearRetainingCapacity();
+    try testing.expect(keyboard.consumeMenuAction(value, press, copy));
+
+    var release = press;
+    release.action = .release;
+    try testing.expect(keyboard.consumesBindingRelease(release));
+}
 
 /// The configuration that a surface has, this is copied from the main
 /// Config struct usually to prevent sharing a single value.
@@ -3060,27 +3115,33 @@ pub fn keyEventIsBinding(
     };
 }
 
-/// Returns true when the key event resolves to exactly one binding action
-/// equal to `action`. This applies the same remappings, active key tables, and
-/// sequence state as key processing without executing the binding.
-pub fn keyEventBindingIsExactAction(
+/// Consume a key event whose corresponding native menu action was unavailable.
+///
+/// This is intentionally limited to a root, single-action, consumed,
+/// performable binding. Sequences, key tables, unconsumed bindings, and
+/// application-wide bindings must continue through normal key processing.
+/// Recording the trigger here also consumes the paired release event through
+/// the same lifecycle used by normally handled bindings.
+pub fn keyEventConsumeIfMenuAction(
     self: *Surface,
     event_orig: input.KeyEvent,
     action: input.Binding.Action,
 ) bool {
-    const entry = self.keyEventBindingEntry(event_orig) orelse return false;
-    return entry.value_ptr.*.isExactAction(action);
+    const event = self.keyEventWithRemappedMods(event_orig);
+    switch (event.action) {
+        .release => return false,
+        .press, .repeat => {},
+    }
+
+    const entry = self.config.keybind.set.getEvent(event) orelse return false;
+    return self.keyboard.consumeMenuAction(entry.value_ptr.*, event, action);
 }
 
 fn keyEventBindingEntry(
     self: *Surface,
     event_orig: input.KeyEvent,
 ) ?input.Binding.Set.Entry {
-    // Apply key remappings for consistency with keyCallback
-    var event = event_orig;
-    if (self.config.key_remaps.isRemapped(event_orig.mods)) {
-        event.mods = self.config.key_remaps.apply(event_orig.mods);
-    }
+    const event = self.keyEventWithRemappedMods(event_orig);
 
     switch (event.action) {
         .release => return null,
@@ -3110,6 +3171,17 @@ fn keyEventBindingEntry(
     return entry;
 }
 
+fn keyEventWithRemappedMods(
+    self: *const Surface,
+    event_orig: input.KeyEvent,
+) input.KeyEvent {
+    var event = event_orig;
+    if (self.config.key_remaps.isRemapped(event_orig.mods)) {
+        event.mods = self.config.key_remaps.apply(event_orig.mods);
+    }
+    return event;
+}
+
 /// Called for any key events. This handles keybindings, encoding and
 /// sending to the terminal, etc.
 pub fn keyCallback(
@@ -3120,10 +3192,7 @@ pub fn keyCallback(
 
     // Apply key remappings to transform modifiers before any processing.
     // This allows users to remap modifier keys at the app level.
-    var event = event_orig;
-    if (self.config.key_remaps.isRemapped(event_orig.mods)) {
-        event.mods = self.config.key_remaps.apply(event_orig.mods);
-    }
+    const event = self.keyEventWithRemappedMods(event_orig);
 
     // Crash metadata in case we crash in here
     crash.sentry.thread_state = self.crashThreadState();
@@ -3317,13 +3386,11 @@ fn maybeHandleBinding(
         // Release events never trigger a binding but we need to check if
         // we consumed the press event so we don't encode the release.
         .release => {
-            if (self.keyboard.last_trigger) |last| {
-                if (last == event.bindingHash()) {
-                    // We don't reset the last trigger on release because
-                    // an apprt may send multiple release events for a single
-                    // press event.
-                    return .consumed;
-                }
+            if (self.keyboard.consumesBindingRelease(event)) {
+                // We don't reset the last trigger on release because
+                // an apprt may send multiple release events for a single
+                // press event.
+                return .consumed;
             }
 
             return null;

@@ -2128,12 +2128,16 @@ pub const Set = struct {
         /// A set of actions to take in response to a trigger.
         leaf_chained: LeafChained,
 
-        /// Returns true only when this value resolves to one non-chained action
-        /// equal to `action`. Leaders and chains retain distinct sequence
-        /// semantics and therefore never match.
-        pub fn isExactAction(self: Value, action: Action) bool {
+        /// Returns true only when this value can be owned by an unavailable
+        /// native menu action. Menu-owned bindings are one consumed,
+        /// performable action scoped to the focused surface.
+        pub fn isMenuEquivalentAction(self: Value, action: Action) bool {
             return switch (self) {
-                .leaf => |leaf| leaf.action.equal(action),
+                .leaf => |leaf| leaf.flags.consumed and
+                    leaf.flags.performable and
+                    !leaf.flags.all and
+                    !leaf.flags.global and
+                    leaf.action.equal(action),
                 .leader, .leaf_chained => false,
             };
         }
@@ -4126,7 +4130,7 @@ test "set: performable is not part of reverse mappings" {
     }
 }
 
-test "set value: exact action match excludes custom and chained bindings" {
+test "set value: menu-equivalent action excludes unsafe flags, custom, and chained bindings" {
     const testing = std.testing;
     const alloc = testing.allocator;
     const trigger = try Trigger.parse("super+c");
@@ -4136,14 +4140,23 @@ test "set value: exact action match excludes custom and chained bindings" {
     defer s.deinit(alloc);
 
     try s.parseAndPut(alloc, "performable:super+c=copy_to_clipboard");
-    try testing.expect(s.get(trigger).?.value_ptr.*.isExactAction(copy));
+    try testing.expect(s.get(trigger).?.value_ptr.*.isMenuEquivalentAction(copy));
+
+    try s.parseAndPut(alloc, "unconsumed:performable:super+c=copy_to_clipboard");
+    try testing.expect(!s.get(trigger).?.value_ptr.*.isMenuEquivalentAction(copy));
+
+    try s.parseAndPut(alloc, "all:performable:super+c=copy_to_clipboard");
+    try testing.expect(!s.get(trigger).?.value_ptr.*.isMenuEquivalentAction(copy));
+
+    try s.parseAndPut(alloc, "super+c=copy_to_clipboard");
+    try testing.expect(!s.get(trigger).?.value_ptr.*.isMenuEquivalentAction(copy));
 
     try s.parseAndPut(alloc, "performable:super+c=toggle_fullscreen");
-    try testing.expect(!s.get(trigger).?.value_ptr.*.isExactAction(copy));
+    try testing.expect(!s.get(trigger).?.value_ptr.*.isMenuEquivalentAction(copy));
 
     try s.parseAndPut(alloc, "performable:super+c=copy_to_clipboard");
     try s.parseAndPut(alloc, "chain=ignore");
-    try testing.expect(!s.get(trigger).?.value_ptr.*.isExactAction(copy));
+    try testing.expect(!s.get(trigger).?.value_ptr.*.isMenuEquivalentAction(copy));
 }
 
 test "set: overriding a mapping updates reverse" {

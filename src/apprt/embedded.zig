@@ -3836,10 +3836,9 @@ pub const CAPI = struct {
         return true;
     }
 
-    /// Returns true when the key event would resolve to exactly the requested
-    /// binding action if it were sent to the surface right now. This does not
-    /// execute the binding.
-    export fn ghostty_surface_key_binding_is_exact_action(
+    /// Consumes a safe menu-owned binding after the corresponding native menu
+    /// action declined the key event.
+    export fn ghostty_surface_key_consume_if_menu_action(
         surface: *Surface,
         event: KeyEvent,
         action_ptr: [*]const u8,
@@ -3858,7 +3857,7 @@ pub const CAPI = struct {
             return false;
         };
 
-        return surface.core_surface.keyEventBindingIsExactAction(
+        return surface.core_surface.keyEventConsumeIfMenuAction(
             core_event,
             action,
         );
