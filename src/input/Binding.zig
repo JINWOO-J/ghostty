@@ -4126,7 +4126,7 @@ test "set: performable is not part of reverse mappings" {
     }
 }
 
-test "set value: exact action match excludes custom and chained bindings" {
+test "set value: menu-equivalent action excludes unsafe flags, custom, and chained bindings" {
     const testing = std.testing;
     const alloc = testing.allocator;
     const trigger = try Trigger.parse("super+c");
@@ -4137,6 +4137,15 @@ test "set value: exact action match excludes custom and chained bindings" {
 
     try s.parseAndPut(alloc, "performable:super+c=copy_to_clipboard");
     try testing.expect(s.get(trigger).?.value_ptr.*.isExactAction(copy));
+
+    try s.parseAndPut(alloc, "unconsumed:performable:super+c=copy_to_clipboard");
+    try testing.expect(!s.get(trigger).?.value_ptr.*.isExactAction(copy));
+
+    try s.parseAndPut(alloc, "all:performable:super+c=copy_to_clipboard");
+    try testing.expect(!s.get(trigger).?.value_ptr.*.isExactAction(copy));
+
+    try s.parseAndPut(alloc, "super+c=copy_to_clipboard");
+    try testing.expect(!s.get(trigger).?.value_ptr.*.isExactAction(copy));
 
     try s.parseAndPut(alloc, "performable:super+c=toggle_fullscreen");
     try testing.expect(!s.get(trigger).?.value_ptr.*.isExactAction(copy));
