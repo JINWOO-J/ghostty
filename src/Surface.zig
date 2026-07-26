@@ -3052,6 +3052,30 @@ pub fn keyEventIsBinding(
     self: *Surface,
     event_orig: input.KeyEvent,
 ) ?input.Binding.Flags {
+    const entry = self.keyEventBindingEntry(event_orig) orelse return null;
+
+    return switch (entry.value_ptr.*) {
+        .leader => .{},
+        inline .leaf, .leaf_chained => |v| v.flags,
+    };
+}
+
+/// Returns true when the key event resolves to exactly one binding action
+/// equal to `action`. This applies the same remappings, active key tables, and
+/// sequence state as key processing without executing the binding.
+pub fn keyEventBindingIsExactAction(
+    self: *Surface,
+    event_orig: input.KeyEvent,
+    action: input.Binding.Action,
+) bool {
+    const entry = self.keyEventBindingEntry(event_orig) orelse return false;
+    return entry.value_ptr.*.isExactAction(action);
+}
+
+fn keyEventBindingEntry(
+    self: *Surface,
+    event_orig: input.KeyEvent,
+) ?input.Binding.Set.Entry {
     // Apply key remappings for consistency with keyCallback
     var event = event_orig;
     if (self.config.key_remaps.isRemapped(event_orig.mods)) {
@@ -3083,11 +3107,7 @@ pub fn keyEventIsBinding(
         break :entry self.config.keybind.set.getEvent(event) orelse return null;
     };
 
-    // Return flags based on the
-    return switch (entry.value_ptr.*) {
-        .leader => .{},
-        inline .leaf, .leaf_chained => |v| v.flags,
-    };
+    return entry;
 }
 
 /// Called for any key events. This handles keybindings, encoding and

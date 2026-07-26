@@ -3836,6 +3836,34 @@ pub const CAPI = struct {
         return true;
     }
 
+    /// Returns true when the key event would resolve to exactly the requested
+    /// binding action if it were sent to the surface right now. This does not
+    /// execute the binding.
+    export fn ghostty_surface_key_binding_is_exact_action(
+        surface: *Surface,
+        event: KeyEvent,
+        action_ptr: [*]const u8,
+        action_len: usize,
+    ) bool {
+        const core_event = event.keyEvent().core() orelse {
+            log.warn("error processing key event", .{});
+            return false;
+        };
+        const action_str = action_ptr[0..action_len];
+        const action = input.Binding.Action.parse(action_str) catch |err| {
+            log.warn(
+                "error parsing binding action action={s} err={}",
+                .{ action_str, err },
+            );
+            return false;
+        };
+
+        return surface.core_surface.keyEventBindingIsExactAction(
+            core_event,
+            action,
+        );
+    }
+
     /// Send raw text to the terminal. This is treated like a paste
     /// so this isn't useful for sending escape sequences. For that,
     /// individual key input should be used.

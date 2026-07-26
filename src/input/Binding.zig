@@ -2128,6 +2128,16 @@ pub const Set = struct {
         /// A set of actions to take in response to a trigger.
         leaf_chained: LeafChained,
 
+        /// Returns true only when this value resolves to one non-chained action
+        /// equal to `action`. Leaders and chains retain distinct sequence
+        /// semantics and therefore never match.
+        pub fn isExactAction(self: Value, action: Action) bool {
+            return switch (self) {
+                .leaf => |leaf| leaf.action.equal(action),
+                .leader, .leaf_chained => false,
+            };
+        }
+
         /// Implements the formatter for the fmt package. This encodes the
         /// action back into the format used by parse.
         pub fn format(
@@ -4114,6 +4124,26 @@ test "set: performable is not part of reverse mappings" {
         const trigger = s.getTrigger(.{ .new_window = {} }).?;
         try testing.expect(trigger.key.unicode == 'a');
     }
+}
+
+test "set value: exact action match excludes custom and chained bindings" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const trigger = try Trigger.parse("super+c");
+    const copy: Action = .{ .copy_to_clipboard = .mixed };
+
+    var s: Set = .{};
+    defer s.deinit(alloc);
+
+    try s.parseAndPut(alloc, "performable:super+c=copy_to_clipboard");
+    try testing.expect(s.get(trigger).?.value_ptr.*.isExactAction(copy));
+
+    try s.parseAndPut(alloc, "performable:super+c=toggle_fullscreen");
+    try testing.expect(!s.get(trigger).?.value_ptr.*.isExactAction(copy));
+
+    try s.parseAndPut(alloc, "performable:super+c=copy_to_clipboard");
+    try s.parseAndPut(alloc, "chain=ignore");
+    try testing.expect(!s.get(trigger).?.value_ptr.*.isExactAction(copy));
 }
 
 test "set: overriding a mapping updates reverse" {

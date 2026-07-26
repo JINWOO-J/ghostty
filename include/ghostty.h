@@ -1380,6 +1380,13 @@ GHOSTTY_API bool ghostty_surface_key(ghostty_surface_t, ghostty_input_key_s);
 GHOSTTY_API bool ghostty_surface_key_is_binding(ghostty_surface_t,
                                                    ghostty_input_key_s,
                                                    ghostty_binding_flags_e*);
+// cmux fork: inspect the exact binding action resolved by the current surface
+// key-table/sequence state without dispatching the key event.
+GHOSTTY_API bool ghostty_surface_key_binding_is_exact_action(
+    ghostty_surface_t,
+    ghostty_input_key_s,
+    const char*,
+    uintptr_t);
 GHOSTTY_API void ghostty_surface_text(ghostty_surface_t, const char*, uintptr_t);
 // cmux fork: delete when upstream separates committed typed text from paste
 // delivery for libghostty embedders.
