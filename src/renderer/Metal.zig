@@ -865,6 +865,24 @@ test "metal command queue releases and recreates across renderer realization" {
     try testing.expect(queue.isLive());
 }
 
+test "metal command queue is process-shared per device" {
+    const testing = std.testing;
+    const device = try chooseDevice();
+    defer device.release();
+
+    var active = RecreatableCommandQueue.init(device);
+    defer active.deinit();
+    var hidden = RecreatableCommandQueue.init(device);
+    defer hidden.deinit();
+
+    try testing.expectEqual(active.get().value, hidden.get().value);
+
+    active.release();
+    var restored = RecreatableCommandQueue.init(device);
+    defer restored.deinit();
+    try testing.expectEqual(hidden.get().value, restored.get().value);
+}
+
 test "metal completion generation rejects old callbacks after rotation" {
     const testing = std.testing;
     const Context = struct {
