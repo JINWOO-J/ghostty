@@ -307,36 +307,34 @@ fn shadersFromSharedStandard(entry: *SharedStandardShaders) Shaders {
 }
 
 fn releaseSharedStandard(entry: *SharedStandardShaders) void {
-    var destroy = false;
-
     shared_standard_mutex.lock();
+    defer shared_standard_mutex.unlock();
+
     std.debug.assert(entry.references > 0);
     entry.references -= 1;
-    if (entry.references == 0) {
-        for (shared_standard_entries.items, 0..) |candidate, i| {
-            if (candidate != entry) continue;
-            _ = shared_standard_entries.orderedRemove(i);
-            destroy = true;
-            break;
-        }
-        std.debug.assert(destroy);
+    // Keep a zero-reference standard entry alive for the process lifetime.
+    // Native tab selection can unrealize the outgoing renderer before
+    // realizing the incoming renderer. Destroying the entry in that gap
+    // recompiles identical pipelines on every tab switch, and Metal retains
+    // the associated driver allocations after the objects are released.
+}
 
-        if (shared_standard_entries.items.len == 0) {
-            shared_standard_entries.deinit(shared_standard_allocator);
-            shared_standard_entries = .empty;
-        }
+fn clearSharedStandardCacheForTesting() void {
+    shared_standard_mutex.lock();
+    defer shared_standard_mutex.unlock();
+
+    for (shared_standard_entries.items) |entry| {
+        std.debug.assert(entry.references == 0);
+        var owned: Shaders = .{
+            .library = entry.library,
+            .pipelines = entry.pipelines,
+            .post_pipelines = entry.post_pipelines,
+        };
+        owned.deinit(entry.resource_allocator);
+        shared_standard_allocator.destroy(entry);
     }
-    shared_standard_mutex.unlock();
-
-    if (!destroy) return;
-
-    var owned: Shaders = .{
-        .library = entry.library,
-        .pipelines = entry.pipelines,
-        .post_pipelines = entry.post_pipelines,
-    };
-    owned.deinit(entry.resource_allocator);
-    shared_standard_allocator.destroy(entry);
+    shared_standard_entries.deinit(shared_standard_allocator);
+    shared_standard_entries = .empty;
 }
 
 /// The uniforms that are passed to our shaders.
@@ -460,6 +458,7 @@ test "standard shaders reuse pipeline state across surfaces and restores" {
         }
     }
 
+    clearSharedStandardCacheForTesting();
     shared_standard_mutex.lock();
     defer shared_standard_mutex.unlock();
     try testing.expectEqual(@as(usize, 0), shared_standard_entries.items.len);
@@ -510,11 +509,14 @@ test "concurrent standard shader initialization compiles once" {
     start.set();
     for (&threads) |*thread| thread.join();
 
-    defer for (&contexts) |*context| {
-        if (context.shaders) |*value| {
-            value.deinit(std.heap.c_allocator);
+    defer {
+        for (&contexts) |*context| {
+            if (context.shaders) |*value| {
+                value.deinit(std.heap.c_allocator);
+            }
         }
-    };
+        clearSharedStandardCacheForTesting();
+    }
 
     for (&contexts) |*context| {
         if (context.err) |err| return err;
@@ -556,6 +558,7 @@ test "standard shader cache survives a renderer handoff gap" {
         .bgra8unorm,
     );
     restored.deinit(testing.allocator);
+    defer clearSharedStandardCacheForTesting();
 
     try testing.expectEqual(
         @as(usize, 1),
