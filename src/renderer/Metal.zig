@@ -39,6 +39,7 @@ pub const custom_shader_y_is_down = true;
 
 /// Triple buffering.
 pub const swap_chain_count = 3;
+const command_queue_max_inflight: usize = swap_chain_count;
 
 const log = std.log.scoped(.metal);
 
@@ -158,8 +159,8 @@ const RecreatableCommandQueue = struct {
         return .{
             .value = device.msgSend(
                 objc.Object,
-                objc.sel("newCommandQueue"),
-                .{},
+                objc.sel("newCommandQueueWithMaxCommandBufferCount:"),
+                .{command_queue_max_inflight},
             ),
         };
     }
