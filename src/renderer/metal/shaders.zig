@@ -531,6 +531,38 @@ test "concurrent standard shader initialization compiles once" {
     );
 }
 
+test "standard shader cache survives a renderer handoff gap" {
+    const testing = std.testing;
+    const device_ptr = mtl.MTLCreateSystemDefaultDevice() orelse {
+        return error.SkipZigTest;
+    };
+    const device = objc.Object.fromId(device_ptr);
+    defer device.release();
+
+    shared_standard_build_count.store(0, .monotonic);
+
+    var hidden = try Shaders.init(
+        testing.allocator,
+        device,
+        &.{},
+        .bgra8unorm,
+    );
+    hidden.deinit(testing.allocator);
+
+    var restored = try Shaders.init(
+        testing.allocator,
+        device,
+        &.{},
+        .bgra8unorm,
+    );
+    restored.deinit(testing.allocator);
+
+    try testing.expectEqual(
+        @as(usize, 1),
+        shared_standard_build_count.load(.monotonic),
+    );
+}
+
 /// This is a single parameter for the terminal cell shader.
 pub const CellText = extern struct {
     glyph_pos: [2]u32 align(8) = .{ 0, 0 },
