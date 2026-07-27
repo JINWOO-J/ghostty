@@ -236,6 +236,7 @@ const SharedStandardShaders = struct {
 const shared_standard_allocator = std.heap.c_allocator;
 var shared_standard_mutex: std.Thread.Mutex = .{};
 var shared_standard_entries: std.ArrayListUnmanaged(*SharedStandardShaders) = .empty;
+var shared_standard_build_count = std.atomic.Value(usize).init(0);
 
 fn initSharedStandard(
     alloc: Allocator,
@@ -251,6 +252,7 @@ fn initSharedStandard(
         return shadersFromSharedStandard(entry);
     }
 
+    _ = shared_standard_build_count.fetchAdd(1, .monotonic);
     var candidate = try Shaders.initOwned(alloc, device, &.{}, pixel_format);
     const entry = shared_standard_allocator.create(SharedStandardShaders) catch |err| {
         candidate.deinit(alloc);
@@ -476,6 +478,72 @@ test "standard shaders reuse pipeline state across surfaces and restores" {
     shared_standard_mutex.lock();
     defer shared_standard_mutex.unlock();
     try testing.expectEqual(@as(usize, 0), shared_standard_entries.items.len);
+}
+
+test "concurrent standard shader initialization compiles once" {
+    const testing = std.testing;
+    const device_ptr = mtl.MTLCreateSystemDefaultDevice() orelse {
+        return error.SkipZigTest;
+    };
+    const device = objc.Object.fromId(device_ptr);
+    defer device.release();
+
+    const Context = struct {
+        start: *std.Thread.ResetEvent,
+        device: objc.Object,
+        shaders: ?Shaders = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.start.wait();
+            self.shaders = Shaders.init(
+                std.heap.c_allocator,
+                self.device,
+                &.{},
+                .bgra8unorm_srgb,
+            ) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+
+    const thread_count = 5;
+    var start: std.Thread.ResetEvent = .{};
+    var contexts: [thread_count]Context = undefined;
+    var threads: [thread_count]std.Thread = undefined;
+
+    shared_standard_build_count.store(0, .monotonic);
+    for (&contexts, &threads) |*context, *thread| {
+        context.* = .{
+            .start = &start,
+            .device = device,
+        };
+        thread.* = try std.Thread.spawn(.{}, Context.run, .{context});
+    }
+
+    start.set();
+    for (&threads) |*thread| thread.join();
+
+    defer for (&contexts) |*context| {
+        if (context.shaders) |*value| {
+            value.deinit(std.heap.c_allocator);
+        }
+    };
+
+    for (&contexts) |*context| {
+        if (context.err) |err| return err;
+        try testing.expect(context.shaders != null);
+        try testing.expectEqual(
+            contexts[0].shaders.?.pipelines.bg_color.state.value,
+            context.shaders.?.pipelines.bg_color.state.value,
+        );
+    }
+
+    try testing.expectEqual(
+        @as(usize, 1),
+        shared_standard_build_count.load(.monotonic),
+    );
 }
 
 /// This is a single parameter for the terminal cell shader.
