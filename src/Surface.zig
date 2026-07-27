@@ -2547,6 +2547,15 @@ pub const KeyboardCopySelectionKind = enum(c_int) {
     line,
 };
 
+pub const KeyboardCopyCursorSnapshot = extern struct {
+    column: u16,
+    row: u16,
+    width_cells: u16,
+    color_red: u8,
+    color_green: u8,
+    color_blue: u8,
+};
+
 const KeyboardSelectionCell = struct {
     pin: terminal.Pin,
     width_cells: u16,
@@ -2920,6 +2929,91 @@ fn writeKeyboardCopyCursorViewport(
     return true;
 }
 
+fn effectiveKeyboardCopyCursorColor(
+    runtime_override: ?terminal.color.RGB,
+    configured: ?configpkg.Config.TerminalColor,
+    foreground: terminal.color.RGB,
+    background: terminal.color.RGB,
+    palette: *const terminal.color.Palette,
+    bold_color: ?terminal.Style.BoldColor,
+    pin: terminal.Pin,
+) terminal.color.RGB {
+    if (runtime_override) |color| return color;
+    const configured_color = configured orelse return foreground;
+    return switch (configured_color) {
+        .color => |color| color.toTerminalRGB(),
+        inline .@"cell-foreground",
+        .@"cell-background",
+        => |_, tag| {
+            const cell = pin.rowAndCell().cell;
+            const style = pin.style(cell);
+            const cell_foreground = style.fg(.{
+                .default = foreground,
+                .palette = palette,
+                .bold = bold_color,
+            });
+            const cell_background = style.bg(
+                cell,
+                palette,
+            ) orelse background;
+            return switch (tag) {
+                .color => unreachable,
+                .@"cell-foreground" => if (style.flags.inverse)
+                    cell_background
+                else
+                    cell_foreground,
+                .@"cell-background" => if (style.flags.inverse)
+                    cell_foreground
+                else
+                    cell_background,
+            };
+        },
+    };
+}
+
+fn writeKeyboardCopyCursorSnapshot(
+    self: *Surface,
+    screen: *terminal.Screen,
+    resolution: KeyboardCopyCursorResolution,
+    snapshot: *KeyboardCopyCursorSnapshot,
+) bool {
+    var column: u16 = 0;
+    var row: u16 = 0;
+    var width_cells: u16 = 0;
+    if (!writeKeyboardCopyCursorViewport(
+        screen,
+        resolution,
+        &column,
+        &row,
+        &width_cells,
+    )) return false;
+
+    var foreground = self.io.terminal.colors.foreground.get() orelse
+        self.io.config.foreground.toTerminalRGB();
+    var background = self.io.terminal.colors.background.get() orelse
+        self.io.config.background.toTerminalRGB();
+    if (self.io.terminal.modes.get(.reverse_colors))
+        std.mem.swap(terminal.color.RGB, &foreground, &background);
+    const color = effectiveKeyboardCopyCursorColor(
+        self.io.terminal.colors.cursor.override,
+        self.io.config.cursor_color,
+        foreground,
+        background,
+        &self.io.terminal.colors.palette.current,
+        self.io.config.bold_color,
+        resolution.cell.pin,
+    );
+    snapshot.* = .{
+        .column = column,
+        .row = row,
+        .width_cells = width_cells,
+        .color_red = color.r,
+        .color_green = color.g,
+        .color_blue = color.b,
+    };
+    return true;
+}
+
 /// Start or stop Ghostty's tracked keyboard-copy cursor.
 pub fn keyboardCopyCursorSet(
     self: *Surface,
@@ -2974,6 +3068,26 @@ pub fn keyboardCopyCursorViewport(
         resolved_column,
         resolved_row,
         width_cells,
+    );
+}
+
+/// Return tracked copy cursor geometry and its effective runtime color.
+pub fn keyboardCopyCursorSnapshot(
+    self: *Surface,
+    snapshot: *KeyboardCopyCursorSnapshot,
+) !bool {
+    self.renderer_state.lockDemand();
+    defer self.renderer_state.unlockDemand();
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const resolution = try self.resolveKeyboardCopyCursor(screen) orelse
+        return false;
+    if (resolution.changed) try self.queueRender();
+    return writeKeyboardCopyCursorSnapshot(
+        self,
+        screen,
+        resolution,
+        snapshot,
     );
 }
 
@@ -7897,6 +8011,59 @@ test "Surface: counted horizontal movement crosses multiple wide wraps" {
         screen.pages.pointFromPin(.viewport, moved.pin).?,
     );
     try testing.expectEqual(@as(u16, 2), moved.width_cells);
+}
+
+test "Surface: copy cursor color follows runtime and cell semantics" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(alloc, .{ .cols = 4, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b[38;2;10;20;30;48;2;40;50;60mX");
+
+    const screen = t.screens.active;
+    const pin = viewportPin(screen, 0, 0).?;
+    const foreground: terminal.color.RGB = .{ .r = 1, .g = 2, .b = 3 };
+    const background: terminal.color.RGB = .{ .r = 4, .g = 5, .b = 6 };
+
+    try testing.expectEqual(
+        terminal.color.RGB{ .r = 10, .g = 20, .b = 30 },
+        effectiveKeyboardCopyCursorColor(
+            null,
+            .@"cell-foreground",
+            foreground,
+            background,
+            &t.colors.palette.current,
+            null,
+            pin,
+        ),
+    );
+    try testing.expectEqual(
+        terminal.color.RGB{ .r = 40, .g = 50, .b = 60 },
+        effectiveKeyboardCopyCursorColor(
+            null,
+            .@"cell-background",
+            foreground,
+            background,
+            &t.colors.palette.current,
+            null,
+            pin,
+        ),
+    );
+    try testing.expectEqual(
+        terminal.color.RGB{ .r = 90, .g = 80, .b = 70 },
+        effectiveKeyboardCopyCursorColor(
+            .{ .r = 90, .g = 80, .b = 70 },
+            .@"cell-foreground",
+            foreground,
+            background,
+            &t.colors.palette.current,
+            null,
+            pin,
+        ),
+    );
 }
 
 test "Surface: tracked copy cursor is not reinterpreted after viewport drift" {

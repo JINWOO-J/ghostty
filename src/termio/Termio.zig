@@ -191,6 +191,7 @@ pub const DerivedConfig = struct {
     cursor_style: terminalpkg.CursorStyle,
     cursor_blink: ?bool,
     cursor_color: ?configpkg.Config.TerminalColor,
+    bold_color: ?terminalpkg.Style.BoldColor,
     foreground: configpkg.Config.Color,
     background: configpkg.Config.Color,
     osc_color_report_format: configpkg.Config.OSCColorReportFormat,
@@ -227,6 +228,10 @@ pub const DerivedConfig = struct {
             .cursor_style = config.@"cursor-style",
             .cursor_blink = config.@"cursor-style-blink",
             .cursor_color = config.@"cursor-color",
+            .bold_color = if (config.@"bold-color") |color|
+                color.toTerminal()
+            else
+                null,
             .foreground = config.foreground,
             .background = config.background,
             .osc_color_report_format = config.@"osc-color-report-format",
@@ -244,6 +249,36 @@ pub const DerivedConfig = struct {
         self.arena.deinit();
     }
 };
+
+fn updateThemeColorSemantics(
+    target: *DerivedConfig,
+    source: *const DerivedConfig,
+) void {
+    target.cursor_color = source.cursor_color;
+    target.bold_color = source.bold_color;
+}
+
+test "Termio: theme config updates cursor semantics" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var base_config = try configpkg.Config.default(alloc);
+    defer base_config.deinit();
+    var target = try DerivedConfig.init(alloc, &base_config);
+    defer target.deinit();
+
+    var theme_config = try configpkg.Config.default(alloc);
+    defer theme_config.deinit();
+    theme_config.@"cursor-color" = .@"cell-background";
+    theme_config.@"bold-color" = .bright;
+    var theme = try DerivedConfig.init(alloc, &theme_config);
+    defer theme.deinit();
+
+    updateThemeColorSemantics(&target, &theme);
+
+    try testing.expect(std.meta.eql(theme.cursor_color, target.cursor_color));
+    try testing.expect(std.meta.eql(theme.bold_color, target.bold_color));
+}
 
 /// Initialize the termio state.
 ///
@@ -585,6 +620,7 @@ pub fn changeColorConfig(self: *Termio, config: *const DerivedConfig) void {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
 
+    updateThemeColorSemantics(&self.config, config);
     self.terminal.colors.palette.changeDefault(config.palette);
     self.terminal.colors.background.default = config.background.toTerminalRGB();
     self.terminal.colors.foreground.default = config.foreground.toTerminalRGB();
