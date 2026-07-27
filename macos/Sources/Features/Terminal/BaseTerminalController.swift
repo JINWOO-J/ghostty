@@ -26,6 +26,17 @@ enum RendererTabSelection: Equatable {
     }
 }
 
+enum RendererTabVisibility {
+    static func isVisible(
+        selection: RendererTabSelection,
+        occlusionVisible: Bool,
+        isKeyOrMain: Bool
+    ) -> Bool {
+        guard selection != .deselected else { return false }
+        return occlusionVisible || (selection == .selected && isKeyOrMain)
+    }
+}
+
 /// A base class for windows that can contain Ghostty windows. This base class implements
 /// the bare minimum functionality that every terminal window in Ghostty should implement.
 ///
@@ -1389,8 +1400,11 @@ class BaseTerminalController: NSWindowController,
         selection: RendererTabSelection
     ) -> Bool {
         guard let window else { return false }
-        guard selection != .deselected else { return false }
-        return window.occlusionState.contains(.visible)
+        return RendererTabVisibility.isVisible(
+            selection: selection,
+            occlusionVisible: window.occlusionState.contains(.visible),
+            isKeyOrMain: window.isKeyWindow || window.isMainWindow
+        )
     }
 
     private func syncSurfaceTreeOcclusionState() {
