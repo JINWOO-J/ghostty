@@ -461,6 +461,9 @@ test "tokened surface updates defer delivery and teardown invalidates them" {
 test "clear surface drops displayed IOSurface without disabling future updates" {
     const testing = std.testing;
 
+    try testing.expect(surfaceClearRunsInline(true));
+    try testing.expect(!surfaceClearRunsInline(false));
+
     var layer = try IOSurfaceLayer.init();
     defer layer.release();
     var surface = try IOSurface.init(.{
