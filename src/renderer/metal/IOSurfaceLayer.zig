@@ -209,23 +209,29 @@ pub fn invalidateSurfaceUpdates(self: *IOSurfaceLayer) void {
 }
 
 /// Clear the last presented IOSurface without disabling future assignments.
-/// The synchronous main-queue hop runs after any earlier queued assignments,
-/// so renderer teardown cannot be followed by a stale surface becoming layer
-/// contents again.
+/// Renderer teardown enqueues this after every frame lease drains, so FIFO
+/// main-queue ordering clears earlier assignments without synchronously
+/// waiting on AppKit while it may be joining the renderer thread.
 pub fn clearSurface(self: *IOSurfaceLayer) void {
     var block = ClearSurfaceBlock.init(.{
         .layer = self.layer.value,
     }, &clearSurfaceCallback);
 
     const NSThread = objc.getClass("NSThread").?;
-    if (NSThread.msgSend(bool, "isMainThread", .{})) {
+    if (surfaceClearRunsInline(
+        NSThread.msgSend(bool, "isMainThread", .{}),
+    )) {
         clearSurfaceCallback(&block);
     } else {
-        macos.dispatch.dispatch_sync(
+        macos.dispatch.dispatch_async(
             @ptrCast(macos.dispatch.queue.getMain()),
             @ptrCast(&block),
         );
     }
+}
+
+fn surfaceClearRunsInline(is_main_thread: bool) bool {
+    return is_main_thread;
 }
 
 /// Sets the layer's `contents` to the provided IOSurface.
