@@ -35,6 +35,12 @@ enum RendererTabVisibility {
         guard selection != .deselected else { return false }
         return occlusionVisible || (selection == .selected && isKeyOrMain)
     }
+
+    static func shouldReclaimSynchronously(
+        selection: RendererTabSelection
+    ) -> Bool {
+        selection == .deselected
+    }
 }
 
 /// A base class for windows that can contain Ghostty windows. This base class implements
@@ -106,8 +112,9 @@ class BaseTerminalController: NSWindowController,
     private var eventMonitor: Any?
 
     /// Hidden terminal windows keep their PTYs and terminal state but release
-    /// GPU swap-chain resources after this grace period.
-    private static let rendererReclamationDelay: TimeInterval = 5
+    /// GPU swap-chain resources in the same tab-selection pass. Retry only if
+    /// the renderer state handoff is temporarily unavailable.
+    private static let rendererReclamationRetryDelay: TimeInterval = 0.05
     private var rendererReclamationTimer: Timer?
     private weak var observedRendererTabGroup: NSWindowTabGroup?
     private var rendererTabSelectionObservation: NSKeyValueObservation?
@@ -1357,6 +1364,16 @@ class BaseTerminalController: NSWindowController,
 
         for controller in controllers {
             controller.syncRendererTabSelectionObservation()
+        }
+
+        // Publish every deselection before realizing the selected tab. This
+        // prevents a tab switch from growing two renderer allocations at once.
+        for controller in controllers
+            where controller.rendererTabSelection == .deselected {
+            controller.syncSurfaceTreeOcclusionState()
+        }
+        for controller in controllers
+            where controller.rendererTabSelection != .deselected {
             controller.syncSurfaceTreeOcclusionState()
         }
     }
@@ -1432,39 +1449,47 @@ class BaseTerminalController: NSWindowController,
                 ghostty_surface_set_occlusion(surface, true)
                 view.isWindowVisible = true
             } else {
-                // Stop drawing immediately. The renderer itself stays warm for
-                // the grace period so rapid tab switches remain instant.
+                // Stop drawing before releasing this deselected tab's renderer.
                 ghostty_surface_set_occlusion(surface, false)
                 view.isWindowVisible = false
             }
         }
 
-        if selection == .deselected {
-            scheduleRendererReclamation()
+        if RendererTabVisibility.shouldReclaimSynchronously(
+            selection: selection
+        ) {
+            reclaimDeselectedRenderers()
         }
     }
 
-    private func scheduleRendererReclamation() {
+    private func reclaimDeselectedRenderers() {
+        guard rendererTabSelection == .deselected else { return }
+
+        rendererReclamationTimer?.invalidate()
+        rendererReclamationTimer = nil
+
+        var needsRetry = false
+        for view in surfaceTree where !view.isWindowVisible {
+            if !view.setRendererRealized(false) {
+                needsRetry = true
+            }
+        }
+
+        if needsRetry {
+            scheduleRendererReclamationRetry()
+        }
+    }
+
+    private func scheduleRendererReclamationRetry() {
         guard rendererReclamationTimer == nil else { return }
 
         rendererReclamationTimer = Timer.scheduledTimer(
-            withTimeInterval: Self.rendererReclamationDelay,
+            withTimeInterval: Self.rendererReclamationRetryDelay,
             repeats: false
         ) { [weak self] _ in
             guard let self else { return }
             self.rendererReclamationTimer = nil
-            guard self.rendererTabSelection == .deselected else { return }
-
-            var needsRetry = false
-            for view in self.surfaceTree where !view.isWindowVisible {
-                if !view.setRendererRealized(false) {
-                    needsRetry = true
-                }
-            }
-
-            if needsRetry {
-                self.scheduleRendererReclamation()
-            }
+            self.reclaimDeselectedRenderers()
         }
     }
 
