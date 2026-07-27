@@ -248,7 +248,15 @@ fn initSharedStandard(
         .pixel_format = pixel_format,
     };
 
-    if (retainSharedStandard(key)) |entry| {
+    // Pipeline compilation is expensive and Metal retains significant
+    // process-wide compiler state even after duplicate pipelines are
+    // released. Serialize cache misses so concurrent surface initialization
+    // cannot compile the same standard pipeline collection more than once.
+    shared_standard_mutex.lock();
+    defer shared_standard_mutex.unlock();
+
+    if (findSharedStandardLocked(key)) |entry| {
+        entry.references += 1;
         return shadersFromSharedStandard(entry);
     }
 
@@ -267,40 +275,17 @@ fn initSharedStandard(
         .references = 1,
     };
 
-    shared_standard_mutex.lock();
-    if (findSharedStandardLocked(key)) |existing| {
-        existing.references += 1;
-        shared_standard_mutex.unlock();
-
-        candidate.deinit(alloc);
-        shared_standard_allocator.destroy(entry);
-        return shadersFromSharedStandard(existing);
-    }
-
     shared_standard_entries.append(
         shared_standard_allocator,
         entry,
     ) catch |err| {
-        shared_standard_mutex.unlock();
         candidate.deinit(alloc);
         shared_standard_allocator.destroy(entry);
         return err;
     };
-    shared_standard_mutex.unlock();
 
     candidate.shared = entry;
     return candidate;
-}
-
-fn retainSharedStandard(
-    key: SharedStandardShadersKey,
-) ?*SharedStandardShaders {
-    shared_standard_mutex.lock();
-    defer shared_standard_mutex.unlock();
-
-    const entry = findSharedStandardLocked(key) orelse return null;
-    entry.references += 1;
-    return entry;
 }
 
 fn findSharedStandardLocked(
