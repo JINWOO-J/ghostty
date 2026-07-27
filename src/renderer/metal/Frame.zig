@@ -17,6 +17,34 @@ const FramePresentation = rendererpkg.FramePresentation;
 
 const log = std.log.scoped(.metal);
 
+test "metal frame command buffers use renderer-owned resource lifetimes" {
+    try std.testing.expectEqualStrings(
+        "commandBufferWithUnretainedReferences",
+        command_buffer_selector,
+    );
+
+    try std.testing.expect(!commandBufferRequiresMetalRetention(
+        false,
+        false,
+        false,
+    ));
+    try std.testing.expect(commandBufferRequiresMetalRetention(
+        true,
+        false,
+        false,
+    ));
+    try std.testing.expect(commandBufferRequiresMetalRetention(
+        false,
+        true,
+        false,
+    ));
+    try std.testing.expect(commandBufferRequiresMetalRetention(
+        false,
+        false,
+        true,
+    ));
+}
+
 /// Options for beginning a frame.
 pub const Options = struct {
     /// MTLCommandQueue
