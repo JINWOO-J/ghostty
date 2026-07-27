@@ -41,4 +41,12 @@ struct RendererTabSelectionTests {
             isKeyOrMain: true
         ) == .selected)
     }
+
+    @Test func keyWindowRemainsVisibleWhileOcclusionStateLagsTabSelection() {
+        #expect(RendererTabVisibility.isVisible(
+            selection: .selected,
+            occlusionVisible: false,
+            isKeyOrMain: true
+        ))
+    }
 }
