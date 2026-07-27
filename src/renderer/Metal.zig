@@ -39,7 +39,6 @@ pub const custom_shader_y_is_down = true;
 
 /// Triple buffering.
 pub const swap_chain_count = 3;
-const command_queue_max_inflight: usize = swap_chain_count;
 
 const log = std.log.scoped(.metal);
 
@@ -159,8 +158,8 @@ const RecreatableCommandQueue = struct {
         return .{
             .value = device.msgSend(
                 objc.Object,
-                objc.sel("newCommandQueueWithMaxCommandBufferCount:"),
-                .{command_queue_max_inflight},
+                objc.sel("newCommandQueue"),
+                .{},
             ),
         };
     }
@@ -864,13 +863,6 @@ test "metal command queue releases and recreates across renderer realization" {
 
     queue.ensureLive(device);
     try testing.expect(queue.isLive());
-}
-
-test "metal command queue capacity matches the swap chain" {
-    try std.testing.expectEqual(
-        @as(usize, swap_chain_count),
-        command_queue_max_inflight,
-    );
 }
 
 test "metal completion generation rejects old callbacks after rotation" {
