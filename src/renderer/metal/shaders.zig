@@ -261,6 +261,53 @@ pub const Uniforms = extern struct {
     };
 };
 
+test "standard shaders reuse pipeline state across surfaces and restores" {
+    const testing = std.testing;
+    const device_ptr = mtl.MTLCreateSystemDefaultDevice() orelse {
+        return error.SkipZigTest;
+    };
+    const device = objc.Object.fromId(device_ptr);
+    defer device.release();
+
+    var active = try Shaders.init(
+        testing.allocator,
+        device,
+        &.{},
+        .bgra8unorm,
+    );
+    defer active.deinit(testing.allocator);
+
+    {
+        var hidden = try Shaders.init(
+            testing.allocator,
+            device,
+            &.{},
+            .bgra8unorm,
+        );
+        defer hidden.deinit(testing.allocator);
+
+        try testing.expectEqual(
+            active.pipelines.bg_color.state.value,
+            hidden.pipelines.bg_color.state.value,
+        );
+    }
+
+    {
+        var restored = try Shaders.init(
+            testing.allocator,
+            device,
+            &.{},
+            .bgra8unorm,
+        );
+        defer restored.deinit(testing.allocator);
+
+        try testing.expectEqual(
+            active.pipelines.bg_color.state.value,
+            restored.pipelines.bg_color.state.value,
+        );
+    }
+}
+
 /// This is a single parameter for the terminal cell shader.
 pub const CellText = extern struct {
     glyph_pos: [2]u32 align(8) = .{ 0, 0 },
