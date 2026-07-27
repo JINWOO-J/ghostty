@@ -151,12 +151,52 @@ const Presenter = union(enum) {
     }
 };
 
+const RecreatableCommandQueue = struct {
+    value: ?objc.Object,
+
+    fn init(device: objc.Object) RecreatableCommandQueue {
+        return .{
+            .value = device.msgSend(
+                objc.Object,
+                objc.sel("newCommandQueue"),
+                .{},
+            ),
+        };
+    }
+
+    fn deinit(self: *RecreatableCommandQueue) void {
+        self.release();
+    }
+
+    fn release(self: *RecreatableCommandQueue) void {
+        const value = self.value orelse return;
+        self.value = null;
+        value.release();
+    }
+
+    fn ensureLive(
+        self: *RecreatableCommandQueue,
+        device: objc.Object,
+    ) void {
+        if (self.value != null) return;
+        self.* = .init(device);
+    }
+
+    fn get(self: *const RecreatableCommandQueue) objc.Object {
+        return self.value orelse unreachable;
+    }
+
+    fn isLive(self: *const RecreatableCommandQueue) bool {
+        return self.value != null;
+    }
+};
+
 presenter: Presenter,
 
 /// MTLDevice
 device: objc.Object,
 /// MTLCommandQueue
-queue: objc.Object,
+queue: RecreatableCommandQueue,
 
 /// Alpha blending mode
 blending: configpkg.Config.AlphaBlending,
@@ -189,8 +229,8 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
     // Choose our MTLDevice and create a MTLCommandQueue for that device.
     const device = try chooseDevice();
     errdefer device.release();
-    const queue = device.msgSend(objc.Object, objc.sel("newCommandQueue"), .{});
-    errdefer queue.release();
+    var queue = RecreatableCommandQueue.init(device);
+    errdefer queue.deinit();
 
     // Grab metadata about the device.
     const default_storage_mode: mtl.MTLResourceOptions.StorageMode = switch (comptime builtin.os.tag) {
@@ -228,7 +268,7 @@ pub fn deinit(self: *Metal) void {
     // Init failures can deinitialize Metal without the generic renderer's
     // prepare/finish hooks. Invalidation is idempotent.
     self.completion_generation.deinit();
-    self.queue.release();
+    self.queue.deinit();
     self.device.release();
     self.presenter.deinit();
 }
@@ -267,6 +307,14 @@ pub fn displayUnrealizedAfterDrain(self: *Metal) void {
         .layer => |*layer| layer.clearSurface(),
         .external, .external_leased => {},
     }
+    self.queue.release();
+}
+
+/// Restore the per-renderer submission queue after hidden-tab reclamation.
+/// Pipeline state remains shared, while the queue's driver allocation pools
+/// exist only for renderers that can submit frames.
+pub fn displayRealized(self: *Metal) void {
+    self.queue.ensureLive(self.device);
 }
 
 /// Install a distinct gate before replacement swap-chain frames can be used.
@@ -645,7 +693,7 @@ pub inline fn beginFrame(
         value.delivery_gate_userdata = renderer;
     }
     return try Frame.begin(.{
-        .queue = self.queue,
+        .queue = self.queue.get(),
         .completion_lifetime = self.completion_generation.lifetime(),
     }, target, frame_token, host_context, gated);
 }
