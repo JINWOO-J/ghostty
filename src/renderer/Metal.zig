@@ -39,6 +39,7 @@ pub const custom_shader_y_is_down = true;
 
 /// Triple buffering.
 pub const swap_chain_count = 3;
+const shared_command_queue_max_inflight: usize = swap_chain_count * 5 + 1;
 
 const log = std.log.scoped(.metal);
 
@@ -212,10 +213,12 @@ fn acquireSharedCommandQueue(device: objc.Object) *SharedCommandQueue {
 
     // Apple recommends one long-lived command queue per GPU. Command queues
     // are thread-safe, so every renderer can submit through this shared queue.
+    // Sixteen slots let five triple-buffered surfaces submit concurrently;
+    // additional surfaces apply backpressure instead of growing driver pools.
     const queue = device.msgSend(
         objc.Object,
-        objc.sel("newCommandQueue"),
-        .{},
+        objc.sel("newCommandQueueWithMaxCommandBufferCount:"),
+        .{shared_command_queue_max_inflight},
     );
     const entry = shared_command_queue_allocator.create(
         SharedCommandQueue,
