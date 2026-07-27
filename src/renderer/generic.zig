@@ -129,6 +129,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         const shaderpkg = GraphicsAPI.shaders;
         const Shaders = shaderpkg.Shaders;
 
+        fn disposeOwned(resource: anytype, comptime purge: bool) void {
+            const Resource = @TypeOf(resource.*);
+            if (comptime purge and @hasDecl(Resource, "discard")) {
+                resource.discard();
+            } else {
+                resource.deinit();
+            }
+        }
+
         /// Allocator that can be used
         alloc: std.mem.Allocator,
 
@@ -311,6 +320,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             /// the renderer is deinited after that.
             defunct: bool = false,
 
+            const DrainedFrames = struct {
+                swap_chain: *SwapChain,
+                indices: [buf_count]usize = undefined,
+                count: usize = 0,
+
+                fn dispose(
+                    self: *DrainedFrames,
+                    comptime purge: bool,
+                ) void {
+                    for (self.indices[0..self.count]) |index| {
+                        self.swap_chain.frames[index]
+                            .deinitWithDisposition(purge);
+                    }
+                    self.count = 0;
+                }
+            };
+
             pub fn init(api: GraphicsAPI, custom_shaders: bool) !SwapChain {
                 var result: SwapChain = .{ .frames = undefined };
 
@@ -323,7 +349,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             pub fn deinit(self: *SwapChain) void {
-                if (self.defunct) return;
+                var drained = self.drainForDeinit();
+                drained.dispose(false);
+            }
+
+            pub fn discard(self: *SwapChain) void {
+                var drained = self.drainForDeinit();
+                drained.dispose(true);
+            }
+
+            fn drainForDeinit(self: *SwapChain) DrainedFrames {
+                var drained: DrainedFrames = .{ .swap_chain = self };
+                if (self.defunct) return drained;
                 self.defunct = true;
                 self.leases.beginDeinit();
 
@@ -335,19 +372,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // slots still owned by the GPU or host. `defunct` is already
                 // set, so no new acquire races us.
                 if (comptime builtin.os.tag == .ios) {
-                    var acquired: usize = 0;
-                    while (acquired < buf_count) : (acquired += 1) {
+                    while (drained.count < buf_count) {
                         const index = self.leases.takeForDeinit(
                             frame_acquire_timeout_ns,
                         ) catch break;
-                        self.frames[index].deinit();
+                        drained.indices[drained.count] = index;
+                        drained.count += 1;
                     }
                 } else {
                     for (0..buf_count) |_| {
                         const index = self.leases.takeForDeinit(null) catch unreachable;
-                        self.frames[index].deinit();
+                        drained.indices[drained.count] = index;
+                        drained.count += 1;
                     }
                 }
+
+                return drained;
             }
 
             const AcquiredFrame = struct {
@@ -512,14 +552,28 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             pub fn deinit(self: *FrameState) void {
-                self.target.deinit();
-                self.uniforms.deinit();
-                self.cells.deinit();
-                self.cells_bg.deinit();
-                self.grayscale.deinit();
-                self.color.deinit();
-                self.bg_image_buffer.deinit();
-                if (self.custom_shader_state) |*state| state.deinit();
+                self.deinitWithDisposition(false);
+            }
+
+            pub fn discard(self: *FrameState) void {
+                self.deinitWithDisposition(true);
+            }
+
+            fn deinitWithDisposition(
+                self: *FrameState,
+                comptime purge: bool,
+            ) void {
+                // SwapChain only calls this after the frame lease drains.
+                disposeOwned(&self.target, purge);
+                disposeOwned(&self.uniforms, purge);
+                disposeOwned(&self.cells, purge);
+                disposeOwned(&self.cells_bg, purge);
+                disposeOwned(&self.grayscale, purge);
+                disposeOwned(&self.color, purge);
+                disposeOwned(&self.bg_image_buffer, purge);
+                if (self.custom_shader_state) |*state| {
+                    state.deinitWithDisposition(purge);
+                }
             }
 
             pub fn resize(
@@ -601,10 +655,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             pub fn deinit(self: *CustomShaderState) void {
-                self.front_texture.deinit();
-                self.back_texture.deinit();
-                self.sampler.deinit();
-                self.uniforms.deinit();
+                self.deinitWithDisposition(false);
+            }
+
+            pub fn discard(self: *CustomShaderState) void {
+                self.deinitWithDisposition(true);
+            }
+
+            fn deinitWithDisposition(
+                self: *CustomShaderState,
+                comptime purge: bool,
+            ) void {
+                disposeOwned(&self.front_texture, purge);
+                disposeOwned(&self.back_texture, purge);
+                disposeOwned(&self.sampler, purge);
+                disposeOwned(&self.uniforms, purge);
             }
 
             pub fn resize(
@@ -1097,20 +1162,34 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.api.displayUnrealized();
             }
 
-            // Lock the draw mutex so that we can
-            // safely deinitialize our GPU resources.
-            self.draw_mutex.lock();
-            defer self.draw_mutex.unlock();
-
-            // We deinit our swap chain and shaders.
-            //
-            // This will mark them as defunct so that they
-            // can't be double-freed or used in draw calls.
-            self.swap_chain.deinit();
-            if (@hasDecl(GraphicsAPI, "finishFrameGeneration")) {
-                self.api.finishFrameGeneration();
+            var drained: SwapChain.DrainedFrames = undefined;
+            {
+                // Mark the swap chain defunct and wait for every available
+                // frame lease before releasing the draw lock.
+                self.draw_mutex.lock();
+                defer self.draw_mutex.unlock();
+                drained = self.swap_chain.drainForDeinit();
+                if (@hasDecl(GraphicsAPI, "finishFrameGeneration")) {
+                    self.api.finishFrameGeneration();
+                }
             }
-            self.shaders.deinit(self.alloc);
+
+            // Flush queued compositor assignments after all frame leases drain.
+            // This must run without the draw mutex because a main-thread host
+            // callback may acquire it.
+            if (@hasDecl(GraphicsAPI, "displayUnrealizedAfterDrain")) {
+                self.api.displayUnrealizedAfterDrain();
+            }
+
+            {
+                // No draw can acquire a defunct swap chain. Clear compositor
+                // ownership first, then make only these teardown resources
+                // purgeable before releasing their final renderer references.
+                self.draw_mutex.lock();
+                defer self.draw_mutex.unlock();
+                drained.dispose(true);
+                self.shaders.deinit(self.alloc);
+            }
         }
 
         fn displayLinkCallback(
@@ -3655,11 +3734,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             texture: *Texture,
         ) !void {
             if (atlas.size > texture.width) {
-                // Free our old texture
+                const replacement = try self.api.initAtlasTexture(atlas);
                 texture.*.deinit();
-
-                // Reallocate
-                texture.* = try self.api.initAtlasTexture(atlas);
+                texture.* = replacement;
             }
 
             try texture.replaceRegion(0, 0, atlas.size, atlas.size, atlas.data);

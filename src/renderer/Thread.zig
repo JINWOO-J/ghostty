@@ -54,16 +54,22 @@ const VisibilityDrainState = struct {
 const SurfaceStateRequests = struct {
     const Update = struct {
         visible: ?bool = null,
+        renderer_realized: ?bool = null,
         focused: ?bool = null,
         display_id: ?u32 = null,
     };
 
     visible: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    renderer_realized: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     focused: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
     display_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     fn publishVisible(self: *SurfaceStateRequests, value: bool) void {
         self.visible.store(if (value) 2 else 1, .release);
+    }
+
+    fn publishRendererRealized(self: *SurfaceStateRequests, value: bool) void {
+        self.renderer_realized.store(if (value) 2 else 1, .release);
     }
 
     fn publishFocused(self: *SurfaceStateRequests, value: bool) void {
@@ -86,6 +92,18 @@ const SurfaceStateRequests = struct {
         );
     }
 
+    fn restoreRendererRealizedIfEmpty(
+        self: *SurfaceStateRequests,
+        value: bool,
+    ) void {
+        _ = self.renderer_realized.cmpxchgStrong(
+            0,
+            if (value) 2 else 1,
+            .release,
+            .monotonic,
+        );
+    }
+
     fn restoreDisplayIDIfEmpty(
         self: *SurfaceStateRequests,
         value: u32,
@@ -101,6 +119,9 @@ const SurfaceStateRequests = struct {
     fn take(self: *SurfaceStateRequests) Update {
         return .{
             .visible = decodeBool(self.visible.swap(0, .acq_rel)),
+            .renderer_realized = decodeBool(
+                self.renderer_realized.swap(0, .acq_rel),
+            ),
             .focused = decodeBool(self.focused.swap(0, .acq_rel)),
             .display_id = decodeDisplayID(self.display_id.swap(0, .acq_rel)),
         };
@@ -108,6 +129,7 @@ const SurfaceStateRequests = struct {
 
     fn hasPending(self: *const SurfaceStateRequests) bool {
         return self.visible.load(.acquire) != 0 or
+            self.renderer_realized.load(.acquire) != 0 or
             self.focused.load(.acquire) != 0 or
             self.display_id.load(.acquire) != 0;
     }
@@ -535,6 +557,12 @@ surface_state_requests: SurfaceStateRequests = .{},
 /// mailbox handler aborts a drain before its coalesced transition commits.
 renderer_visible: bool = true,
 
+/// Whether the renderer currently owns a live swap chain and shaders.
+/// Renderer-thread owned. Realization requests are idempotent so embedders can
+/// publish authoritative visibility-derived state without mirroring queue
+/// delivery.
+renderer_realized: bool = true,
+
 /// Configuration we need derived from the main config.
 config: DerivedConfig,
 
@@ -776,6 +804,10 @@ pub fn drainMailboxNow(self: *Thread) void {
 /// mailbox capacity. Callers must notify `wakeup` after publishing.
 pub fn publishVisible(self: *Thread, value: bool) void {
     self.surface_state_requests.publishVisible(value);
+}
+
+pub fn publishRendererRealized(self: *Thread, value: bool) void {
+    self.surface_state_requests.publishRendererRealized(value);
 }
 
 pub fn publishFocused(self: *Thread, value: bool) void {
@@ -1153,11 +1185,7 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
             // surface is occluded when this is sent (macOS `drawFrame` early-
             // returns on `!flags.visible`), and both calls take `draw_mutex`.
             .display_realized => |v| {
-                if (v) {
-                    try self.renderer.displayRealized();
-                } else {
-                    self.renderer.displayUnrealized();
-                }
+                try self.applyRendererRealized(v);
             },
         }
     }
@@ -1172,6 +1200,20 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
     // renderer visibility in `renderAfterMailboxDrain`; external iOS rendering
     // deliberately leaves visibility and frame gating to its platform owner.
     if (surface_state.visible) |value| self.applyVisible(&visibility, value);
+    if (surface_state.renderer_realized) |value| {
+        self.applyRendererRealized(value) catch |err| {
+            // A failed GPU recreation remains the desired state. Restore only
+            // into an empty slot so a newer visibility-derived request wins.
+            self.surface_state_requests.restoreRendererRealizedIfEmpty(value);
+            if (surface_state.focused) |focused| {
+                self.surface_state_requests.restoreFocusedIfEmpty(focused);
+            }
+            if (surface_state.display_id) |display_id| {
+                self.surface_state_requests.restoreDisplayIDIfEmpty(display_id);
+            }
+            return err;
+        };
+    }
     if (surface_state.focused) |value| {
         self.applyFocused(value, external_drain) catch |err| {
             // Restore only into an empty slot. A newer publication must remain
@@ -1201,7 +1243,7 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
     var result = applyRendererVisibilityTransition(
         self,
         &self.visibility_regain,
-        visibility.rendererTransition(),
+        self.pendingRendererVisibilityTransition(),
     );
     result.wake_pending = wake_pending;
     return result;
@@ -1218,6 +1260,24 @@ fn applyVisible(
 
     // Timers are intentionally left armed across visibility changes. Their
     // callbacks already consult this renderer-owned flag.
+}
+
+fn applyRendererRealized(self: *Thread, value: bool) !void {
+    if (self.renderer_realized == value) return;
+
+    if (value) {
+        try self.renderer.displayRealized();
+        self.renderer_realized = true;
+        return;
+    }
+
+    // Stop presentation before releasing the swap chain. displayUnrealized
+    // waits for in-flight frame leases, so no draw can retain a released
+    // IOSurface after this call returns.
+    self.visibility_regain.cancel();
+    self.setRendererVisible(false);
+    self.renderer.displayUnrealized();
+    self.renderer_realized = false;
 }
 
 fn applyFocused(self: *Thread, value: bool, external_drain: bool) !void {
@@ -1285,6 +1345,7 @@ fn changeConfig(self: *Thread, config: *const DerivedConfig) !void {
 }
 
 fn updateVisibilityRegainFrame(self: *Thread) bool {
+    if (!self.renderer_realized) return false;
     self.updateFrame(self.flags.cursor_blink_visible) catch |err| {
         log.warn("error rendering err={}", .{err});
         return false;
@@ -1308,6 +1369,7 @@ fn setRendererVisible(self: *Thread, visible: bool) void {
 }
 
 fn pendingRendererVisibilityTransition(self: *Thread) ?bool {
+    if (!self.renderer_realized) return null;
     if (self.renderer_visible == self.flags.visible) return null;
     return self.flags.visible;
 }
@@ -1319,6 +1381,8 @@ fn renderWakeFrame(self: *Thread) void {
 /// Trigger a draw. This will not update frame data or anything, it will
 /// just trigger a draw/paint.
 fn drawFrame(self: *Thread, now: bool) DrawFrameResult {
+    if (!self.renderer_realized) return .skipped_invisible;
+
     // If we're invisible, we do not draw.
     //
     // cmux iOS fork: skip this early-return on iOS. The iOS embedder owns
@@ -1552,7 +1616,7 @@ fn renderCallback(
 
     // Preserve terminal dirty state while hidden. The visibility regain path
     // consumes the accumulated row union in one update before presenting.
-    if (!t.flags.visible) return .disarm;
+    if (!t.flags.visible or !t.renderer_realized) return .disarm;
 
     // Update our frame data
     t.updateFrame(t.flags.cursor_blink_visible) catch |err|
@@ -1705,12 +1769,15 @@ test "surface lifecycle state bypasses a full renderer mailbox and keeps latest 
     var state: SurfaceStateRequests = .{};
     state.publishVisible(false);
     state.publishVisible(true);
+    state.publishRendererRealized(false);
+    state.publishRendererRealized(true);
     state.publishFocused(false);
     state.publishDisplayID(7);
     state.publishDisplayID(42);
 
     const update = state.take();
     try std.testing.expectEqual(true, update.visible);
+    try std.testing.expectEqual(true, update.renderer_realized);
     try std.testing.expectEqual(false, update.focused);
     try std.testing.expectEqual(@as(u32, 42), update.display_id);
     try std.testing.expectEqual(
@@ -1724,19 +1791,24 @@ test "surface lifecycle retry restoration preserves newer publications" {
     try std.testing.expect(!state.hasPending());
 
     state.restoreFocusedIfEmpty(false);
+    state.restoreRendererRealizedIfEmpty(false);
     state.restoreDisplayIDIfEmpty(7);
     try std.testing.expect(state.hasPending());
     const restored = state.take();
     try std.testing.expectEqual(false, restored.focused);
+    try std.testing.expectEqual(false, restored.renderer_realized);
     try std.testing.expectEqual(@as(u32, 7), restored.display_id);
     try std.testing.expect(!state.hasPending());
 
     state.publishFocused(true);
+    state.publishRendererRealized(true);
     state.publishDisplayID(42);
     state.restoreFocusedIfEmpty(false);
+    state.restoreRendererRealizedIfEmpty(false);
     state.restoreDisplayIDIfEmpty(7);
     const newer = state.take();
     try std.testing.expectEqual(true, newer.focused);
+    try std.testing.expectEqual(true, newer.renderer_realized);
     try std.testing.expectEqual(@as(u32, 42), newer.display_id);
 }
 

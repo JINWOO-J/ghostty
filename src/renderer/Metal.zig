@@ -260,6 +260,15 @@ pub fn finishFrameGeneration(self: *Metal) void {
     self.completion_generation.finish();
 }
 
+/// Drop the compositor's last IOSurface after all frame completion callbacks
+/// have drained. The persistent command queue remains valid across swaps.
+pub fn displayUnrealizedAfterDrain(self: *Metal) void {
+    switch (self.presenter) {
+        .layer => |*layer| layer.clearSurface(),
+        .external, .external_leased => {},
+    }
+}
+
 /// Install a distinct gate before replacement swap-chain frames can be used.
 pub fn startFrameGeneration(self: *Metal) !void {
     const renderer: *Renderer = @alignCast(@fieldParentPtr("api", self));

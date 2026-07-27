@@ -208,6 +208,26 @@ pub fn invalidateSurfaceUpdates(self: *IOSurfaceLayer) void {
     }
 }
 
+/// Clear the last presented IOSurface without disabling future assignments.
+/// The synchronous main-queue hop runs after any earlier queued assignments,
+/// so renderer teardown cannot be followed by a stale surface becoming layer
+/// contents again.
+pub fn clearSurface(self: *IOSurfaceLayer) void {
+    var block = ClearSurfaceBlock.init(.{
+        .layer = self.layer.value,
+    }, &clearSurfaceCallback);
+
+    const NSThread = objc.getClass("NSThread").?;
+    if (NSThread.msgSend(bool, "isMainThread", .{})) {
+        clearSurfaceCallback(&block);
+    } else {
+        macos.dispatch.dispatch_sync(
+            @ptrCast(macos.dispatch.queue.getMain()),
+            @ptrCast(&block),
+        );
+    }
+}
+
 /// Sets the layer's `contents` to the provided IOSurface.
 ///
 /// Does not ensure this happens on the main thread.
@@ -232,6 +252,10 @@ const DetachFromHostBlock = objc.Block(struct {
 }, .{}, void);
 
 const InvalidateSurfaceUpdatesBlock = objc.Block(struct {
+    layer: objc.c.id,
+}, .{}, void);
+
+const ClearSurfaceBlock = objc.Block(struct {
     layer: objc.c.id,
 }, .{}, void);
 
@@ -303,6 +327,13 @@ fn invalidateSurfaceUpdatesCallback(
 ) callconv(.c) void {
     const layer = objc.Object.fromId(block.layer);
     layer.setInstanceVariable("surface_updates_active", .{ .value = null });
+}
+
+fn clearSurfaceCallback(
+    block: *const ClearSurfaceBlock.Context,
+) callconv(.c) void {
+    const layer = objc.Object.fromId(block.layer);
+    layer.setProperty("contents", @as(?*anyopaque, null));
 }
 
 pub const DisplayCallback = ?*align(8) const fn (?*anyopaque) void;
