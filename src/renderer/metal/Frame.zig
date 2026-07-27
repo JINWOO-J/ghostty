@@ -17,6 +17,13 @@ const FramePresentation = rendererpkg.FramePresentation;
 
 const log = std.log.scoped(.metal);
 
+test "metal frame command buffers do not retain renderer resources" {
+    try std.testing.expectEqualStrings(
+        "commandBufferWithUnretainedReferences",
+        command_buffer_selector,
+    );
+}
+
 /// Options for beginning a frame.
 pub const Options = struct {
     /// MTLCommandQueue
