@@ -16,6 +16,7 @@ const FrameToken = rendererpkg.frame_lease.Token;
 const FramePresentation = rendererpkg.FramePresentation;
 
 const log = std.log.scoped(.metal);
+const command_buffer_selector = "commandBufferWithUnretainedReferences";
 
 test "metal frame command buffers do not retain renderer resources" {
     try std.testing.expectEqualStrings(
@@ -47,9 +48,13 @@ pub fn begin(
     host_context: u64,
     presentation: ?FramePresentation,
 ) !Self {
+    // The swap-chain lease keeps every resource encoded by this frame alive
+    // until bufferCompleted recycles its exact slot. Renderer teardown drains
+    // those leases before releasing shared shaders or per-frame resources, so
+    // Metal does not need a second strong-reference table for every command.
     const buffer = opts.queue.msgSend(
         objc.Object,
-        objc.sel("commandBuffer"),
+        objc.sel(command_buffer_selector),
         .{},
     );
 
