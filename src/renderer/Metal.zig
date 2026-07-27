@@ -934,6 +934,13 @@ test "metal command queue is process-shared per device" {
     try testing.expectEqual(hidden.get().value, restored.get().value);
 }
 
+test "shared Metal queue bounds process-wide in-flight frames" {
+    try std.testing.expectEqual(
+        @as(usize, swap_chain_count * 5 + 1),
+        shared_command_queue_max_inflight,
+    );
+}
+
 test "metal completion generation rejects old callbacks after rotation" {
     const testing = std.testing;
     const Context = struct {
