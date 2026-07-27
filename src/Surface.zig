@@ -3735,7 +3735,7 @@ fn formatSelectionClipboardContentsBounded(
     selection: terminal.Selection,
     opts_: terminal.formatter.Options,
     max_bytes: usize,
-) ![2]apprt.ClipboardContent {
+) ![]apprt.ClipboardContent {
     if (max_bytes == 0 or
         !selectionWithinClipboardWorkBudget(
             screen,
@@ -3757,6 +3757,9 @@ fn formatSelectionClipboardContentsBounded(
     try formatter.format(&writer);
     const plain = try alloc.dupeZ(u8, writer.buffered());
     errdefer alloc.free(plain);
+    const contents = try alloc.alloc(apprt.ClipboardContent, 2);
+    errdefer alloc.free(contents);
+    contents[0] = .{ .mime = "text/plain", .data = plain };
 
     opts.emit = .html;
     opts.background = null;
@@ -3764,16 +3767,18 @@ fn formatSelectionClipboardContentsBounded(
     formatter = .init(screen, opts);
     formatter.content = .{ .selection = selection };
     writer = .fixed(scratch);
-    try formatter.format(&writer);
-    const html = try alloc.dupeZ(u8, writer.buffered());
-
-    return .{
-        .{ .mime = "text/plain", .data = plain },
-        .{ .mime = "text/html", .data = html },
+    formatter.format(&writer) catch |err| switch (err) {
+        error.WriteFailed => return contents[0..1],
+        else => |other| return other,
     };
+    const html = try alloc.dupeZ(u8, writer.buffered());
+    contents[1] = .{ .mime = "text/html", .data = html };
+
+    return contents;
 }
 
-/// Publish the active selection as bounded plain-text and HTML clipboard data.
+/// Publish the active selection as bounded plain text plus HTML when it fits.
+/// Plain text remains available when only rich formatting exceeds the bound.
 ///
 /// This intentionally does not clear the selection. The caller owns the
 /// keyboard-copy transaction and clears it only after publication succeeds.
@@ -3806,7 +3811,7 @@ pub fn copySelectionToClipboardBounded(
 
     self.rt_surface.setClipboard(
         .standard,
-        &contents,
+        contents,
         false,
     ) catch |err| {
         log.err("error setting bounded clipboard selection err={}", .{err});
@@ -8217,6 +8222,47 @@ test "Surface: bounded selection clipboard preserves plain and html" {
         contents[1].data,
         "color:",
     ) != null);
+}
+
+test "Surface: bounded selection clipboard falls back to plain when html exceeds budget" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(alloc, .{ .cols = 8, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice(
+        "\x1b[31ma\x1b[32mb\x1b[33mc\x1b[34md" ++
+            "\x1b[35me\x1b[36mf\x1b[37mg\x1b[31mh",
+    );
+
+    const screen = t.screens.active;
+    const selection = terminal.Selection.init(
+        viewportPin(screen, 0, 0).?,
+        viewportPin(screen, 7, 0).?,
+        false,
+    );
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const contents = try formatSelectionClipboardContentsBounded(
+        arena.allocator(),
+        screen,
+        selection,
+        .{
+            .emit = .plain,
+            .unwrap = true,
+            .trim = true,
+            .background = t.colors.background.get(),
+            .foreground = t.colors.foreground.get(),
+            .palette = &t.colors.palette.current,
+        },
+        64,
+    );
+
+    try testing.expectEqual(@as(usize, 1), contents.len);
+    try testing.expectEqualStrings("text/plain", contents[0].mime);
+    try testing.expectEqualStrings("abcdefgh", contents[0].data);
 }
 
 test "Surface: bounded selection clipboard accepts empty plain text" {
