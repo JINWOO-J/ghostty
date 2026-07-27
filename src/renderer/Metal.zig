@@ -695,6 +695,12 @@ pub inline fn beginFrame(
     return try Frame.begin(.{
         .queue = self.queue.get(),
         .completion_lifetime = self.completion_generation.lifetime(),
+        .retain_references = Frame.commandBufferRequiresMetalRetention(
+            renderer.bg_image != null,
+            renderer.images.kitty_placements.items.len > 0 or
+                renderer.images.overlay_placements.items.len > 0,
+            renderer.has_custom_shaders,
+        ),
     }, target, frame_token, host_context, gated);
 }
 
