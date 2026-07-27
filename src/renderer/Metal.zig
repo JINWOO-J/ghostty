@@ -152,15 +152,11 @@ const Presenter = union(enum) {
 };
 
 const RecreatableCommandQueue = struct {
-    value: ?objc.Object,
+    value: ?*SharedCommandQueue,
 
     fn init(device: objc.Object) RecreatableCommandQueue {
         return .{
-            .value = device.msgSend(
-                objc.Object,
-                objc.sel("newCommandQueue"),
-                .{},
-            ),
+            .value = acquireSharedCommandQueue(device),
         };
     }
 
@@ -171,7 +167,7 @@ const RecreatableCommandQueue = struct {
     fn release(self: *RecreatableCommandQueue) void {
         const value = self.value orelse return;
         self.value = null;
-        value.release();
+        releaseSharedCommandQueue(value);
     }
 
     fn ensureLive(
@@ -183,13 +179,69 @@ const RecreatableCommandQueue = struct {
     }
 
     fn get(self: *const RecreatableCommandQueue) objc.Object {
-        return self.value orelse unreachable;
+        return (self.value orelse unreachable).queue;
     }
 
     fn isLive(self: *const RecreatableCommandQueue) bool {
         return self.value != null;
     }
 };
+
+const SharedCommandQueue = struct {
+    device: usize,
+    queue: objc.Object,
+    references: usize,
+};
+
+const shared_command_queue_allocator = std.heap.c_allocator;
+var shared_command_queue_mutex: std.Thread.Mutex = .{};
+var shared_command_queues: std.ArrayListUnmanaged(*SharedCommandQueue) = .empty;
+
+fn acquireSharedCommandQueue(device: objc.Object) *SharedCommandQueue {
+    const device_key = @intFromPtr(device.value);
+
+    shared_command_queue_mutex.lock();
+    defer shared_command_queue_mutex.unlock();
+
+    for (shared_command_queues.items) |entry| {
+        if (entry.device == device_key) {
+            entry.references += 1;
+            return entry;
+        }
+    }
+
+    // Apple recommends one long-lived command queue per GPU. Command queues
+    // are thread-safe, so every renderer can submit through this shared queue.
+    const queue = device.msgSend(
+        objc.Object,
+        objc.sel("newCommandQueue"),
+        .{},
+    );
+    const entry = shared_command_queue_allocator.create(
+        SharedCommandQueue,
+    ) catch @panic("failed to allocate shared Metal command queue");
+    entry.* = .{
+        .device = device_key,
+        .queue = queue,
+        .references = 1,
+    };
+    shared_command_queues.append(
+        shared_command_queue_allocator,
+        entry,
+    ) catch @panic("failed to cache shared Metal command queue");
+    return entry;
+}
+
+fn releaseSharedCommandQueue(entry: *SharedCommandQueue) void {
+    shared_command_queue_mutex.lock();
+    defer shared_command_queue_mutex.unlock();
+
+    std.debug.assert(entry.references > 0);
+    entry.references -= 1;
+    // Keep the queue alive for the process lifetime. Metal retains substantial
+    // driver pools after a queue first submits work, so destroying and
+    // recreating queues across tab switches only increases retained memory.
+}
 
 presenter: Presenter,
 
@@ -301,7 +353,7 @@ pub fn finishFrameGeneration(self: *Metal) void {
 }
 
 /// Drop the compositor's last IOSurface after all frame completion callbacks
-/// have drained. The persistent command queue remains valid across swaps.
+/// have drained, then release this renderer's shared-queue reference.
 pub fn displayUnrealizedAfterDrain(self: *Metal) void {
     switch (self.presenter) {
         .layer => |*layer| layer.clearSurface(),
@@ -310,9 +362,8 @@ pub fn displayUnrealizedAfterDrain(self: *Metal) void {
     self.queue.release();
 }
 
-/// Restore the per-renderer submission queue after hidden-tab reclamation.
-/// Pipeline state remains shared, while the queue's driver allocation pools
-/// exist only for renderers that can submit frames.
+/// Restore this renderer's reference to the process-wide submission queue
+/// after hidden-tab reclamation.
 pub fn displayRealized(self: *Metal) void {
     self.queue.ensureLive(self.device);
 }
