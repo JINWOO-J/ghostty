@@ -801,6 +801,22 @@ test "metal completion invalidation waits for an active callback lease" {
     try testing.expect(lifetime.acquire() == null);
 }
 
+test "metal command queue releases and recreates across renderer realization" {
+    const testing = std.testing;
+    const device = try chooseDevice();
+    defer device.release();
+
+    var queue = RecreatableCommandQueue.init(device);
+    defer queue.deinit();
+    try testing.expect(queue.isLive());
+
+    queue.release();
+    try testing.expect(!queue.isLive());
+
+    queue.ensureLive(device);
+    try testing.expect(queue.isLive());
+}
+
 test "metal completion generation rejects old callbacks after rotation" {
     const testing = std.testing;
     const Context = struct {
