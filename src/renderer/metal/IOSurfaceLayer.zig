@@ -426,3 +426,31 @@ test "tokened surface updates defer delivery and teardown invalidates them" {
     try testing.expectEqual(@as(usize, 0), state.gate_count);
     try testing.expectEqual(@as(usize, 0), state.callback_count);
 }
+
+test "clear surface drops displayed IOSurface without disabling future updates" {
+    const testing = std.testing;
+
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    var surface = try IOSurface.init(.{
+        .width = 1,
+        .height = 1,
+        .pixel_format = .@"32BGRA",
+        .bytes_per_element = 4,
+        .colorspace = null,
+    });
+    defer surface.deinit();
+
+    layer.setSurfaceSync(surface);
+    try testing.expect(
+        layer.layer.getProperty(?*anyopaque, "contents") != null,
+    );
+
+    layer.clearSurface();
+
+    try testing.expectEqual(
+        @as(?*anyopaque, null),
+        layer.layer.getProperty(?*anyopaque, "contents"),
+    );
+    try testing.expect(layer.surfaceUpdatesActive());
+}

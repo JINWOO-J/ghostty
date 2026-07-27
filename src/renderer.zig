@@ -99,6 +99,17 @@ test "forced draw transfers synchronous presentation to its caller" {
     try testing.expect(payload == ?FramePresentation);
 }
 
+test "renderer thread exposes lossless realization publication" {
+    const testing = @import("std").testing;
+    try testing.expect(@hasDecl(Thread, "publishRendererRealized"));
+}
+
+test "metal frame resources expose destructive disposal" {
+    const testing = @import("std").testing;
+    try testing.expect(@hasDecl(Metal.Texture, "discard"));
+    try testing.expect(@hasDecl(Metal.Buffer(u8), "discard"));
+}
+
 /// The implementation to use for the renderer. This is comptime chosen
 /// so that every build has exactly one renderer implementation.
 pub const Renderer = switch (build_config.renderer) {
