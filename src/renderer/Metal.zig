@@ -39,7 +39,6 @@ pub const custom_shader_y_is_down = true;
 
 /// Triple buffering.
 pub const swap_chain_count = 3;
-const shared_command_queue_max_inflight: usize = swap_chain_count * 5 + 1;
 
 const log = std.log.scoped(.metal);
 
@@ -153,11 +152,15 @@ const Presenter = union(enum) {
 };
 
 const RecreatableCommandQueue = struct {
-    value: ?*SharedCommandQueue,
+    value: ?objc.Object,
 
     fn init(device: objc.Object) RecreatableCommandQueue {
         return .{
-            .value = acquireSharedCommandQueue(device),
+            .value = device.msgSend(
+                objc.Object,
+                objc.sel("newCommandQueue"),
+                .{},
+            ),
         };
     }
 
@@ -168,7 +171,7 @@ const RecreatableCommandQueue = struct {
     fn release(self: *RecreatableCommandQueue) void {
         const value = self.value orelse return;
         self.value = null;
-        releaseSharedCommandQueue(value);
+        value.release();
     }
 
     fn ensureLive(
@@ -180,71 +183,13 @@ const RecreatableCommandQueue = struct {
     }
 
     fn get(self: *const RecreatableCommandQueue) objc.Object {
-        return (self.value orelse unreachable).queue;
+        return self.value orelse unreachable;
     }
 
     fn isLive(self: *const RecreatableCommandQueue) bool {
         return self.value != null;
     }
 };
-
-const SharedCommandQueue = struct {
-    device: usize,
-    queue: objc.Object,
-    references: usize,
-};
-
-const shared_command_queue_allocator = std.heap.c_allocator;
-var shared_command_queue_mutex: std.Thread.Mutex = .{};
-var shared_command_queues: std.ArrayListUnmanaged(*SharedCommandQueue) = .empty;
-
-fn acquireSharedCommandQueue(device: objc.Object) *SharedCommandQueue {
-    const device_key = @intFromPtr(device.value);
-
-    shared_command_queue_mutex.lock();
-    defer shared_command_queue_mutex.unlock();
-
-    for (shared_command_queues.items) |entry| {
-        if (entry.device == device_key) {
-            entry.references += 1;
-            return entry;
-        }
-    }
-
-    // Apple recommends one long-lived command queue per GPU. Command queues
-    // are thread-safe, so every renderer can submit through this shared queue.
-    // Sixteen slots let five triple-buffered surfaces submit concurrently;
-    // additional surfaces apply backpressure instead of growing driver pools.
-    const queue = device.msgSend(
-        objc.Object,
-        objc.sel("newCommandQueueWithMaxCommandBufferCount:"),
-        .{shared_command_queue_max_inflight},
-    );
-    const entry = shared_command_queue_allocator.create(
-        SharedCommandQueue,
-    ) catch @panic("failed to allocate shared Metal command queue");
-    entry.* = .{
-        .device = device_key,
-        .queue = queue,
-        .references = 1,
-    };
-    shared_command_queues.append(
-        shared_command_queue_allocator,
-        entry,
-    ) catch @panic("failed to cache shared Metal command queue");
-    return entry;
-}
-
-fn releaseSharedCommandQueue(entry: *SharedCommandQueue) void {
-    shared_command_queue_mutex.lock();
-    defer shared_command_queue_mutex.unlock();
-
-    std.debug.assert(entry.references > 0);
-    entry.references -= 1;
-    // Keep the queue alive for the process lifetime. Metal retains substantial
-    // driver pools after a queue first submits work, so destroying and
-    // recreating queues across tab switches only increases retained memory.
-}
 
 presenter: Presenter,
 
@@ -356,7 +301,7 @@ pub fn finishFrameGeneration(self: *Metal) void {
 }
 
 /// Drop the compositor's last IOSurface after all frame completion callbacks
-/// have drained, then release this renderer's shared-queue reference.
+/// have drained. The persistent command queue remains valid across swaps.
 pub fn displayUnrealizedAfterDrain(self: *Metal) void {
     switch (self.presenter) {
         .layer => |*layer| layer.clearSurface(),
@@ -365,8 +310,9 @@ pub fn displayUnrealizedAfterDrain(self: *Metal) void {
     self.queue.release();
 }
 
-/// Restore this renderer's reference to the process-wide submission queue
-/// after hidden-tab reclamation.
+/// Restore the per-renderer submission queue after hidden-tab reclamation.
+/// Pipeline state remains shared, while the queue's driver allocation pools
+/// exist only for renderers that can submit frames.
 pub fn displayRealized(self: *Metal) void {
     self.queue.ensureLive(self.device);
 }
@@ -917,31 +863,6 @@ test "metal command queue releases and recreates across renderer realization" {
 
     queue.ensureLive(device);
     try testing.expect(queue.isLive());
-}
-
-test "metal command queue is process-shared per device" {
-    const testing = std.testing;
-    const device = try chooseDevice();
-    defer device.release();
-
-    var active = RecreatableCommandQueue.init(device);
-    defer active.deinit();
-    var hidden = RecreatableCommandQueue.init(device);
-    defer hidden.deinit();
-
-    try testing.expectEqual(active.get().value, hidden.get().value);
-
-    active.release();
-    var restored = RecreatableCommandQueue.init(device);
-    defer restored.deinit();
-    try testing.expectEqual(hidden.get().value, restored.get().value);
-}
-
-test "shared Metal queue bounds process-wide in-flight frames" {
-    try std.testing.expectEqual(
-        @as(usize, swap_chain_count * 5 + 1),
-        shared_command_queue_max_inflight,
-    );
 }
 
 test "metal completion generation rejects old callbacks after rotation" {
