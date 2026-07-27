@@ -49,4 +49,16 @@ struct RendererTabSelectionTests {
             isKeyOrMain: true
         ))
     }
+
+    @Test func deselectedTabReclaimsRendererInCurrentVisibilityPass() {
+        #expect(RendererTabVisibility.shouldReclaimSynchronously(
+            selection: .deselected
+        ))
+        #expect(!RendererTabVisibility.shouldReclaimSynchronously(
+            selection: .selected
+        ))
+        #expect(!RendererTabVisibility.shouldReclaimSynchronously(
+            selection: .ambiguous
+        ))
+    }
 }
