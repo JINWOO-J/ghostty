@@ -871,6 +871,13 @@ test "metal command queue releases and recreates across renderer realization" {
     try testing.expect(queue.isLive());
 }
 
+test "metal command queue rejects a nil Objective-C result" {
+    try std.testing.expectError(
+        error.CommandQueueUnavailable,
+        commandQueueFromId(null),
+    );
+}
+
 test "metal completion generation rejects old callbacks after rotation" {
     const testing = std.testing;
     const Context = struct {

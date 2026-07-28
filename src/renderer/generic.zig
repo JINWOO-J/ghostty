@@ -3779,3 +3779,34 @@ test "prepared frame damage remains retryable until draw commit" {
     }
     try std.testing.expect(!cells_rebuilt);
 }
+
+test "swap chain initialization cleans its successful prefix on failure" {
+    const testing = std.testing;
+    const State = struct {
+        initialized: usize = 0,
+        deinited: usize = 0,
+        fail_at: usize = 2,
+    };
+    const Frame = struct {
+        state: *State,
+
+        fn init(state: *State, _: bool) !@This() {
+            if (state.initialized == state.fail_at) return error.InitFailed;
+            state.initialized += 1;
+            return .{ .state = state };
+        }
+
+        fn deinit(self: *@This()) void {
+            self.state.deinited += 1;
+        }
+    };
+
+    var state: State = .{};
+    var frames: [3]Frame = undefined;
+    try testing.expectError(
+        error.InitFailed,
+        initializeFrameStates(&frames, &state, false),
+    );
+    try testing.expectEqual(@as(usize, 2), state.initialized);
+    try testing.expectEqual(state.initialized, state.deinited);
+}

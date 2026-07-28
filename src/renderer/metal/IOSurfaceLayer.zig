@@ -574,3 +574,25 @@ test "deferred clear preserves a newer IOSurface" {
         @intFromPtr(contents.?),
     );
 }
+
+test "deferred clear uses the last committed surface generation" {
+    const testing = std.testing;
+
+    var generations = try SurfaceGeneration.create();
+    defer generations.release();
+
+    const committed = generations.schedule();
+    generations.commit(committed);
+
+    // A newer scheduled frame may fail the layer-size guard. Clearing through
+    // that cutoff must still release the older frame that remains displayed.
+    const rejected = generations.schedule();
+    try testing.expect(generations.shouldClear(rejected));
+
+    // A synchronous frame committed after the clear was scheduled belongs to
+    // the replacement swap chain and must survive the deferred callback.
+    const replacement = generations.schedule();
+    generations.commit(replacement);
+    try testing.expect(!generations.shouldClear(rejected));
+    try testing.expect(!generations.shouldCommit(committed));
+}
