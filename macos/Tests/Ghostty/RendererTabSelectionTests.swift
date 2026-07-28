@@ -2,6 +2,8 @@ import Testing
 @testable import Ghostty
 
 struct RendererTabSelectionTests {
+    private final class ObservationToken {}
+
     @Test func standaloneWindowIsSelected() {
         #expect(RendererTabSelection.classify(
             hasTabGroup: false,
@@ -98,10 +100,31 @@ struct RendererTabSelectionTests {
     }
 
     @Test func tabGroupElectsOneRendererObservationOwner() {
-        let observers = (0..<100).filter {
-            RendererTabObservationPlan.shouldObserve(controllerIndex: $0)
+        let controllers = (0..<100).map { _ in ObservationToken() }
+        let observers = controllers.filter {
+            RendererTabObservationPlan.shouldObserve(
+                controller: $0,
+                controllers: controllers
+            )
         }
 
-        #expect(observers == [0])
+        #expect(observers.count == 1)
+        #expect(observers.first === controllers.first)
+    }
+
+    @Test func tabGroupMembershipChangeElectsFirstSurvivor() {
+        var controllers = (0..<3).map { _ in ObservationToken() }
+        let originalOwner = controllers[0]
+        let firstSurvivor = controllers[1]
+
+        controllers.removeFirst()
+        #expect(!RendererTabObservationPlan.shouldObserve(
+            controller: originalOwner,
+            controllers: controllers
+        ))
+        #expect(RendererTabObservationPlan.shouldObserve(
+            controller: firstSurvivor,
+            controllers: controllers
+        ))
     }
 }
