@@ -3839,6 +3839,33 @@ test "prepared frame damage remains retryable until draw commit" {
     try std.testing.expect(!cells_rebuilt);
 }
 
+test "renderer teardown releases presented target without purging" {
+    const Resource = struct {
+        deinited: *usize,
+        discarded: *usize,
+
+        fn deinit(self: *@This()) void {
+            self.deinited.* += 1;
+        }
+
+        fn discard(self: *@This()) void {
+            self.discarded.* += 1;
+        }
+    };
+
+    var deinited: usize = 0;
+    var discarded: usize = 0;
+    var target: Resource = .{
+        .deinited = &deinited,
+        .discarded = &discarded,
+    };
+
+    disposePresentedTarget(&target);
+
+    try std.testing.expectEqual(@as(usize, 1), deinited);
+    try std.testing.expectEqual(@as(usize, 0), discarded);
+}
+
 test "swap chain initialization cleans its successful prefix on failure" {
     const testing = std.testing;
     const State = struct {
