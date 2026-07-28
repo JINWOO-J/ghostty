@@ -509,6 +509,7 @@ const RendererRealizedRetryState = struct {
     const initial_delay_ms = 250;
     const maximum_delay_ms = 4_000;
 
+    mutex: std.Thread.Mutex = .{},
     value: ?RendererRealizedRequest = null,
     scheduled: bool = false,
     delay_ms: u64 = initial_delay_ms,
@@ -519,6 +520,9 @@ const RendererRealizedRetryState = struct {
         self: *RendererRealizedRetryState,
         value: RendererRealizedRequest,
     ) ?u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         self.value = value;
         if (self.scheduled) return null;
 
@@ -531,19 +535,43 @@ const RendererRealizedRetryState = struct {
     /// A newer lifecycle publication supersedes the retry value. The timer may
     /// remain armed and becomes a no-op unless another failure coalesces into it.
     fn supersede(self: *RendererRealizedRetryState) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         self.value = null;
     }
 
     fn resolved(self: *RendererRealizedRetryState) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         self.value = null;
         self.delay_ms = initial_delay_ms;
     }
 
     fn fired(self: *RendererRealizedRetryState) ?RendererRealizedRequest {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         self.scheduled = false;
         const value = self.value;
         self.value = null;
         return value;
+    }
+};
+
+/// Cross-thread one-shot request to arm the realization retry timer. External
+/// iOS rendering owns renderer state on its serial queue, but xev loop handles
+/// must only be mutated by the renderer OS thread.
+const RendererRealizedRetryTimerHandoff = struct {
+    delay_ms: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    fn publish(self: *RendererRealizedRetryTimerHandoff, delay_ms: u64) void {
+        std.debug.assert(delay_ms > 0);
+        const previous = self.delay_ms.swap(delay_ms, .acq_rel);
+        std.debug.assert(previous == 0);
+    }
+
+    fn take(self: *RendererRealizedRetryTimerHandoff) ?u64 {
+        const delay_ms = self.delay_ms.swap(0, .acq_rel);
+        return if (delay_ms == 0) null else delay_ms;
     }
 };
 
@@ -590,6 +618,7 @@ started: std.Thread.ResetEvent = .{},
 renderer_realized_retry_h: xev.Timer,
 renderer_realized_retry_c: xev.Completion = .{},
 renderer_realized_retry: RendererRealizedRetryState = .{},
+renderer_realized_retry_timer_handoff: RendererRealizedRetryTimerHandoff = .{},
 
 /// The timer used for draw calls. Draw calls don't update from the
 /// terminal state so they're much cheaper. They're used for animation
@@ -1572,6 +1601,7 @@ fn wakeupCallback(
     };
 
     const t = self_.?;
+    t.armPendingRendererRealizedRetryTimer();
     if (t.externalDrainActive()) {
         // External mode owns renderer state on its serial queue. Convert the
         // coalesced xev wake into an unconditional embedder render request.
@@ -1663,6 +1693,26 @@ fn scheduleRendererRealizedRetry(
     value: RendererRealizedRequest,
 ) void {
     const delay_ms = self.renderer_realized_retry.failed(value) orelse return;
+    if (self.externalDrainActive()) {
+        self.renderer_realized_retry_timer_handoff.publish(delay_ms);
+        self.wakeup.notify() catch |err| {
+            log.warn(
+                "failed to hand renderer realization retry to loop owner err={}",
+                .{err},
+            );
+        };
+        return;
+    }
+    self.armRendererRealizedRetryTimer(delay_ms);
+}
+
+fn armPendingRendererRealizedRetryTimer(self: *Thread) void {
+    const delay_ms =
+        self.renderer_realized_retry_timer_handoff.take() orelse return;
+    self.armRendererRealizedRetryTimer(delay_ms);
+}
+
+fn armRendererRealizedRetryTimer(self: *Thread, delay_ms: u64) void {
     self.renderer_realized_retry_h.run(
         &self.loop,
         &self.renderer_realized_retry_c,
