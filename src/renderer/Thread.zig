@@ -578,6 +578,24 @@ const RendererRealizedRetryState = struct {
         self.value = null;
     }
 
+    /// Claim published surface state while atomically invalidating any older
+    /// renderer retry. A timer callback uses the same mutex when restoring, so
+    /// it cannot refill the renderer slot between its claim and invalidation.
+    fn takeSurfaceState(
+        self: *RendererRealizedRetryState,
+        requests: *SurfaceStateRequests,
+    ) SurfaceStateRequests.Update {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const update = requests.take();
+        if (update.renderer_realized != null) {
+            _ = self.generation.fetchAdd(1, .acq_rel);
+            self.value = null;
+        }
+        return update;
+    }
+
     fn resolved(self: *RendererRealizedRetryState) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -1381,7 +1399,9 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
     // this bounded ordinary-mailbox snapshot so an older compatibility message
     // cannot overwrite a newer request, without waiting for a producer-refilled
     // queue to become transiently empty.
-    const surface_state = self.surface_state_requests.take();
+    const surface_state = self.renderer_realized_retry.takeSurfaceState(
+        &self.surface_state_requests,
+    );
     // Visibility application cannot fail, so its thread-owned state is already
     // committed if a later lifecycle operation fails. A normal wake reconciles
     // renderer visibility in `renderAfterMailboxDrain`; external iOS rendering
@@ -1390,7 +1410,6 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
     if (surface_state.renderer_realized) |value| {
         // Any publication is newer than a retained retry. A failed application
         // below records this value again behind the paced timer.
-        self.renderer_realized_retry.supersede();
         self.applyRendererRealized(value) catch |err| {
             self.scheduleRendererRealizedRetry(value);
             if (surface_state.focused) |focused| {
