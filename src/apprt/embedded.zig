@@ -4615,6 +4615,17 @@ pub const CAPI = struct {
             return true;
         }
 
+        /// Force one unrealize/realize transaction on the renderer thread.
+        /// Unlike two latest-value boolean publications, this cannot lose the
+        /// unrealize step when a surface becomes presentable before the renderer
+        /// consumes its earlier state.
+        export fn ghostty_surface_rebuild_renderer(ptr: *Surface) bool {
+            const surface = &ptr.core_surface;
+            surface.renderer_thread.publishRendererRebuild();
+            surface.renderer_thread.wakeup.notify() catch {};
+            return true;
+        }
+
         /// This returns a CTFontRef that should be used for quicklook
         /// highlighted text. This is always the primary font in use
         /// regardless of the selected text. If coretext is not in use

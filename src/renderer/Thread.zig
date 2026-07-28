@@ -43,18 +43,31 @@ const VisibilityDrainState = struct {
     }
 };
 
-/// Latest-value publication for surface lifecycle state. These values are
-/// idempotent and have no owned payloads, so producers can replace an unread
-/// request instead of waiting for space in the ordered renderer mailbox.
+const RendererRealizedRequest = enum(u8) {
+    unrealize = 1,
+    realize = 2,
+    rebuild = 3,
+
+    fn fromBool(value: bool) RendererRealizedRequest {
+        return if (value) .realize else .unrealize;
+    }
+};
+
+/// Latest-value publication for surface lifecycle state. These values have no
+/// owned payloads, so producers can replace an unread request instead of
+/// waiting for space in the ordered renderer mailbox. Renderer rebuild is the
+/// one stronger operation: a redundant realize publication preserves it so a
+/// forced unrealize/realize transaction cannot be coalesced away.
 ///
 /// Each property has its own atomic slot. Zero means no pending request;
-/// booleans use one/ two for false/true, and display ids are offset by one so
-/// every u32 value remains representable. A producer that races `take` either
-/// lands in the returned update or remains pending for the next renderer wake.
+/// booleans use one/two for false/true, renderer realization uses the enum
+/// values above, and display ids are offset by one so every u32 value remains
+/// representable. A producer that races `take` either lands in the returned
+/// update or remains pending for the next renderer wake.
 const SurfaceStateRequests = struct {
     const Update = struct {
         visible: ?bool = null,
-        renderer_realized: ?bool = null,
+        renderer_realized: ?RendererRealizedRequest = null,
         focused: ?bool = null,
         display_id: ?u32 = null,
     };
@@ -69,7 +82,31 @@ const SurfaceStateRequests = struct {
     }
 
     fn publishRendererRealized(self: *SurfaceStateRequests, value: bool) void {
-        self.renderer_realized.store(if (value) 2 else 1, .release);
+        const request = RendererRealizedRequest.fromBool(value);
+        if (request == .unrealize) {
+            self.renderer_realized.store(@intFromEnum(request), .release);
+            return;
+        }
+
+        // Rebuild already has the same final realized state, but also carries
+        // the required unrealize transition. A redundant realize must not
+        // weaken it before the renderer consumes the slot.
+        var current = self.renderer_realized.load(.monotonic);
+        while (current != @intFromEnum(RendererRealizedRequest.rebuild)) {
+            current = self.renderer_realized.cmpxchgWeak(
+                current,
+                @intFromEnum(request),
+                .release,
+                .monotonic,
+            ) orelse return;
+        }
+    }
+
+    fn publishRendererRebuild(self: *SurfaceStateRequests) void {
+        self.renderer_realized.store(
+            @intFromEnum(RendererRealizedRequest.rebuild),
+            .release,
+        );
     }
 
     fn publishFocused(self: *SurfaceStateRequests, value: bool) void {
@@ -94,11 +131,11 @@ const SurfaceStateRequests = struct {
 
     fn restoreRendererRealizedIfEmpty(
         self: *SurfaceStateRequests,
-        value: bool,
+        value: RendererRealizedRequest,
     ) void {
         _ = self.renderer_realized.cmpxchgStrong(
             0,
-            if (value) 2 else 1,
+            @intFromEnum(value),
             .release,
             .monotonic,
         );
@@ -119,7 +156,7 @@ const SurfaceStateRequests = struct {
     fn take(self: *SurfaceStateRequests) Update {
         return .{
             .visible = decodeBool(self.visible.swap(0, .acq_rel)),
-            .renderer_realized = decodeBool(
+            .renderer_realized = decodeRendererRealized(
                 self.renderer_realized.swap(0, .acq_rel),
             ),
             .focused = decodeBool(self.focused.swap(0, .acq_rel)),
@@ -139,6 +176,16 @@ const SurfaceStateRequests = struct {
             0 => null,
             1 => false,
             2 => true,
+            else => unreachable,
+        };
+    }
+
+    fn decodeRendererRealized(value: u8) ?RendererRealizedRequest {
+        return switch (value) {
+            0 => null,
+            1 => .unrealize,
+            2 => .realize,
+            3 => .rebuild,
             else => unreachable,
         };
     }
@@ -462,13 +509,16 @@ const RendererRealizedRetryState = struct {
     const initial_delay_ms = 250;
     const maximum_delay_ms = 4_000;
 
-    value: ?bool = null,
+    value: ?RendererRealizedRequest = null,
     scheduled: bool = false,
     delay_ms: u64 = initial_delay_ms,
 
     /// Record a failed value and return the delay for a newly required timer.
     /// An already scheduled timer owns delivery of the coalesced latest value.
-    fn failed(self: *RendererRealizedRetryState, value: bool) ?u64 {
+    fn failed(
+        self: *RendererRealizedRetryState,
+        value: RendererRealizedRequest,
+    ) ?u64 {
         self.value = value;
         if (self.scheduled) return null;
 
@@ -489,7 +539,7 @@ const RendererRealizedRetryState = struct {
         self.delay_ms = initial_delay_ms;
     }
 
-    fn fired(self: *RendererRealizedRetryState) ?bool {
+    fn fired(self: *RendererRealizedRetryState) ?RendererRealizedRequest {
         self.scheduled = false;
         const value = self.value;
         self.value = null;
@@ -854,6 +904,10 @@ pub fn publishVisible(self: *Thread, value: bool) void {
 
 pub fn publishRendererRealized(self: *Thread, value: bool) void {
     self.surface_state_requests.publishRendererRealized(value);
+}
+
+pub fn publishRendererRebuild(self: *Thread) void {
+    self.surface_state_requests.publishRendererRebuild();
 }
 
 pub fn publishFocused(self: *Thread, value: bool) void {
@@ -1231,7 +1285,9 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
             // surface is occluded when this is sent (macOS `drawFrame` early-
             // returns on `!flags.visible`), and both calls take `draw_mutex`.
             .display_realized => |v| {
-                try self.applyRendererRealized(v);
+                try self.applyRendererRealized(
+                    RendererRealizedRequest.fromBool(v),
+                );
             },
         }
     }
@@ -1310,7 +1366,16 @@ fn applyVisible(
     // callbacks already consult this renderer-owned flag.
 }
 
-fn applyRendererRealized(self: *Thread, value: bool) !void {
+fn applyRendererRealized(
+    self: *Thread,
+    request: RendererRealizedRequest,
+) !void {
+    if (request == .rebuild) {
+        try self.applyRendererRealized(.unrealize);
+        return self.applyRendererRealized(.realize);
+    }
+
+    const value = request == .realize;
     if (self.renderer_realized == value) return;
 
     if (value) {
@@ -1593,7 +1658,10 @@ fn visibilityRetryCallback(
     return .rearm;
 }
 
-fn scheduleRendererRealizedRetry(self: *Thread, value: bool) void {
+fn scheduleRendererRealizedRetry(
+    self: *Thread,
+    value: RendererRealizedRequest,
+) void {
     const delay_ms = self.renderer_realized_retry.failed(value) orelse return;
     self.renderer_realized_retry_h.run(
         &self.loop,
@@ -1852,7 +1920,10 @@ test "surface lifecycle state bypasses a full renderer mailbox and keeps latest 
 
     const update = state.take();
     try std.testing.expectEqual(true, update.visible);
-    try std.testing.expectEqual(true, update.renderer_realized);
+    try std.testing.expectEqual(
+        RendererRealizedRequest.realize,
+        update.renderer_realized,
+    );
     try std.testing.expectEqual(false, update.focused);
     try std.testing.expectEqual(@as(u32, 42), update.display_id);
     try std.testing.expectEqual(
@@ -1892,12 +1963,15 @@ test "surface lifecycle retry restoration preserves newer publications" {
     try std.testing.expect(!state.hasPending());
 
     state.restoreFocusedIfEmpty(false);
-    state.restoreRendererRealizedIfEmpty(false);
+    state.restoreRendererRealizedIfEmpty(.unrealize);
     state.restoreDisplayIDIfEmpty(7);
     try std.testing.expect(state.hasPending());
     const restored = state.take();
     try std.testing.expectEqual(false, restored.focused);
-    try std.testing.expectEqual(false, restored.renderer_realized);
+    try std.testing.expectEqual(
+        RendererRealizedRequest.unrealize,
+        restored.renderer_realized,
+    );
     try std.testing.expectEqual(@as(u32, 7), restored.display_id);
     try std.testing.expect(!state.hasPending());
 
@@ -1905,11 +1979,14 @@ test "surface lifecycle retry restoration preserves newer publications" {
     state.publishRendererRealized(true);
     state.publishDisplayID(42);
     state.restoreFocusedIfEmpty(false);
-    state.restoreRendererRealizedIfEmpty(false);
+    state.restoreRendererRealizedIfEmpty(.unrealize);
     state.restoreDisplayIDIfEmpty(7);
     const newer = state.take();
     try std.testing.expectEqual(true, newer.focused);
-    try std.testing.expectEqual(true, newer.renderer_realized);
+    try std.testing.expectEqual(
+        RendererRealizedRequest.realize,
+        newer.renderer_realized,
+    );
     try std.testing.expectEqual(@as(u32, 42), newer.display_id);
 }
 
@@ -1917,35 +1994,44 @@ test "renderer realization retries coalesce with bounded backoff" {
     const testing = std.testing;
 
     var retry: RendererRealizedRetryState = .{};
-    try testing.expectEqual(@as(?u64, 250), retry.failed(true));
-    try testing.expectEqual(@as(?u64, null), retry.failed(false));
-    try testing.expectEqual(@as(?bool, false), retry.fired());
+    try testing.expectEqual(@as(?u64, 250), retry.failed(.realize));
+    try testing.expectEqual(@as(?u64, null), retry.failed(.unrealize));
+    try testing.expectEqual(
+        @as(?RendererRealizedRequest, .unrealize),
+        retry.fired(),
+    );
 
-    try testing.expectEqual(@as(?u64, 500), retry.failed(true));
+    try testing.expectEqual(@as(?u64, 500), retry.failed(.realize));
     retry.supersede();
-    try testing.expectEqual(@as(?bool, null), retry.fired());
+    try testing.expectEqual(
+        @as(?RendererRealizedRequest, null),
+        retry.fired(),
+    );
 
-    try testing.expectEqual(@as(?u64, 1_000), retry.failed(true));
-    try testing.expectEqual(@as(?bool, true), retry.fired());
+    try testing.expectEqual(@as(?u64, 1_000), retry.failed(.realize));
+    try testing.expectEqual(
+        @as(?RendererRealizedRequest, .realize),
+        retry.fired(),
+    );
     // A timer backend error consumes the active latch before the callback
     // reschedules the retained value at the next paced delay.
-    try testing.expectEqual(@as(?u64, 2_000), retry.failed(true));
+    try testing.expectEqual(@as(?u64, 2_000), retry.failed(.realize));
     const failed_timer_value = retry.fired().?;
     try testing.expectEqual(@as(?u64, 4_000), retry.failed(failed_timer_value));
     _ = retry.fired();
     retry.resolved();
-    try testing.expectEqual(@as(?u64, 250), retry.failed(true));
+    try testing.expectEqual(@as(?u64, 250), retry.failed(.realize));
     _ = retry.fired();
 
     retry.delay_ms = RendererRealizedRetryState.maximum_delay_ms;
     try testing.expectEqual(
         @as(?u64, RendererRealizedRetryState.maximum_delay_ms),
-        retry.failed(true),
+        retry.failed(.realize),
     );
     _ = retry.fired();
     try testing.expectEqual(
         @as(?u64, RendererRealizedRetryState.maximum_delay_ms),
-        retry.failed(true),
+        retry.failed(.realize),
     );
 }
 
