@@ -210,8 +210,10 @@ pub fn invalidateSurfaceUpdates(self: *IOSurfaceLayer) void {
 
 /// Clear the last presented IOSurface without disabling future assignments.
 /// Renderer teardown enqueues this after every frame lease drains, so FIFO
-/// main-queue ordering clears earlier assignments without synchronously
-/// waiting on AppKit while it may be joining the renderer thread.
+/// main-queue ordering normally clears earlier assignments without
+/// synchronously waiting on AppKit while it may be joining the renderer
+/// thread. The captured IOSurface guard preserves a newer synchronous frame
+/// if realization races the queued clear.
 pub fn clearSurface(self: *IOSurfaceLayer) void {
     const surface: *IOSurface = @ptrCast(self.layer.getProperty(
         ?*anyopaque,
@@ -348,6 +350,8 @@ fn clearSurfaceCallback(
 ) callconv(.c) void {
     defer block.surface.release();
     const layer = objc.Object.fromId(block.layer);
+    const contents = layer.getProperty(?*anyopaque, "contents");
+    if (contents != @as(*anyopaque, @ptrCast(block.surface))) return;
     layer.setProperty("contents", @as(?*anyopaque, null));
 }
 

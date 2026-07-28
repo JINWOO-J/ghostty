@@ -226,6 +226,7 @@ const SharedStandardShadersKey = struct {
 
 const SharedStandardShaders = struct {
     key: SharedStandardShadersKey,
+    device: objc.Object,
     resource_allocator: Allocator,
     library: objc.Object,
     pipelines: PipelineCollection,
@@ -268,6 +269,7 @@ fn initSharedStandard(
     };
     entry.* = .{
         .key = key,
+        .device = device.retain(),
         .resource_allocator = alloc,
         .library = candidate.library,
         .pipelines = candidate.pipelines,
@@ -280,6 +282,7 @@ fn initSharedStandard(
         entry,
     ) catch |err| {
         candidate.deinit(alloc);
+        entry.device.release();
         shared_standard_allocator.destroy(entry);
         return err;
     };
@@ -331,6 +334,7 @@ fn clearSharedStandardCacheForTesting() void {
             .post_pipelines = entry.post_pipelines,
         };
         owned.deinit(entry.resource_allocator);
+        entry.device.release();
         shared_standard_allocator.destroy(entry);
     }
     shared_standard_entries.deinit(shared_standard_allocator);

@@ -455,6 +455,48 @@ fn renderAfterMailboxDrain(
     context.renderWakeFrame();
 }
 
+/// Renderer realization can allocate Metal resources and fail under memory
+/// pressure. Keep the latest desired value while pacing retries so a failed
+/// tab restore cannot turn the renderer wakeup into a tight loop.
+const RendererRealizedRetryState = struct {
+    const initial_delay_ms = 250;
+    const maximum_delay_ms = 4_000;
+
+    value: ?bool = null,
+    scheduled: bool = false,
+    delay_ms: u64 = initial_delay_ms,
+
+    /// Record a failed value and return the delay for a newly required timer.
+    /// An already scheduled timer owns delivery of the coalesced latest value.
+    fn failed(self: *RendererRealizedRetryState, value: bool) ?u64 {
+        self.value = value;
+        if (self.scheduled) return null;
+
+        self.scheduled = true;
+        const delay_ms = self.delay_ms;
+        self.delay_ms = @min(self.delay_ms * 2, maximum_delay_ms);
+        return delay_ms;
+    }
+
+    /// A newer lifecycle publication supersedes the retry value. The timer may
+    /// remain armed and becomes a no-op unless another failure coalesces into it.
+    fn supersede(self: *RendererRealizedRetryState) void {
+        self.value = null;
+    }
+
+    fn resolved(self: *RendererRealizedRetryState) void {
+        self.value = null;
+        self.delay_ms = initial_delay_ms;
+    }
+
+    fn fired(self: *RendererRealizedRetryState) ?bool {
+        self.scheduled = false;
+        const value = self.value;
+        self.value = null;
+        return value;
+    }
+};
+
 /// Whether calls to `drawFrame` must be done from the app thread.
 ///
 /// If this is `true` then we send a `redraw_surface` message to the apprt
@@ -492,9 +534,12 @@ stop_c: xev.Completion = .{},
 /// a stop notification could still be lost during thread startup.
 started: std.Thread.ResetEvent = .{},
 
-/// The timer used for rendering
-render_h: xev.Timer,
-render_c: xev.Completion = .{},
+/// One-shot timer and coalesced state for fallible Metal realization retries.
+/// This repurposes the renderer's otherwise unused legacy render timer, so the
+/// recovery path does not add another xev handle to every terminal surface.
+renderer_realized_retry_h: xev.Timer,
+renderer_realized_retry_c: xev.Completion = .{},
+renderer_realized_retry: RendererRealizedRetryState = .{},
 
 /// The timer used for draw calls. Draw calls don't update from the
 /// terminal state so they're much cheaper. They're used for animation
@@ -639,9 +684,10 @@ pub fn init(
     var stop_h = try xev.Async.init();
     errdefer stop_h.deinit();
 
-    // The primary timer for rendering.
-    var render_h = try xev.Timer.init();
-    errdefer render_h.deinit();
+    // Paced Metal realization recovery. This was historically an unused
+    // general render timer, so reusing it keeps per-surface handles flat.
+    var renderer_realized_retry_h = try xev.Timer.init();
+    errdefer renderer_realized_retry_h.deinit();
 
     // Draw timer, see comments.
     var draw_h = try xev.Timer.init();
@@ -669,7 +715,7 @@ pub fn init(
         .loop = loop,
         .wakeup = wakeup_h,
         .stop = stop_h,
-        .render_h = render_h,
+        .renderer_realized_retry_h = renderer_realized_retry_h,
         .draw_h = draw_h,
         .draw_now = draw_now,
         .visibility_retry = visibility_retry,
@@ -696,7 +742,7 @@ pub fn init(
 pub fn deinit(self: *Thread) void {
     self.stop.deinit();
     self.wakeup.deinit();
-    self.render_h.deinit();
+    self.renderer_realized_retry_h.deinit();
     self.draw_h.deinit();
     self.draw_now.deinit();
     self.visibility_retry.deinit();
@@ -1201,10 +1247,11 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
     // deliberately leaves visibility and frame gating to its platform owner.
     if (surface_state.visible) |value| self.applyVisible(&visibility, value);
     if (surface_state.renderer_realized) |value| {
+        // Any publication is newer than a retained retry. A failed application
+        // below records this value again behind the paced timer.
+        self.renderer_realized_retry.supersede();
         self.applyRendererRealized(value) catch |err| {
-            // A failed GPU recreation remains the desired state. Restore only
-            // into an empty slot so a newer visibility-derived request wins.
-            self.surface_state_requests.restoreRendererRealizedIfEmpty(value);
+            self.scheduleRendererRealizedRetry(value);
             if (surface_state.focused) |focused| {
                 self.surface_state_requests.restoreFocusedIfEmpty(focused);
             }
@@ -1213,6 +1260,7 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
             }
             return err;
         };
+        self.renderer_realized_retry.resolved();
     }
     if (surface_state.focused) |value| {
         self.applyFocused(value, external_drain) catch |err| {
@@ -1501,23 +1549,6 @@ fn wakeupCallback(
     // it here covers output, resize, and viewport scrolling uniformly.
     t.compression.wake(t);
 
-    // The below is not used anymore but if we ever want to introduce
-    // a configuration to introduce a delay to coalesce renders, we can
-    // use this.
-    //
-    // // If the timer is already active then we don't have to do anything.
-    // if (t.render_c.state() == .active) return .rearm;
-    //
-    // // Timer is not active, let's start it
-    // t.render_h.run(
-    //     &t.loop,
-    //     &t.render_c,
-    //     10,
-    //     Thread,
-    //     t,
-    //     renderCallback,
-    // );
-
     return .rearm;
 }
 
@@ -1560,6 +1591,41 @@ fn visibilityRetryCallback(
         t.syncDrawTimer();
     }
     return .rearm;
+}
+
+fn scheduleRendererRealizedRetry(self: *Thread, value: bool) void {
+    const delay_ms = self.renderer_realized_retry.failed(value) orelse return;
+    self.renderer_realized_retry_h.run(
+        &self.loop,
+        &self.renderer_realized_retry_c,
+        delay_ms,
+        Thread,
+        self,
+        rendererRealizedRetryCallback,
+    );
+}
+
+fn rendererRealizedRetryCallback(
+    self_: ?*Thread,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    result: xev.Timer.RunError!void,
+) xev.CallbackAction {
+    _ = result catch |err| switch (err) {
+        error.Canceled => return .disarm,
+        else => {
+            log.warn("error in renderer realization retry timer err={}", .{err});
+            return .disarm;
+        },
+    };
+
+    const self = self_ orelse return .disarm;
+    const value = self.renderer_realized_retry.fired() orelse return .disarm;
+    self.surface_state_requests.restoreRendererRealizedIfEmpty(value);
+    self.wakeup.notify() catch |err| {
+        log.warn("failed to notify renderer realization retry err={}", .{err});
+    };
+    return .disarm;
 }
 
 fn drawCallback(
@@ -1810,6 +1876,36 @@ test "surface lifecycle retry restoration preserves newer publications" {
     try std.testing.expectEqual(true, newer.focused);
     try std.testing.expectEqual(true, newer.renderer_realized);
     try std.testing.expectEqual(@as(u32, 42), newer.display_id);
+}
+
+test "renderer realization retries coalesce with bounded backoff" {
+    const testing = std.testing;
+
+    var retry: RendererRealizedRetryState = .{};
+    try testing.expectEqual(@as(?u64, 250), retry.failed(true));
+    try testing.expectEqual(@as(?u64, null), retry.failed(false));
+    try testing.expectEqual(@as(?bool, false), retry.fired());
+
+    try testing.expectEqual(@as(?u64, 500), retry.failed(true));
+    retry.supersede();
+    try testing.expectEqual(@as(?bool, null), retry.fired());
+
+    try testing.expectEqual(@as(?u64, 1_000), retry.failed(true));
+    try testing.expectEqual(@as(?bool, true), retry.fired());
+    retry.resolved();
+    try testing.expectEqual(@as(?u64, 250), retry.failed(true));
+    _ = retry.fired();
+
+    retry.delay_ms = RendererRealizedRetryState.maximum_delay_ms;
+    try testing.expectEqual(
+        @as(?u64, RendererRealizedRetryState.maximum_delay_ms),
+        retry.failed(true),
+    );
+    _ = retry.fired();
+    try testing.expectEqual(
+        @as(?u64, RendererRealizedRetryState.maximum_delay_ms),
+        retry.failed(true),
+    );
 }
 
 test "synchronous presentation is delivered after thread draw cleanup" {
