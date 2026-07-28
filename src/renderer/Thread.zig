@@ -2094,6 +2094,28 @@ test "external renderer retry timer is handed to loop owner once" {
     try std.testing.expectEqual(@as(?u64, null), handoff.take());
 }
 
+test "stale external renderer retry cannot override newer publication" {
+    var retry: RendererRealizedRetryState = .{};
+    var requests: SurfaceStateRequests = .{};
+
+    _ = retry.failed(.realize);
+    const claimed = retry.fired().?;
+
+    retry.supersede();
+    requests.publishRendererRealized(false);
+    const newer = requests.take();
+    try std.testing.expectEqual(
+        RendererRealizedRequest.unrealize,
+        newer.renderer_realized,
+    );
+
+    try std.testing.expect(!retry.restoreIfCurrent(claimed, &requests));
+    try std.testing.expectEqual(
+        @as(?RendererRealizedRequest, null),
+        requests.take().renderer_realized,
+    );
+}
+
 test "synchronous presentation is delivered after thread draw cleanup" {
     const Event = enum { begin, renderer_cleanup, end, callback };
     const State = struct {
