@@ -2063,6 +2063,73 @@ pub const CAPI = struct {
         cell_height_px: u32,
     };
 
+    const SurfaceGridMetrics = extern struct {
+        columns: u16,
+        rows: u16,
+        cursor_column: u16,
+        cursor_row: u16,
+        cursor_width_cells: u16,
+        cursor_in_viewport: bool,
+        cell_width: f64,
+        cell_height: f64,
+        padding_left: f64,
+        padding_top: f64,
+    };
+
+    fn surfaceGridMetricsSnapshot(
+        size: renderer.Size,
+        scale: apprt.ContentScale,
+        screen: *terminal.Screen,
+    ) ?SurfaceGridMetrics {
+        const size_grid = size.grid();
+        if (screen.pages.cols == 0 or
+            screen.pages.rows == 0 or
+            size_grid.columns != screen.pages.cols or
+            size_grid.rows != screen.pages.rows or
+            size.cell.width == 0 or
+            size.cell.height == 0 or
+            !std.math.isFinite(scale.x) or
+            !std.math.isFinite(scale.y) or
+            scale.x <= 0 or
+            scale.y <= 0) return null;
+
+        const cursor_cell = terminal.Selection.canonicalCell(
+            screen.cursor.page_pin.*,
+        );
+        const cursor = if (cursor_cell) |cell|
+            if (screen.pages.pointFromPin(.viewport, cell.pin)) |point|
+                if (point.viewport.x < screen.pages.cols and
+                    point.viewport.y < screen.pages.rows)
+                    point
+                else
+                    null
+            else
+                null
+        else
+            null;
+        return .{
+            .columns = @intCast(screen.pages.cols),
+            .rows = @intCast(screen.pages.rows),
+            .cursor_column = if (cursor) |point|
+                @intCast(point.viewport.x)
+            else
+                0,
+            .cursor_row = if (cursor) |point|
+                @intCast(point.viewport.y)
+            else
+                0,
+            .cursor_width_cells = if (cursor != null)
+                cursor_cell.?.width_cells
+            else
+                0,
+            .cursor_in_viewport = cursor != null,
+            .cell_width = @as(f64, @floatFromInt(size.cell.width)) / scale.x,
+            .cell_height = @as(f64, @floatFromInt(size.cell.height)) / scale.y,
+            .padding_left = @as(f64, @floatFromInt(size.padding.left)) / scale.x,
+            .padding_top = @as(f64, @floatFromInt(size.padding.top)) / scale.y,
+        };
+    }
+
     const SurfaceScrollbar = extern struct {
         total: u64,
         offset: u64,
@@ -2464,6 +2531,203 @@ pub const CAPI = struct {
         };
     }
 
+    /// Select one visible cell without synthesizing a mouse gesture.
+    export fn ghostty_surface_select_viewport_cell(
+        surface: *Surface,
+        column: u16,
+        row: u16,
+    ) bool {
+        return surface.core_surface.selectViewportCell(column, row) catch |err| {
+            log.warn("error selecting viewport cell err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Select inclusive visible rows with tracked full-line endpoints.
+    export fn ghostty_surface_select_viewport_rows(
+        surface: *Surface,
+        top_row: u16,
+        bottom_row: u16,
+    ) bool {
+        return surface.core_surface.selectViewportRows(
+            top_row,
+            bottom_row,
+        ) catch |err| {
+            log.warn("error selecting viewport rows err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Move the active tracked selection endpoint to a visible cell.
+    export fn ghostty_surface_set_selection_endpoint_viewport(
+        surface: *Surface,
+        column: u16,
+        row: u16,
+        linewise: bool,
+    ) bool {
+        return surface.core_surface.setSelectionEndpointViewport(
+            column,
+            row,
+            linewise,
+        ) catch |err| {
+            log.warn("error setting selection endpoint err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Resolve a visible coordinate to its glyph's leading cell and width.
+    export fn ghostty_surface_resolve_viewport_cell(
+        surface: *Surface,
+        column: u16,
+        row: u16,
+        resolved_column: *u16,
+        resolved_row: *u16,
+        width_cells: *u16,
+    ) bool {
+        return surface.core_surface.resolveViewportCell(
+            column,
+            row,
+            resolved_column,
+            resolved_row,
+            width_cells,
+        );
+    }
+
+    /// Query the active selection's logical endpoint in viewport cells.
+    export fn ghostty_surface_selection_endpoint_viewport(
+        surface: *Surface,
+        column: *u16,
+        row: *u16,
+    ) bool {
+        return surface.core_surface.selectionEndpointViewport(column, row);
+    }
+
+    /// Start or stop Ghostty's tracked keyboard-copy cursor.
+    export fn ghostty_surface_keyboard_copy_cursor_set(
+        surface: *Surface,
+        active: bool,
+        resolved_column: *u16,
+        resolved_row: *u16,
+        width_cells: *u16,
+    ) bool {
+        return surface.core_surface.keyboardCopyCursorSet(
+            active,
+            resolved_column,
+            resolved_row,
+            width_cells,
+        ) catch |err| {
+            log.warn("error setting keyboard copy cursor err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Query Ghostty's tracked keyboard-copy cursor in viewport cells.
+    export fn ghostty_surface_keyboard_copy_cursor_viewport(
+        surface: *Surface,
+        resolved_column: *u16,
+        resolved_row: *u16,
+        width_cells: *u16,
+    ) bool {
+        return surface.core_surface.keyboardCopyCursorViewport(
+            resolved_column,
+            resolved_row,
+            width_cells,
+        ) catch |err| {
+            log.warn("error querying keyboard copy cursor err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Query tracked copy cursor geometry and effective runtime color.
+    export fn ghostty_surface_keyboard_copy_cursor_snapshot(
+        surface: *Surface,
+        snapshot: *CoreSurface.KeyboardCopyCursorSnapshot,
+    ) bool {
+        return surface.core_surface.keyboardCopyCursorSnapshot(
+            snapshot,
+        ) catch |err| {
+            log.warn("error querying keyboard copy cursor snapshot err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Return the selection still owned by keyboard copy mode.
+    export fn ghostty_surface_keyboard_copy_selection_kind(
+        surface: *Surface,
+    ) CoreSurface.KeyboardCopySelectionKind {
+        return surface.core_surface.keyboardCopySelectionKind() catch |err| {
+            log.warn("error querying keyboard copy selection err={}", .{err});
+            return .none;
+        };
+    }
+
+    /// Start a selection at Ghostty's tracked keyboard-copy cursor.
+    export fn ghostty_surface_keyboard_copy_selection_start(
+        surface: *Surface,
+        linewise: bool,
+        line_count: u16,
+        resolved_column: *u16,
+        resolved_row: *u16,
+        width_cells: *u16,
+    ) bool {
+        return surface.core_surface.keyboardCopySelectionStart(
+            linewise,
+            line_count,
+            resolved_column,
+            resolved_row,
+            width_cells,
+        ) catch |err| {
+            log.warn("error starting keyboard copy selection err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Move the tracked copy cursor and optional selection endpoint.
+    export fn ghostty_surface_keyboard_selection_move(
+        surface: *Surface,
+        movement: CoreSurface.KeyboardSelectionMove,
+        count: u16,
+        extend_selection: bool,
+        linewise: bool,
+        resolved_column: *u16,
+        resolved_row: *u16,
+        width_cells: *u16,
+    ) bool {
+        return surface.core_surface.keyboardSelectionMove(
+            movement,
+            count,
+            extend_selection,
+            linewise,
+            resolved_column,
+            resolved_row,
+            width_cells,
+        ) catch |err| {
+            log.warn("error moving keyboard selection err={}", .{err});
+            return false;
+        };
+    }
+
+    /// Apply a synchronous copy-mode viewport mutation.
+    export fn ghostty_surface_keyboard_copy_scroll(
+        surface: *Surface,
+        action: CoreSurface.KeyboardCopyScroll,
+        amount: i32,
+        resolved_column: *u16,
+        resolved_row: *u16,
+        width_cells: *u16,
+    ) bool {
+        return surface.core_surface.keyboardCopyScroll(
+            action,
+            amount,
+            resolved_column,
+            resolved_row,
+            width_cells,
+        ) catch |err| {
+            log.warn("error scrolling keyboard copy viewport err={}", .{err});
+            return false;
+        };
+    }
+
     /// Select inclusive absolute screen rows without writing clipboards
     /// (cmux-specific).
     export fn ghostty_surface_select_screen_rows(
@@ -2502,6 +2766,36 @@ pub const CAPI = struct {
 
         // Read the text from the selection.
         return readTextLocked(surface, core_sel, result);
+    }
+
+    /// Read clipboard-formatted plain text from the active selection while
+    /// bounding both temporary and returned allocation size.
+    export fn ghostty_surface_read_selection_clipboard_text(
+        surface: *Surface,
+        max_bytes: usize,
+        result: *Text,
+    ) bool {
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.lockDemand();
+        defer core_surface.renderer_state.unlockDemand();
+
+        const core_sel = core_surface.io.terminal.screens.active.selection orelse
+            return false;
+        return readClipboardTextLocked(surface, core_sel, max_bytes, result);
+    }
+
+    /// Always publish bounded plain text and add HTML when rich formatting fits.
+    /// Plain text remains published when HTML exceeds max_bytes.
+    export fn ghostty_surface_copy_selection_to_clipboard_bounded(
+        surface: *Surface,
+        max_bytes: usize,
+    ) bool {
+        return surface.core_surface.copySelectionToClipboardBounded(
+            max_bytes,
+        ) catch |err| {
+            log.warn("error copying bounded selection err={}", .{err});
+            return false;
+        };
     }
 
     /// Read some arbitrary text from the surface.
@@ -2691,6 +2985,19 @@ pub const CAPI = struct {
         result: *Text,
     ) bool {
         const core_surface = &surface.core_surface;
+        const screen = core_surface.io.terminal.screens.active;
+        const max_work_cells = max_bytes / 4;
+        if (!CoreSurface.selectionWithinClipboardWorkBudget(
+            screen,
+            core_sel,
+            max_work_cells,
+        )) {
+            log.warn(
+                "clipboard selection exceeds work budget max_cells={}",
+                .{max_work_cells},
+            );
+            return false;
+        }
         const opts: terminal.formatter.Options = .{
             .emit = .plain,
             .unwrap = true,
@@ -2702,7 +3009,7 @@ pub const CAPI = struct {
         };
 
         var formatter: terminal.formatter.ScreenFormatter = .init(
-            core_surface.io.terminal.screens.active,
+            screen,
             opts,
         );
         formatter.content = .{ .selection = core_sel };
@@ -2801,6 +3108,26 @@ pub const CAPI = struct {
     /// Return the size information a surface has.
     export fn ghostty_surface_size(surface: *Surface) SurfaceSize {
         return surfaceSize(surface);
+    }
+
+    /// Return exact renderer grid geometry in logical embedder coordinates.
+    export fn ghostty_surface_grid_metrics(
+        surface: *Surface,
+        result: *SurfaceGridMetrics,
+    ) bool {
+        surface.core_surface.renderer_state.lockDemand();
+        defer surface.core_surface.renderer_state.unlockDemand();
+        const screen = surface.core_surface
+            .renderer_state
+            .terminal
+            .screens
+            .active;
+        result.* = surfaceGridMetricsSnapshot(
+            surface.core_surface.size,
+            surface.content_scale,
+            screen,
+        ) orelse return false;
+        return true;
     }
 
     /// Set an authoritative grid and return the pixel size Ghostty resolved.
@@ -4412,6 +4739,154 @@ test "output sequence publishes only with successful VT tail snapshot" {
         &next_sequence,
     ));
     try std.testing.expectEqual(@as(u64, 42), next_sequence);
+}
+
+test "clipboard selection work budget rejects blank history" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var term = try terminal.Terminal.init(alloc, .{
+        .cols = 4,
+        .rows = 2,
+    });
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\r\n\r\n\r\n\r\n");
+
+    const screen = term.screens.active;
+    const selection = terminal.Selection.initLinewise(
+        screen.pages.getTopLeft(.screen),
+        screen.pages.getBottomRight(.screen).?,
+    );
+    try testing.expect(!CoreSurface.selectionWithinClipboardWorkBudget(
+        screen,
+        selection,
+        8,
+    ));
+    try testing.expect(CoreSurface.selectionWithinClipboardWorkBudget(
+        screen,
+        selection,
+        64,
+    ));
+}
+
+test "grid metrics reject resize skew and report an offscreen cursor" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var term = try terminal.Terminal.init(alloc, .{
+        .cols = 10,
+        .rows = 2,
+    });
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("one\r\ntwo\r\nthree\r\nfour\r\n");
+    term.scrollViewport(.top);
+    const screen = term.screens.active;
+
+    const size: renderer.Size = .{
+        .screen = .{ .width = 83, .height = 37 },
+        .cell = .{ .width = 8, .height = 16 },
+        .padding = .{ .left = 3, .top = 5 },
+    };
+    const snapshot = CAPI.surfaceGridMetricsSnapshot(
+        size,
+        .{ .x = 2, .y = 2 },
+        screen,
+    ).?;
+    try testing.expectEqual(@as(u16, 10), snapshot.columns);
+    try testing.expectEqual(@as(u16, 2), snapshot.rows);
+    try testing.expect(!snapshot.cursor_in_viewport);
+    try testing.expectEqual(@as(u16, 0), snapshot.cursor_width_cells);
+    try testing.expectEqual(@as(f64, 4), snapshot.cell_width);
+    try testing.expectEqual(@as(f64, 8), snapshot.cell_height);
+    try testing.expectEqual(@as(f64, 1.5), snapshot.padding_left);
+    try testing.expectEqual(@as(f64, 2.5), snapshot.padding_top);
+
+    var mismatched_size = size;
+    mismatched_size.screen.width += size.cell.width;
+    try testing.expect(CAPI.surfaceGridMetricsSnapshot(
+        mismatched_size,
+        .{ .x = 2, .y = 2 },
+        screen,
+    ) == null);
+
+    term.scrollViewport(.bottom);
+    const active = CAPI.surfaceGridMetricsSnapshot(
+        size,
+        .{ .x = 2, .y = 2 },
+        screen,
+    ).?;
+    try testing.expect(active.cursor_in_viewport);
+    try testing.expectEqual(@as(u16, 1), active.cursor_width_cells);
+}
+
+test "grid metrics canonicalize a wide-tail cursor" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var term = try terminal.Terminal.init(alloc, .{
+        .cols = 6,
+        .rows = 2,
+    });
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("A橋B\x1b[1;3H");
+    const cursor_pin = term.screens.active.cursor.page_pin.*;
+    try testing.expectEqual(
+        terminal.page.Cell.Wide.spacer_tail,
+        cursor_pin.rowAndCell().cell.wide,
+    );
+
+    const snapshot = CAPI.surfaceGridMetricsSnapshot(
+        .{
+            .screen = .{ .width = 51, .height = 37 },
+            .cell = .{ .width = 8, .height = 16 },
+            .padding = .{ .left = 3, .top = 5 },
+        },
+        .{ .x = 1, .y = 1 },
+        term.screens.active,
+    ).?;
+    try testing.expect(snapshot.cursor_in_viewport);
+    try testing.expectEqual(@as(u16, 1), snapshot.cursor_column);
+    try testing.expectEqual(@as(u16, 0), snapshot.cursor_row);
+    try testing.expectEqual(@as(u16, 2), snapshot.cursor_width_cells);
+}
+
+test "grid metrics resolve a spacer-head cursor to its wrapped glyph" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var term = try terminal.Terminal.init(alloc, .{
+        .cols = 4,
+        .rows = 3,
+    });
+    defer term.deinit(alloc);
+
+    var stream = term.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("ABC橋\x1b[1;4H");
+    const cursor_pin = term.screens.active.cursor.page_pin.*;
+    try testing.expectEqual(
+        terminal.page.Cell.Wide.spacer_head,
+        cursor_pin.rowAndCell().cell.wide,
+    );
+
+    const snapshot = CAPI.surfaceGridMetricsSnapshot(
+        .{
+            .screen = .{ .width = 35, .height = 53 },
+            .cell = .{ .width = 8, .height = 16 },
+            .padding = .{ .left = 3, .top = 5 },
+        },
+        .{ .x = 1, .y = 1 },
+        term.screens.active,
+    ).?;
+    try testing.expect(snapshot.cursor_in_viewport);
+    try testing.expectEqual(@as(u16, 0), snapshot.cursor_column);
+    try testing.expectEqual(@as(u16, 1), snapshot.cursor_row);
+    try testing.expectEqual(@as(u16, 2), snapshot.cursor_width_cells);
 }
 
 test "render grid preserves terminal color semantics" {

@@ -614,6 +614,21 @@ typedef struct {
   uint32_t cell_height_px;
 } ghostty_surface_size_s;
 
+// cmux fork: authoritative terminal grid geometry in the embedder's logical
+// coordinate space. Delete when upstream exposes equivalent geometry.
+typedef struct {
+  uint16_t columns;
+  uint16_t rows;
+  uint16_t cursor_column;
+  uint16_t cursor_row;
+  uint16_t cursor_width_cells;
+  bool cursor_in_viewport;
+  double cell_width;
+  double cell_height;
+  double padding_left;
+  double padding_top;
+} ghostty_surface_grid_metrics_s;
+
 // cmux fork: authoritative scrollbar snapshot independent of renderer
 // publication. Delete when upstream exports equivalent row-space identity.
 typedef struct {
@@ -622,6 +637,47 @@ typedef struct {
   uint64_t len;
   uint64_t row_space_revision;
 } ghostty_surface_scrollbar_s;
+
+// cmux fork: semantic keyboard-selection movement kept inside Ghostty so
+// glyph canonicalization, tracked endpoints, and viewport scrolling are one
+// renderer-state transaction.
+typedef enum {
+  GHOSTTY_KEYBOARD_SELECTION_MOVE_LEFT,
+  GHOSTTY_KEYBOARD_SELECTION_MOVE_RIGHT,
+  GHOSTTY_KEYBOARD_SELECTION_MOVE_UP,
+  GHOSTTY_KEYBOARD_SELECTION_MOVE_DOWN,
+  GHOSTTY_KEYBOARD_SELECTION_MOVE_PAGE_UP,
+  GHOSTTY_KEYBOARD_SELECTION_MOVE_PAGE_DOWN,
+  GHOSTTY_KEYBOARD_SELECTION_MOVE_HOME,
+  GHOSTTY_KEYBOARD_SELECTION_MOVE_END,
+  GHOSTTY_KEYBOARD_SELECTION_MOVE_BEGINNING_OF_LINE,
+  GHOSTTY_KEYBOARD_SELECTION_MOVE_END_OF_LINE,
+} ghostty_keyboard_selection_move_e;
+
+// cmux fork: synchronous viewport mutations used by keyboard copy mode.
+typedef enum {
+  GHOSTTY_KEYBOARD_COPY_SCROLL_LINES,
+  GHOSTTY_KEYBOARD_COPY_SCROLL_PAGES,
+  GHOSTTY_KEYBOARD_COPY_SCROLL_HALF_PAGES,
+  GHOSTTY_KEYBOARD_COPY_SCROLL_TOP,
+  GHOSTTY_KEYBOARD_COPY_SCROLL_BOTTOM,
+  GHOSTTY_KEYBOARD_COPY_SCROLL_PROMPTS,
+} ghostty_keyboard_copy_scroll_e;
+
+typedef enum {
+  GHOSTTY_KEYBOARD_COPY_SELECTION_NONE,
+  GHOSTTY_KEYBOARD_COPY_SELECTION_CHARACTER,
+  GHOSTTY_KEYBOARD_COPY_SELECTION_LINE,
+} ghostty_keyboard_copy_selection_e;
+
+typedef struct {
+  uint16_t column;
+  uint16_t row;
+  uint16_t width_cells;
+  uint8_t color_red;
+  uint8_t color_green;
+  uint8_t color_blue;
+} ghostty_keyboard_copy_cursor_s;
 
 // Config types
 
@@ -1315,6 +1371,9 @@ GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
+GHOSTTY_API bool ghostty_surface_grid_metrics(
+    ghostty_surface_t,
+    ghostty_surface_grid_metrics_s*);
 // Set an authoritative logical terminal grid. Ghostty derives the exact pixel
 // dimensions from the current cell metrics and padding, applies the resize,
 // and optionally writes the resolved dimensions. Zero or overflowing sizes
@@ -1437,6 +1496,70 @@ GHOSTTY_API bool ghostty_surface_has_selection(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_select_cursor_cell(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_select_cursor_line(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_clear_selection(ghostty_surface_t);
+// cmux fork: tracked keyboard-selection operations in viewport coordinates.
+// These avoid synthesizing mouse gestures and keep terminal row identity,
+// selection motion, rendering, and clipboard formatting inside Ghostty.
+GHOSTTY_API bool ghostty_surface_select_viewport_cell(ghostty_surface_t,
+                                                      uint16_t,
+                                                      uint16_t);
+GHOSTTY_API bool ghostty_surface_select_viewport_rows(ghostty_surface_t,
+                                                      uint16_t,
+                                                      uint16_t);
+GHOSTTY_API bool ghostty_surface_set_selection_endpoint_viewport(
+    ghostty_surface_t,
+    uint16_t,
+    uint16_t,
+    bool);
+GHOSTTY_API bool ghostty_surface_resolve_viewport_cell(
+    ghostty_surface_t,
+    uint16_t,
+    uint16_t,
+    uint16_t*,
+    uint16_t*,
+    uint16_t*);
+GHOSTTY_API bool ghostty_surface_selection_endpoint_viewport(
+    ghostty_surface_t,
+    uint16_t*,
+    uint16_t*);
+GHOSTTY_API bool ghostty_surface_keyboard_copy_cursor_set(
+    ghostty_surface_t,
+    bool,
+    uint16_t*,
+    uint16_t*,
+    uint16_t*);
+GHOSTTY_API bool ghostty_surface_keyboard_copy_cursor_viewport(
+    ghostty_surface_t,
+    uint16_t*,
+    uint16_t*,
+    uint16_t*);
+GHOSTTY_API bool ghostty_surface_keyboard_copy_cursor_snapshot(
+    ghostty_surface_t,
+    ghostty_keyboard_copy_cursor_s*);
+GHOSTTY_API ghostty_keyboard_copy_selection_e
+ghostty_surface_keyboard_copy_selection_kind(ghostty_surface_t);
+GHOSTTY_API bool ghostty_surface_keyboard_copy_selection_start(
+    ghostty_surface_t,
+    bool,
+    uint16_t,
+    uint16_t*,
+    uint16_t*,
+    uint16_t*);
+GHOSTTY_API bool ghostty_surface_keyboard_selection_move(
+    ghostty_surface_t,
+    ghostty_keyboard_selection_move_e,
+    uint16_t,
+    bool,
+    bool,
+    uint16_t*,
+    uint16_t*,
+    uint16_t*);
+GHOSTTY_API bool ghostty_surface_keyboard_copy_scroll(
+    ghostty_surface_t,
+    ghostty_keyboard_copy_scroll_e,
+    int32_t,
+    uint16_t*,
+    uint16_t*,
+    uint16_t*);
 // cmux fork: set/query the active selection from inclusive absolute screen rows.
 // The setter updates Ghostty's tracked selection pins without writing clipboards.
 GHOSTTY_API bool ghostty_surface_select_screen_rows(ghostty_surface_t,
@@ -1446,6 +1569,17 @@ GHOSTTY_API bool ghostty_surface_selection_screen_rows(ghostty_surface_t,
                                                        uint32_t*,
                                                        uint32_t*);
 GHOSTTY_API bool ghostty_surface_read_selection(ghostty_surface_t, ghostty_text_s*);
+GHOSTTY_API bool ghostty_surface_read_selection_clipboard_text(
+    ghostty_surface_t,
+    uintptr_t,
+    ghostty_text_s*);
+// Publish the active selection to the standard clipboard as plain text plus
+// HTML when the HTML fits. Both formatter output and selected-cell work are
+// bounded by max_bytes; plain text is still published when only HTML exceeds
+// that bound. The selection is not cleared.
+GHOSTTY_API bool ghostty_surface_copy_selection_to_clipboard_bounded(
+    ghostty_surface_t,
+    uintptr_t);
 GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
                                               ghostty_selection_s,
                                               ghostty_text_s*);
