@@ -120,6 +120,10 @@ pub const Shaders = struct {
     /// "post_shaders" is an optional list of postprocess shaders to run
     /// against the final drawable texture. This is an array of shader source
     /// code, not file paths.
+    ///
+    /// The allocator parameter is unused because shared shader state is
+    /// process-wide and allocated with `shared_shader_allocator`. It remains
+    /// in the signature for graphics API compatibility.
     pub fn init(
         _: Allocator,
         device: objc.Object,
@@ -421,7 +425,8 @@ fn removeSharedLocked(target: *SharedShaders) void {
         destroySharedLocked(entry);
         return;
     }
-    unreachable;
+    log.warn("shared shader entry missing from cache during removal", .{});
+    return;
 }
 
 /// Caller holds `shared_shader_mutex`.
@@ -702,6 +707,7 @@ test "custom shader cache survives a renderer handoff gap" {
         .bgra8unorm,
     );
     try testing.expect(hidden.shared != null);
+    try testing.expectEqual(@as(usize, 1), hidden.post_pipelines.len);
     const standard_pipeline = hidden.pipelines.bg_color.state.value;
     const post_pipeline = hidden.post_pipelines[0].state.value;
     hidden.deinit(testing.allocator);
