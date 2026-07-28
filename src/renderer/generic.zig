@@ -170,6 +170,14 @@ fn advanceShaperCellIndexToX(
 ///
 /// [ Texture ] - An abstraction over a GPU texture.
 ///
+fn disposePresentedTarget(resource: anytype) void {
+    // A queued main-thread layer clear may still composite this target.
+    // Release renderer ownership without making its IOSurface purgeable;
+    // Core Animation's retained reference keeps the pixels valid until
+    // the clear callback removes the layer contents.
+    resource.deinit();
+}
+
 pub fn Renderer(comptime GraphicsAPI: type) type {
     return struct {
         const Self = @This();
@@ -621,7 +629,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 comptime purge: bool,
             ) void {
                 // SwapChain only calls this after the frame lease drains.
-                disposeOwned(&self.target, purge);
+                disposePresentedTarget(&self.target);
                 disposeOwned(&self.uniforms, purge);
                 disposeOwned(&self.cells, purge);
                 disposeOwned(&self.cells_bg, purge);
