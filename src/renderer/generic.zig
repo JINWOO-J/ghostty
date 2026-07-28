@@ -3849,8 +3849,13 @@ test "prepared frame damage remains retryable until draw commit" {
 
 test "renderer teardown releases presented target without purging" {
     const Resource = struct {
+        released: *usize,
         deinited: *usize,
         discarded: *usize,
+
+        fn releasePresentationOwnership(self: @This()) void {
+            self.released.* += 1;
+        }
 
         fn deinit(self: *@This()) void {
             self.deinited.* += 1;
@@ -3861,16 +3866,19 @@ test "renderer teardown releases presented target without purging" {
         }
     };
 
+    var released: usize = 0;
     var deinited: usize = 0;
     var discarded: usize = 0;
     var target: Resource = .{
+        .released = &released,
         .deinited = &deinited,
         .discarded = &discarded,
     };
 
     disposePresentedTarget(&target);
 
-    try std.testing.expectEqual(@as(usize, 1), deinited);
+    try std.testing.expectEqual(@as(usize, 1), released);
+    try std.testing.expectEqual(@as(usize, 0), deinited);
     try std.testing.expectEqual(@as(usize, 0), discarded);
 }
 
