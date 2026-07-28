@@ -154,13 +154,13 @@ const Presenter = union(enum) {
 const RecreatableCommandQueue = struct {
     value: ?objc.Object,
 
-    fn init(device: objc.Object) RecreatableCommandQueue {
+    fn init(device: objc.Object) !RecreatableCommandQueue {
         return .{
-            .value = device.msgSend(
-                objc.Object,
+            .value = try commandQueueFromId(device.msgSend(
+                ?*anyopaque,
                 objc.sel("newCommandQueue"),
                 .{},
-            ),
+            )),
         };
     }
 
@@ -177,9 +177,9 @@ const RecreatableCommandQueue = struct {
     fn ensureLive(
         self: *RecreatableCommandQueue,
         device: objc.Object,
-    ) void {
+    ) !void {
         if (self.value != null) return;
-        self.* = .init(device);
+        self.* = try .init(device);
     }
 
     fn get(self: *const RecreatableCommandQueue) objc.Object {
@@ -190,6 +190,10 @@ const RecreatableCommandQueue = struct {
         return self.value != null;
     }
 };
+
+fn commandQueueFromId(value: ?*anyopaque) !objc.Object {
+    return objc.Object.fromId(value orelse return error.CommandQueueUnavailable);
+}
 
 presenter: Presenter,
 
@@ -229,7 +233,7 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
     // Choose our MTLDevice and create a MTLCommandQueue for that device.
     const device = try chooseDevice();
     errdefer device.release();
-    var queue = RecreatableCommandQueue.init(device);
+    var queue = try RecreatableCommandQueue.init(device);
     errdefer queue.deinit();
 
     // Grab metadata about the device.
@@ -313,8 +317,8 @@ pub fn displayUnrealizedAfterDrain(self: *Metal) void {
 /// Restore the per-renderer submission queue after hidden-tab reclamation.
 /// Pipeline state remains shared, while the queue's driver allocation pools
 /// exist only for renderers that can submit frames.
-pub fn displayRealized(self: *Metal) void {
-    self.queue.ensureLive(self.device);
+pub fn displayRealized(self: *Metal) !void {
+    try self.queue.ensureLive(self.device);
 }
 
 /// Install a distinct gate before replacement swap-chain frames can be used.
@@ -860,14 +864,14 @@ test "metal command queue releases and recreates across renderer realization" {
     const device = try chooseDevice();
     defer device.release();
 
-    var queue = RecreatableCommandQueue.init(device);
+    var queue = try RecreatableCommandQueue.init(device);
     defer queue.deinit();
     try testing.expect(queue.isLive());
 
     queue.release();
     try testing.expect(!queue.isLive());
 
-    queue.ensureLive(device);
+    try queue.ensureLive(device);
     try testing.expect(queue.isLive());
 }
 

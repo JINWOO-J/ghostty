@@ -64,6 +64,23 @@ const DrawDamageCommit = struct {
     }
 };
 
+/// Initialize a fixed frame array transactionally. A failed later frame must
+/// release every resource owned by the successfully initialized prefix before
+/// the caller retries swap-chain realization.
+fn initializeFrameStates(
+    frames: anytype,
+    api: anytype,
+    custom_shaders: bool,
+) !void {
+    var initialized: usize = 0;
+    errdefer for (frames[0..initialized]) |*frame| frame.deinit();
+
+    for (frames) |*frame| {
+        frame.* = try @TypeOf(frame.*).init(api, custom_shaders);
+        initialized += 1;
+    }
+}
+
 fn advanceShaperCellIndexToX(
     run_offset: usize,
     shaped_cells: []const font.shape.Cell,
@@ -340,10 +357,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             pub fn init(api: GraphicsAPI, custom_shaders: bool) !SwapChain {
                 var result: SwapChain = .{ .frames = undefined };
 
-                // Initialize all of our frame state.
-                for (&result.frames) |*frame| {
-                    frame.* = try FrameState.init(api, custom_shaders);
-                }
+                try initializeFrameStates(
+                    &result.frames,
+                    api,
+                    custom_shaders,
+                );
 
                 return result;
             }
@@ -1122,7 +1140,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         pub fn displayRealized(self: *Self) !void {
             // If our API has to do things on realize, let it.
             if (@hasDecl(GraphicsAPI, "displayRealized")) {
-                self.api.displayRealized();
+                try self.api.displayRealized();
             }
 
             // Lock the draw mutex so that we can
