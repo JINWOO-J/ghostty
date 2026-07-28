@@ -294,6 +294,32 @@ typedef enum GHOSTTY_ENUM_TYPED {
 } GhosttyTerminalScreen;
 
 /**
+ * Automatic Kitty image-ID cursors for both terminal screens.
+ *
+ * @ingroup terminal
+ */
+typedef struct {
+  uint32_t primary;
+  uint32_t alternate;
+} GhosttyTerminalKittyImageIdCursors;
+
+/**
+ * Replay and steady-state Kitty image-ID cursors.
+ *
+ * Replay cursors are installed immediately before image replay bytes that can
+ * allocate an automatic ID. Replay prefixes containing terminal reset
+ * sequences must be applied first. Replay cursors can point at IDs already
+ * reserved by in-flight multipart uploads. Next cursors are restored after
+ * replay.
+ *
+ * @ingroup terminal
+ */
+typedef struct {
+  GhosttyTerminalKittyImageIdCursors replay;
+  GhosttyTerminalKittyImageIdCursors next;
+} GhosttyTerminalKittyImageIdCursorState;
+
+/**
  * Visual style of the terminal cursor.
  *
  * @ingroup terminal
@@ -753,6 +779,44 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Input type: GhosttyTerminalPwdChangedFn
    */
   GHOSTTY_TERMINAL_OPT_PWD_CHANGED = 25,
+
+  /**
+   * Set the maximum number of stored Kitty graphics images per screen.
+   *
+   * Adding a new image at the limit evicts the oldest image, prioritizing
+   * unused images. Replacing an existing image ID remains allowed. Lowering
+   * the limit evicts images immediately. Zero allows no stored images but
+   * does not disable Kitty graphics protocol parsing. A NULL value pointer
+   * is equivalent to zero.
+   *
+   * Input type: uint64_t*
+   */
+  GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_COUNT_LIMIT = 26,
+
+  /**
+   * Set the maximum number of Kitty graphics placements per screen.
+   *
+   * Adding a new placement at the limit is rejected, while replacing an
+   * existing external placement remains allowed. Lowering the limit below
+   * any screen's current placement count returns GHOSTTY_INVALID_VALUE and
+   * leaves every screen unchanged. Zero allows no placements. A NULL value
+   * pointer is equivalent to zero.
+   *
+   * Input type: uint64_t*
+   */
+  GHOSTTY_TERMINAL_OPT_KITTY_PLACEMENT_COUNT_LIMIT = 27,
+
+  /**
+   * Restore automatic Kitty image-ID cursors for both terminal screens.
+   *
+   * Every cursor must be nonzero. The alternate screen is initialized only
+   * when its supplied cursors differ from their defaults. A NULL value is
+   * invalid.
+   *
+   * Input type: GhosttyTerminalKittyImageIdCursors*
+   */
+  GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_ID_CURSORS = 28,
+
   GHOSTTY_TERMINAL_OPT_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalOption;
 
@@ -1063,6 +1127,83 @@ typedef enum GHOSTTY_ENUM_TYPED {
    * Output type: bool *
    */
   GHOSTTY_TERMINAL_DATA_VIEWPORT_ACTIVE = 32,
+
+  /**
+   * The active screen's effective cursor visual style.
+   *
+   * This is the visual shape selected by DECSCUSR or the configured terminal
+   * default. It is distinct from GHOSTTY_TERMINAL_DATA_CURSOR_STYLE, which is
+   * the SGR style applied to newly printed cells.
+   *
+   * Output type: GhosttyTerminalCursorStyle *
+   */
+  GHOSTTY_TERMINAL_DATA_CURSOR_VISUAL_STYLE = 33,
+
+  /**
+   * Whether the effective cursor visual is blinking (DEC mode 12).
+   *
+   * Output type: bool *
+   */
+  GHOSTTY_TERMINAL_DATA_CURSOR_BLINKING = 34,
+
+  /**
+   * An opaque activity token for active-screen continuity.
+   *
+   * The token is guaranteed to change on every actual active-screen switch,
+   * including multiple switches processed by one ghostty_terminal_vt_write()
+   * call. It may also change for other screen activity, such as selection
+   * changes. Consumers must treat the value as opaque and compare it only for
+   * inequality; its magnitude and ordering have no meaning. A request to
+   * switch to the already-active screen need not change the token.
+   *
+   * Output type: uint64_t *
+   */
+  GHOSTTY_TERMINAL_DATA_SCREEN_ACTIVITY = 35,
+
+  /**
+   * An opaque activity token for cursor-semantic continuity.
+   *
+   * The token changes whenever Ghostty processes an operation that can affect
+   * cursor replay semantics, even when the resolved cursor shape and blink
+   * values remain unchanged. This includes DECSCUSR, DEC mode 12, alternate
+   * screen mode dispatches, full reset, and configured cursor-default changes.
+   * Multiple such operations within one ghostty_terminal_vt_write() call each
+   * advance the token. The token may also produce false-positive changes.
+   * Consumers must treat it as opaque and compare it only for inequality; its
+   * magnitude and ordering have no meaning.
+   *
+   * Output type: uint64_t *
+   */
+  GHOSTTY_TERMINAL_DATA_CURSOR_ACTIVITY = 36,
+
+  /**
+   * The stored Kitty graphics image count limit for the active screen.
+   *
+   * Returns GHOSTTY_NO_VALUE when Kitty graphics are disabled at build time.
+   *
+   * Output type: uint64_t *
+   */
+  GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_COUNT_LIMIT = 37,
+
+  /**
+   * The Kitty graphics placement count limit for the active screen.
+   *
+   * Returns GHOSTTY_NO_VALUE when Kitty graphics are disabled at build time.
+   *
+   * Output type: uint64_t *
+   */
+  GHOSTTY_TERMINAL_DATA_KITTY_PLACEMENT_COUNT_LIMIT = 38,
+
+  /**
+   * Exact automatic Kitty image-ID replay and steady-state cursors for both
+   * terminal screens. A cursor can identify an occupied image because
+   * allocation probes forward at use time. An uninitialized alternate screen
+   * reports defaults.
+   *
+   * Output type: GhosttyTerminalKittyImageIdCursorState*
+   */
+  GHOSTTY_TERMINAL_DATA_KITTY_IMAGE_ID_CURSORS = 39,
+
   GHOSTTY_TERMINAL_DATA_MAX_VALUE = GHOSTTY_ENUM_MAX_VALUE,
 } GhosttyTerminalData;
 

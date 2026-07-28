@@ -10,6 +10,7 @@ const ScreenSet = @import("../ScreenSet.zig");
 const PageList = @import("../PageList.zig");
 const apc = @import("../apc.zig");
 const kitty = @import("../kitty/key.zig");
+const kitty_graphics_storage = @import("../kitty/graphics_storage.zig");
 const kitty_gfx_c = @import("kitty_graphics.zig");
 const modes = @import("../modes.zig");
 const point = @import("../point.zig");
@@ -373,6 +374,9 @@ pub const Option = enum(c_int) {
     default_cursor_blink = 23,
     glyph_protocol = 24,
     pwd_changed = 25,
+    kitty_image_count_limit = 26,
+    kitty_placement_count_limit = 27,
+    kitty_image_id_cursors = 28,
 
     /// Input type expected for setting the option.
     pub fn InType(comptime self: Option) type {
@@ -390,7 +394,11 @@ pub const Option = enum(c_int) {
             .title, .pwd => ?*const lib.String,
             .color_foreground, .color_background, .color_cursor => ?*const color.RGB.C,
             .color_palette => ?*const color.PaletteC,
-            .kitty_image_storage_limit => ?*const u64,
+            .kitty_image_storage_limit,
+            .kitty_image_count_limit,
+            .kitty_placement_count_limit,
+            => ?*const u64,
+            .kitty_image_id_cursors => ?*const KittyImageIdCursors,
             .kitty_image_medium_file,
             .kitty_image_medium_temp_file,
             .kitty_image_medium_shared_mem,
@@ -478,6 +486,43 @@ fn setTyped(
                 screen.kitty_images.setLimit(screen.alloc, screen, limit) catch return .out_of_memory;
             }
         },
+        .kitty_image_count_limit => {
+            if (comptime !build_options.kitty_graphics) return .success;
+            const limit: usize = if (value) |v|
+                std.math.cast(usize, v.*) orelse return .invalid_value
+            else
+                0;
+            wrapper.terminal.setKittyGraphicsImageCountLimit(
+                wrapper.terminal.gpa(),
+                limit,
+            ) catch return .out_of_memory;
+        },
+        .kitty_placement_count_limit => {
+            if (comptime !build_options.kitty_graphics) return .success;
+            const limit: usize = if (value) |v|
+                std.math.cast(usize, v.*) orelse return .invalid_value
+            else
+                0;
+            if (!wrapper.terminal.setKittyGraphicsPlacementCountLimit(limit)) {
+                return .invalid_value;
+            }
+        },
+        .kitty_image_id_cursors => {
+            if (comptime !build_options.kitty_graphics) return .success;
+            const cursors = (value orelse return .invalid_value).*;
+            if (cursors.primary == 0 or cursors.alternate == 0) {
+                return .invalid_value;
+            }
+            const t = wrapper.terminal;
+            const alternate = t.screens.get(.alternate) orelse if (cursors.alternate != kitty_default_image_id)
+                initAlternateScreen(t) catch return .out_of_memory
+            else
+                null;
+            t.screens.get(.primary).?.kitty_images.next_image_id = cursors.primary;
+            if (alternate) |screen| {
+                screen.kitty_images.next_image_id = cursors.alternate;
+            }
+        },
         .kitty_image_medium_file,
         .kitty_image_medium_temp_file,
         .kitty_image_medium_shared_mem,
@@ -523,6 +568,7 @@ fn setTyped(
         },
         .default_cursor_style => {
             const style = (if (value) |ptr| ptr.* else TerminalCursorStyle.block).toZig() orelse return .invalid_value;
+            wrapper.stream.handler.recordCursorActivity();
             wrapper.stream.handler.default_cursor_style = style;
             if (wrapper.stream.handler.default_cursor) {
                 wrapper.terminal.screens.active.cursor.cursor_style = style;
@@ -530,6 +576,7 @@ fn setTyped(
         },
         .default_cursor_blink => {
             const blink = if (value) |ptr| ptr.* else false;
+            wrapper.stream.handler.recordCursorActivity();
             wrapper.stream.handler.default_cursor_blink = blink;
             if (wrapper.stream.handler.default_cursor) {
                 wrapper.terminal.modes.set(.cursor_blinking, blink);
@@ -554,6 +601,15 @@ pub const TerminalCursorStyle = enum(c_int) {
             .underline => .underline,
             .block_hollow => .block_hollow,
             _ => null,
+        };
+    }
+
+    fn fromZig(style: Screen.CursorStyle) TerminalCursorStyle {
+        return switch (style) {
+            .bar => .bar,
+            .block => .block,
+            .underline => .underline,
+            .block_hollow => .block_hollow,
         };
     }
 };
@@ -618,8 +674,8 @@ pub fn resize(
 }
 
 pub fn reset(terminal_: Terminal) callconv(lib.calling_conv) void {
-    const t: *ZigTerminal = (terminal_ orelse return).terminal;
-    t.fullReset();
+    const wrapper = terminal_ orelse return;
+    wrapper.stream.handler.fullReset();
 }
 
 pub fn mode_get(
@@ -651,6 +707,48 @@ pub const KittyGraphics = kitty_gfx_c.KittyGraphics;
 
 /// C: GhosttyTerminalScreen
 pub const TerminalScreen = ScreenSet.Key;
+
+/// C: GhosttyTerminalKittyImageIdCursors
+pub const KittyImageIdCursors = extern struct {
+    primary: u32,
+    alternate: u32,
+};
+
+/// C: GhosttyTerminalKittyImageIdCursorState
+pub const KittyImageIdCursorState = extern struct {
+    replay: KittyImageIdCursors,
+    next: KittyImageIdCursors,
+};
+
+const kitty_default_image_id = kitty_graphics_storage.default_image_id;
+
+fn initAlternateScreen(t: *ZigTerminal) !*Screen {
+    const primary = t.screens.get(.primary).?;
+    return t.screens.getInit(
+        primary.alloc,
+        .alternate,
+        .{
+            .cols = t.cols,
+            .rows = t.rows,
+            .max_scrollback = 0,
+            .kitty_image_storage_limit = if (comptime build_options.kitty_graphics)
+                primary.kitty_images.total_limit
+            else
+                0,
+            .kitty_image_count_limit = if (comptime build_options.kitty_graphics)
+                primary.kitty_images.image_count_limit
+            else
+                0,
+            .kitty_placement_count_limit = if (comptime build_options.kitty_graphics)
+                primary.kitty_images.placement_count_limit
+            else
+                0,
+            .kitty_image_loading_limits = if (comptime build_options.kitty_graphics)
+                primary.kitty_images.image_limits
+            else {},
+        },
+    );
+}
 
 /// C: GhosttyTerminalScrollbar
 pub const TerminalScrollbar = PageList.Scrollbar.C;
@@ -690,20 +788,34 @@ pub const TerminalData = enum(c_int) {
     kitty_graphics = 30,
     selection = 31,
     viewport_active = 32,
+    cursor_visual_style = 33,
+    cursor_blinking = 34,
+    screen_activity = 35,
+    cursor_activity = 36,
+    kitty_image_count_limit = 37,
+    kitty_placement_count_limit = 38,
+    kitty_image_id_cursors = 39,
 
     /// Output type expected for querying the data of the given kind.
     pub fn OutType(comptime self: TerminalData) type {
         return switch (self) {
             .invalid => void,
             .cols, .rows, .cursor_x, .cursor_y => size.CellCountInt,
-            .cursor_pending_wrap, .cursor_visible, .mouse_tracking, .viewport_active => bool,
+            .cursor_pending_wrap,
+            .cursor_visible,
+            .mouse_tracking,
+            .viewport_active,
+            .cursor_blinking,
+            => bool,
             .active_screen => TerminalScreen,
             .kitty_keyboard_flags => u8,
             .scrollbar => TerminalScrollbar,
             .cursor_style => style_c.Style,
+            .cursor_visual_style => TerminalCursorStyle,
             .title, .pwd => lib.String,
             .total_rows, .scrollback_rows => usize,
             .width_px, .height_px => u32,
+            .screen_activity, .cursor_activity => u64,
             .color_foreground,
             .color_background,
             .color_cursor,
@@ -712,7 +824,11 @@ pub const TerminalData = enum(c_int) {
             .color_cursor_default,
             => color.RGB.C,
             .color_palette, .color_palette_default => color.PaletteC,
-            .kitty_image_storage_limit => u64,
+            .kitty_image_storage_limit,
+            .kitty_image_count_limit,
+            .kitty_placement_count_limit,
+            => u64,
+            .kitty_image_id_cursors => KittyImageIdCursorState,
             .kitty_image_medium_file,
             .kitty_image_medium_temp_file,
             .kitty_image_medium_shared_mem,
@@ -771,7 +887,8 @@ fn getTyped(
     comptime data: TerminalData,
     out: *data.OutType(),
 ) Result {
-    const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
+    const wrapper = terminal_ orelse return .invalid_value;
+    const t: *ZigTerminal = wrapper.terminal;
     switch (data) {
         .invalid => return .invalid_value,
         .cols => out.* = t.cols,
@@ -812,6 +929,42 @@ fn getTyped(
             if (comptime !build_options.kitty_graphics) return .no_value;
             out.* = @intCast(t.screens.active.kitty_images.total_limit);
         },
+        .kitty_image_count_limit => {
+            if (comptime !build_options.kitty_graphics) return .no_value;
+            out.* = @intCast(t.screens.active.kitty_images.image_count_limit);
+        },
+        .kitty_placement_count_limit => {
+            if (comptime !build_options.kitty_graphics) return .no_value;
+            out.* = @intCast(t.screens.active.kitty_images.placement_count_limit);
+        },
+        .kitty_image_id_cursors => {
+            if (comptime !build_options.kitty_graphics) return .no_value;
+            const primary = &t.screens.get(.primary).?.kitty_images;
+            const alternate = if (t.screens.get(.alternate)) |screen|
+                &screen.kitty_images
+            else
+                null;
+            const primary_replay = primary.replayNextImageId() orelse return .no_value;
+            const primary_next = primary.imageIdCursor();
+            const alternate_replay = if (alternate) |storage|
+                storage.replayNextImageId() orelse return .no_value
+            else
+                kitty_default_image_id;
+            const alternate_next = if (alternate) |storage|
+                storage.imageIdCursor()
+            else
+                kitty_default_image_id;
+            out.* = .{
+                .replay = .{
+                    .primary = primary_replay,
+                    .alternate = alternate_replay,
+                },
+                .next = .{
+                    .primary = primary_next,
+                    .alternate = alternate_next,
+                },
+            };
+        },
         .kitty_image_medium_file => {
             if (comptime !build_options.kitty_graphics) return .no_value;
             out.* = t.screens.active.kitty_images.image_limits.file;
@@ -832,6 +985,10 @@ fn getTyped(
             t.screens.active.selection orelse return .no_value,
         ),
         .viewport_active => out.* = t.screens.active.pages.viewport == .active,
+        .cursor_visual_style => out.* = .fromZig(t.screens.active.cursor.cursor_style),
+        .cursor_blinking => out.* = t.modes.get(.cursor_blinking),
+        .screen_activity => out.* = t.selectionActivity(),
+        .cursor_activity => out.* = wrapper.stream.handler.cursorActivity(),
     }
 
     return .success;
@@ -1122,6 +1279,89 @@ test "scroll_viewport row alt screen" {
     try testing.expectEqual(@as(u64, 2), scrollbar_data.total);
     try testing.expectEqual(@as(u64, 0), scrollbar_data.offset);
     try testing.expectEqual(@as(u64, 2), scrollbar_data.len);
+}
+
+test "Kitty automatic image ID cursors cover both screens" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 5, .rows = 2, .max_scrollback = 0 },
+    ));
+    defer free(t);
+
+    const primary = "\x1b_Ga=t,t=d,f=24,I=1,s=1,v=1;////\x1b\\";
+    vt_write(t, primary.ptr, primary.len);
+    const enter_alt = "\x1b[?1049h";
+    vt_write(t, enter_alt.ptr, enter_alt.len);
+    const alternate = "\x1b_Ga=t,t=d,f=24,I=2,s=1,v=2,m=1;////\x1b\\";
+    vt_write(t, alternate.ptr, alternate.len);
+
+    var state: KittyImageIdCursorState = undefined;
+    try testing.expectEqual(
+        Result.success,
+        get(t, .kitty_image_id_cursors, @ptrCast(&state)),
+    );
+    try testing.expectEqual(@as(u32, kitty_default_image_id + 1), state.replay.primary);
+    try testing.expectEqual(@as(u32, kitty_default_image_id + 1), state.next.primary);
+    try testing.expectEqual(@as(u32, kitty_default_image_id), state.replay.alternate);
+    try testing.expectEqual(@as(u32, kitty_default_image_id + 1), state.next.alternate);
+
+    var restored: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &restored,
+        .{ .cols = 5, .rows = 2, .max_scrollback = 0 },
+    ));
+    defer free(restored);
+    const cursors: KittyImageIdCursors = .{ .primary = 41, .alternate = 42 };
+    try testing.expectEqual(
+        Result.success,
+        set(restored, .kitty_image_id_cursors, @ptrCast(&cursors)),
+    );
+    try testing.expectEqual(
+        Result.success,
+        get(restored, .kitty_image_id_cursors, @ptrCast(&state)),
+    );
+    try testing.expectEqual(cursors, state.replay);
+    try testing.expectEqual(cursors, state.next);
+
+    const invalid: KittyImageIdCursors = .{ .primary = 0, .alternate = 42 };
+    try testing.expectEqual(
+        Result.invalid_value,
+        set(restored, .kitty_image_id_cursors, @ptrCast(&invalid)),
+    );
+
+    var collision: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &collision,
+        .{ .cols = 5, .rows = 2, .max_scrollback = 0 },
+    ));
+    defer free(collision);
+    const explicit_probe =
+        "\x1b_Ga=t,t=d,f=24,i=2147483647,s=1,v=1;////\x1b\\";
+    vt_write(collision, explicit_probe.ptr, explicit_probe.len);
+    try testing.expectEqual(
+        Result.success,
+        get(collision, .kitty_image_id_cursors, @ptrCast(&state)),
+    );
+    try testing.expectEqual(@as(u32, kitty_default_image_id), state.replay.primary);
+    try testing.expectEqual(@as(u32, kitty_default_image_id), state.next.primary);
+
+    const delete_probe =
+        "\x1b_Ga=d,d=I,i=2147483647,q=2;\x1b\\";
+    vt_write(collision, delete_probe.ptr, delete_probe.len);
+    const automatic_after_delete =
+        "\x1b_Ga=t,t=d,f=24,I=3,s=1,v=1;////\x1b\\";
+    vt_write(collision, automatic_after_delete.ptr, automatic_after_delete.len);
+    try testing.expectEqual(
+        Result.success,
+        get(collision, .kitty_image_id_cursors, @ptrCast(&state)),
+    );
+    try testing.expectEqual(@as(u32, kitty_default_image_id + 1), state.next.primary);
 }
 
 test "scroll_viewport null" {
@@ -1732,6 +1972,329 @@ test "set default cursor style and blink" {
     vt_write(t, "\x1b[0 q", 5);
     try testing.expectEqual(Screen.CursorStyle.underline, t.?.terminal.screens.active.cursor.cursor_style);
     try testing.expect(t.?.terminal.modes.get(.cursor_blinking));
+}
+
+fn expectCursorVisual(
+    t: Terminal,
+    expected_style: TerminalCursorStyle,
+    expected_blinking: bool,
+) !void {
+    var style: TerminalCursorStyle = undefined;
+    var blinking: bool = undefined;
+    try testing.expectEqual(Result.success, get(t, .cursor_visual_style, @ptrCast(&style)));
+    try testing.expectEqual(Result.success, get(t, .cursor_blinking, @ptrCast(&blinking)));
+    try testing.expectEqual(expected_style, style);
+    try testing.expectEqual(expected_blinking, blinking);
+}
+
+test "get cursor visual configured defaults and DECSCUSR reset" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer free(t);
+
+    try expectCursorVisual(t, .block, false);
+
+    const default_style: TerminalCursorStyle = .bar;
+    const default_blink = true;
+    try testing.expectEqual(Result.success, set(t, .default_cursor_style, @ptrCast(&default_style)));
+    try testing.expectEqual(Result.success, set(t, .default_cursor_blink, @ptrCast(&default_blink)));
+    try expectCursorVisual(t, .bar, true);
+
+    const explicit = "\x1b[4 q";
+    vt_write(t, explicit, explicit.len);
+    try expectCursorVisual(t, .underline, false);
+
+    const reset_to_default = "\x1b[0 q";
+    vt_write(t, reset_to_default, reset_to_default.len);
+    try expectCursorVisual(t, .bar, true);
+}
+
+test "get cursor visual covers every DECSCUSR shape and blink pair" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer free(t);
+
+    const cases = [_]struct {
+        sequence: []const u8,
+        style: TerminalCursorStyle,
+        blinking: bool,
+    }{
+        .{ .sequence = "\x1b[1 q", .style = .block, .blinking = true },
+        .{ .sequence = "\x1b[2 q", .style = .block, .blinking = false },
+        .{ .sequence = "\x1b[3 q", .style = .underline, .blinking = true },
+        .{ .sequence = "\x1b[4 q", .style = .underline, .blinking = false },
+        .{ .sequence = "\x1b[5 q", .style = .bar, .blinking = true },
+        .{ .sequence = "\x1b[6 q", .style = .bar, .blinking = false },
+    };
+
+    for (cases) |case| {
+        vt_write(t, case.sequence.ptr, case.sequence.len);
+        try expectCursorVisual(t, case.style, case.blinking);
+    }
+
+    // DEC mode 12 controls blink independently of the DECSCUSR shape.
+    const blink_on = "\x1b[?12h";
+    vt_write(t, blink_on, blink_on.len);
+    try expectCursorVisual(t, .bar, true);
+
+    const blink_off = "\x1b[?12l";
+    vt_write(t, blink_off, blink_off.len);
+    try expectCursorVisual(t, .bar, false);
+}
+
+test "get cursor visual follows active screen shape and terminal blink mode" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer free(t);
+
+    const primary_bar = "\x1b[5 q";
+    vt_write(t, primary_bar, primary_bar.len);
+    try expectCursorVisual(t, .bar, true);
+
+    // Mode 1049 copies the primary cursor into the alternate screen.
+    const enter_alt = "\x1b[?1049h";
+    vt_write(t, enter_alt, enter_alt.len);
+    try expectCursorVisual(t, .bar, true);
+
+    const alt_underline = "\x1b[3 q";
+    vt_write(t, alt_underline, alt_underline.len);
+    try expectCursorVisual(t, .underline, true);
+
+    const blink_off = "\x1b[?12l";
+    vt_write(t, blink_off, blink_off.len);
+    try expectCursorVisual(t, .underline, false);
+
+    // Returning restores the primary screen's shape. Blink remains steady
+    // because DEC mode 12 belongs to the terminal, not an individual screen.
+    const leave_alt = "\x1b[?1049l";
+    vt_write(t, leave_alt, leave_alt.len);
+    try expectCursorVisual(t, .bar, false);
+}
+
+test "get cursor visual RIS restores configured defaults" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer free(t);
+
+    const default_style: TerminalCursorStyle = .bar;
+    const default_blink = true;
+    try testing.expectEqual(Result.success, set(t, .default_cursor_style, @ptrCast(&default_style)));
+    try testing.expectEqual(Result.success, set(t, .default_cursor_blink, @ptrCast(&default_blink)));
+
+    const explicit = "\x1b[4 q";
+    vt_write(t, explicit, explicit.len);
+    try expectCursorVisual(t, .underline, false);
+
+    const ris = "\x1bc";
+    vt_write(t, ris, ris.len);
+    try expectCursorVisual(t, .bar, true);
+}
+
+test "get screen activity tracks active screen switches" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer free(t);
+
+    var initial: u64 = undefined;
+    try testing.expectEqual(Result.success, get(t, .screen_activity, @ptrCast(&initial)));
+
+    const text = "screen activity is not text activity";
+    vt_write(t, text, text.len);
+    var after_text: u64 = undefined;
+    try testing.expectEqual(Result.success, get(t, .screen_activity, @ptrCast(&after_text)));
+    try testing.expectEqual(initial, after_text);
+
+    const enter_alt = "\x1b[?1049h";
+    vt_write(t, enter_alt, enter_alt.len);
+    var after_enter: u64 = undefined;
+    try testing.expectEqual(Result.success, get(t, .screen_activity, @ptrCast(&after_enter)));
+    try testing.expect(after_enter != after_text);
+
+    // A repeated request for the active screen is not an actual switch.
+    vt_write(t, enter_alt, enter_alt.len);
+    var after_noop_enter: u64 = undefined;
+    try testing.expectEqual(Result.success, get(t, .screen_activity, @ptrCast(&after_noop_enter)));
+    try testing.expectEqual(after_enter, after_noop_enter);
+
+    const leave_alt = "\x1b[?1049l";
+    vt_write(t, leave_alt, leave_alt.len);
+    var after_leave: u64 = undefined;
+    try testing.expectEqual(Result.success, get(t, .screen_activity, @ptrCast(&after_leave)));
+    try testing.expect(after_leave != after_noop_enter);
+
+    // Both actual switches must survive batching in a single VT write.
+    const enter_and_leave = "\x1b[?1049h\x1b[?1049l";
+    vt_write(t, enter_and_leave, enter_and_leave.len);
+    var after_batched_switches: u64 = undefined;
+    try testing.expectEqual(Result.success, get(t, .screen_activity, @ptrCast(&after_batched_switches)));
+    try testing.expect(after_batched_switches != after_leave);
+}
+
+fn getCursorActivity(t: Terminal) !u64 {
+    var activity: u64 = undefined;
+    try testing.expectEqual(Result.success, get(t, .cursor_activity, @ptrCast(&activity)));
+    return activity;
+}
+
+test "get cursor activity tracks replay semantics independent of resolved visual" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer free(t);
+
+    var activity = try getCursorActivity(t);
+
+    const text = "cursor activity is not text activity";
+    vt_write(t, text, text.len);
+    try testing.expectEqual(activity, try getCursorActivity(t));
+
+    // Both operations resolve to the configured block/steady visual, but each
+    // changes whether replay should use an explicit or default cursor.
+    const explicit_same_visual = "\x1b[2 q";
+    vt_write(t, explicit_same_visual, explicit_same_visual.len);
+    var next = try getCursorActivity(t);
+    try testing.expect(next != activity);
+    activity = next;
+    try expectCursorVisual(t, .block, false);
+
+    const reset_same_visual = "\x1b[0 q";
+    vt_write(t, reset_same_visual, reset_same_visual.len);
+    next = try getCursorActivity(t);
+    try testing.expect(next != activity);
+    activity = next;
+    try expectCursorVisual(t, .block, false);
+
+    // A repeated reset is still a cursor-semantic dispatch.
+    vt_write(t, reset_same_visual, reset_same_visual.len);
+    next = try getCursorActivity(t);
+    try testing.expect(next != activity);
+    activity = next;
+
+    // DEC mode 12 advances on every set/reset dispatch.
+    const blink_dispatches = [_][]const u8{
+        "\x1b[?12h",
+        "\x1b[?12h",
+        "\x1b[?12l",
+    };
+    for (blink_dispatches) |sequence| {
+        vt_write(t, sequence.ptr, sequence.len);
+        next = try getCursorActivity(t);
+        try testing.expect(next != activity);
+        activity = next;
+    }
+
+    // Restoring saved DEC mode 12 is dispatched through the same semantic
+    // path and must be observable as well.
+    const save_blink = "\x1b[?12s";
+    vt_write(t, save_blink, save_blink.len);
+    activity = try getCursorActivity(t);
+    const enable_blink = "\x1b[?12h";
+    vt_write(t, enable_blink, enable_blink.len);
+    next = try getCursorActivity(t);
+    try testing.expect(next != activity);
+    activity = next;
+    const restore_blink = "\x1b[?12r";
+    vt_write(t, restore_blink, restore_blink.len);
+    next = try getCursorActivity(t);
+    try testing.expect(next != activity);
+    activity = next;
+
+    // All supported alternate-screen mode dispatches affect cursor replay.
+    const screen_dispatches = [_][]const u8{
+        "\x1b[?47h",
+        "\x1b[?47l",
+        "\x1b[?1047h",
+        "\x1b[?1047l",
+        "\x1b[?1049h",
+        "\x1b[?1049h",
+        "\x1b[?1049l",
+    };
+    for (screen_dispatches) |sequence| {
+        vt_write(t, sequence.ptr, sequence.len);
+        next = try getCursorActivity(t);
+        try testing.expect(next != activity);
+        activity = next;
+    }
+
+    // A same-pair alternate-screen round trip in one write must not disappear
+    // merely because the final resolved visual equals the initial visual.
+    const same_pair_roundtrip = "\x1b[?1049h\x1b[?1049l";
+    vt_write(t, same_pair_roundtrip, same_pair_roundtrip.len);
+    next = try getCursorActivity(t);
+    try testing.expect(next != activity);
+    activity = next;
+    try expectCursorVisual(t, .block, false);
+
+    // RIS advances even when it restores the already-resolved default pair.
+    const ris = "\x1bc";
+    vt_write(t, ris, ris.len);
+    next = try getCursorActivity(t);
+    try testing.expect(next != activity);
+    activity = next;
+    try expectCursorVisual(t, .block, false);
+
+    const default_style: TerminalCursorStyle = .block;
+    const default_blink = false;
+    try testing.expectEqual(Result.success, set(t, .default_cursor_style, @ptrCast(&default_style)));
+    next = try getCursorActivity(t);
+    try testing.expect(next != activity);
+    activity = next;
+
+    try testing.expectEqual(Result.success, set(t, .default_cursor_blink, @ptrCast(&default_blink)));
+    next = try getCursorActivity(t);
+    try testing.expect(next != activity);
+    activity = next;
+
+    reset(t);
+    next = try getCursorActivity(t);
+    try testing.expect(next != activity);
+    activity = next;
+
+    // A batch that resets cursor provenance, switches screens, and performs
+    // RIS ends on the same visual pair but must still be observable.
+    const batched_reset_switch = "\x1b[0 q\x1b[?1049h\x1bc";
+    vt_write(t, batched_reset_switch, batched_reset_switch.len);
+    next = try getCursorActivity(t);
+    try testing.expect(next != activity);
+    try expectCursorVisual(t, .block, false);
+}
+
+test "cursor activity wraps" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+    ));
+    defer free(t);
+
+    t.?.stream.handler.cursor_activity = std.math.maxInt(u64);
+    const reset_cursor = "\x1b[0 q";
+    vt_write(t, reset_cursor, reset_cursor.len);
+    try testing.expectEqual(@as(u64, 0), try getCursorActivity(t));
 }
 
 test "set and get selection" {
@@ -3612,4 +4175,69 @@ test "get_multi null keys returns invalid_value" {
     var cols: u16 = 0;
     var values = [_]?*anyopaque{@ptrCast(&cols)};
     try testing.expectEqual(Result.invalid_value, get_multi(null, 1, null, &values, null));
+}
+
+test "set and get kitty graphics count limits" {
+    if (comptime build_options.kitty_graphics) {
+        const image_option = std.meta.stringToEnum(
+            Option,
+            "kitty_image_count_limit",
+        ) orelse return error.TestExpectedEqual;
+        const placement_option = std.meta.stringToEnum(
+            Option,
+            "kitty_placement_count_limit",
+        ) orelse return error.TestExpectedEqual;
+        const image_data = std.meta.stringToEnum(
+            TerminalData,
+            "kitty_image_count_limit",
+        ) orelse return error.TestExpectedEqual;
+        const placement_data = std.meta.stringToEnum(
+            TerminalData,
+            "kitty_placement_count_limit",
+        ) orelse return error.TestExpectedEqual;
+
+        var t: Terminal = null;
+        try testing.expectEqual(Result.success, new(
+            &lib.alloc.test_allocator,
+            &t,
+            .{ .cols = 80, .rows = 24, .max_scrollback = 0 },
+        ));
+        defer free(t);
+
+        var image_limit: u64 = 0;
+        var placement_limit: u64 = 0;
+        try testing.expectEqual(Result.success, get(t, image_data, @ptrCast(&image_limit)));
+        try testing.expectEqual(Result.success, get(t, placement_data, @ptrCast(&placement_limit)));
+        try testing.expectEqual(@as(u64, 4096), image_limit);
+        try testing.expectEqual(@as(u64, 16384), placement_limit);
+
+        const new_image_limit: u64 = 17;
+        const new_placement_limit: u64 = 29;
+        try testing.expectEqual(
+            Result.success,
+            set(t, image_option, @ptrCast(&new_image_limit)),
+        );
+        try testing.expectEqual(
+            Result.success,
+            set(t, placement_option, @ptrCast(&new_placement_limit)),
+        );
+        try testing.expectEqual(Result.success, get(t, image_data, @ptrCast(&image_limit)));
+        try testing.expectEqual(Result.success, get(t, placement_data, @ptrCast(&placement_limit)));
+        try testing.expectEqual(new_image_limit, image_limit);
+        try testing.expectEqual(new_placement_limit, placement_limit);
+
+        const image = "\x1b_Ga=T,t=d,f=24,i=1,p=1,s=1,v=1;////\x1b\\";
+        vt_write(t, image, image.len);
+        const zero: u64 = 0;
+        try testing.expectEqual(
+            Result.invalid_value,
+            set(t, placement_option, @ptrCast(&zero)),
+        );
+        try testing.expectEqual(Result.success, get(
+            t,
+            placement_data,
+            @ptrCast(&placement_limit),
+        ));
+        try testing.expectEqual(new_placement_limit, placement_limit);
+    }
 }

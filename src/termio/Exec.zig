@@ -1061,6 +1061,18 @@ const Subprocess = struct {
                 else => return err,
             }
         };
+
+        if (comptime builtin.os.tag == .windows) {
+            // CreatePseudoConsole duplicates its synchronous pipe handles. Once
+            // CreateProcess succeeds, release our setup copies so channel
+            // closure is observable and only HPCON owns the ConPTY lifetime.
+            // `pty` and `self.pty` are value copies, so invalidate both after
+            // the long-lived copy performs the idempotent close.
+            self.pty.?.releasePseudoConsolePipeHandles();
+            pty.out_pipe_pty = self.pty.?.out_pipe_pty;
+            pty.in_pipe_pty = self.pty.?.in_pipe_pty;
+        }
+
         errdefer killCommand(&cmd) catch |err| {
             log.warn("error killing command during cleanup err={}", .{err});
         };
@@ -1161,7 +1173,13 @@ const Subprocess = struct {
     }
 
     fn killPid(pid: c.pid_t) !void {
-        const pgid = getpgid(pid) orelse return;
+        const pgid = getpgid(pid) orelse {
+            // Darwin no longer exposes a process group for an exited child,
+            // even while its wait status is still pending. The process
+            // watcher normally owns reaping, but teardown can win that race.
+            _ = try reapExitedChild(pid);
+            return;
+        };
 
         // It is possible to send a killpg between the time that
         // our child process calls setsid but before or simultaneous
@@ -1173,6 +1191,12 @@ const Subprocess = struct {
         while (true) {
             switch (posix.errno(c.killpg(pgid, c.SIGHUP))) {
                 .SUCCESS => log.debug("process group killed pgid={}", .{pgid}),
+                .SRCH => {
+                    // The child may have exited between getpgid and killpg.
+                    // Consume its wait status if the process watcher has not.
+                    _ = try reapExitedChild(pid);
+                    return;
+                },
                 else => |err| killpg: {
                     if ((comptime builtin.target.os.tag.isDarwin()) and
                         err == .PERM)
@@ -1190,10 +1214,33 @@ const Subprocess = struct {
             // The gist is that it lets us detect when children
             // are still alive without blocking so that we can
             // kill them again.
-            const res = posix.waitpid(pid, std.c.W.NOHANG);
-            log.debug("waitpid result={}", .{res.pid});
-            if (res.pid != 0) break;
+            if (try reapExitedChild(pid)) break;
             std.Thread.sleep(10 * std.time.ns_per_ms);
+        }
+    }
+
+    /// Reap the child if it has exited without racing the process watcher.
+    /// Returns true when no further wait is needed and false while the child
+    /// is still running.
+    fn reapExitedChild(pid: c.pid_t) !bool {
+        while (true) {
+            var status: c_int = 0;
+            const result = std.c.waitpid(pid, &status, std.c.W.NOHANG);
+            switch (posix.errno(result)) {
+                .SUCCESS => {
+                    log.debug("waitpid result={}", .{result});
+                    return result != 0;
+                },
+                .INTR => continue,
+
+                // The process watcher won the race and already reaped it.
+                .CHILD => return true,
+
+                else => |err| {
+                    log.warn("error waiting for child pid={} err={}", .{ pid, err });
+                    return error.WaitFailed;
+                },
+            }
         }
     }
 
@@ -1220,13 +1267,15 @@ const Subprocess = struct {
             // Don't know why it would be zero but its not a valid pid
             if (pgid == 0) return null;
 
-            // If the pid doesn't exist then... we're done!
-            if (pgid == c.ESRCH) return null;
-
-            // If we have an error we're done.
             if (pgid < 0) {
-                log.warn("error getting pgid for kill", .{});
-                return null;
+                switch (posix.errno(pgid)) {
+                    // The child already exited or another waiter reaped it.
+                    .SRCH => return null,
+                    else => |err| {
+                        log.warn("error getting pgid for kill err={}", .{err});
+                        return null;
+                    },
+                }
             }
 
             return pgid;
@@ -1386,6 +1435,11 @@ pub const ReadThread = struct {
     /// milliseconds is well under one display frame, so batching is
     /// invisible on screen.
     const gather_budget_ns = 3 * std.time.ns_per_ms;
+
+    /// Events that make a polled descriptor permanently ready. Readable data
+    /// may accompany these events, so callers drain POLLIN before exiting.
+    const terminal_poll_events =
+        posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL;
 
     /// The state shared between the gather and parse stages. This is
     /// a fixed ring of buffers plus the metadata to rotate ownership
@@ -1666,7 +1720,9 @@ pub const ReadThread = struct {
 
                         // On a quit signal we deliver what we have
                         // and stop.
-                        if (pollfds[1].revents & posix.POLL.IN != 0) {
+                        if (pollfds[1].revents &
+                            (posix.POLL.IN | terminal_poll_events) != 0)
+                        {
                             log.info("read thread got quit signal", .{});
                             fatal = true;
                             break :gather;
@@ -1689,11 +1745,15 @@ pub const ReadThread = struct {
                             break :gather;
                         }
 
-                        // HUP without IN means no more data is
-                        // coming. Deliver and let the outer poll
-                        // decide what to do.
-                        if (pollfds[0].revents & posix.POLL.IN == 0)
+                        // Terminal readiness without data means no more data
+                        // is coming. If POLLIN is also set, drain the final
+                        // bytes first; EOF or a read error will end the loop.
+                        if (pollfds[0].revents & terminal_poll_events != 0 and
+                            pollfds[0].revents & posix.POLL.IN == 0)
+                        {
+                            fatal = true;
                             break :gather;
+                        }
 
                         continue :gather;
                     },
@@ -1714,10 +1774,13 @@ pub const ReadThread = struct {
                     },
                 };
 
-                // This happens on macOS instead of WouldBlock when the
-                // child process dies. Deliver what we have and let the
-                // outer poll detect HUP.
-                if (n == 0) break :gather;
+                // EOF is authoritative even when poll omits HUP. Some fd
+                // types remain readable forever after returning zero, so
+                // polling again would turn EOF into a permanent busy loop.
+                if (n == 0) {
+                    fatal = true;
+                    break :gather;
+                }
 
                 total += n;
 
@@ -1750,15 +1813,19 @@ pub const ReadThread = struct {
             };
 
             // If our quit fd is set, we're done.
-            if (pollfds[1].revents & posix.POLL.IN != 0) {
+            if (pollfds[1].revents &
+                (posix.POLL.IN | terminal_poll_events) != 0)
+            {
                 log.info("read thread got quit signal", .{});
                 return;
             }
 
-            // If our pty fd is closed, then we're also done with our
-            // read thread.
-            if (pollfds[0].revents & posix.POLL.HUP != 0) {
-                log.info("pty fd closed, read thread exiting", .{});
+            // Drain any readable tail bytes before honoring a terminal
+            // condition. The next read will end on EOF or an fd error.
+            if (pollfds[0].revents & terminal_poll_events != 0 and
+                pollfds[0].revents & posix.POLL.IN == 0)
+            {
+                log.info("pty fd terminal event, read thread exiting", .{});
                 return;
             }
         }
@@ -1819,45 +1886,207 @@ pub const ReadThread = struct {
         };
         defer crash.sentry.thread_state = null;
 
+        const read_event = windows.kernel32.CreateEventExW(
+            null,
+            null,
+            windows.CREATE_EVENT_MANUAL_RESET,
+            windows.EVENT_ALL_ACCESS,
+        ) orelse {
+            log.err("error creating read event err={}", .{windows.kernel32.GetLastError()});
+            return;
+        };
+        defer _ = windows.CloseHandle(read_event);
+
         var buf: [1024]u8 = undefined;
         while (true) {
-            while (true) {
-                var n: windows.DWORD = 0;
-                if (windows.kernel32.ReadFile(fd, &buf, buf.len, &n, null) == 0) {
-                    const err = windows.kernel32.GetLastError();
-                    switch (err) {
-                        // Check for a quit signal
-                        .OPERATION_ABORTED => break,
+            // Checking both before and immediately after submission closes the
+            // race where teardown cancels before ReadFile becomes pending.
+            if (windowsQuitRequested(quit)) return;
 
-                        else => {
-                            log.err("io reader error err={}", .{err});
-                            unreachable;
-                        },
-                    }
-                }
-
-                @call(.always_inline, termio.Termio.processOutput, .{ io, buf[0..n] });
-
-                // See threadMainPosix: hand the renderer state mutex
-                // off if the renderer is waiting, since this loop
-                // would otherwise starve it under heavy output.
-                io.renderer_state.yieldToDemand();
-            }
-
-            var quit_bytes: windows.DWORD = 0;
-            if (windows.exp.kernel32.PeekNamedPipe(quit, null, 0, null, &quit_bytes, null) == 0) {
-                const err = windows.kernel32.GetLastError();
-                log.err("quit pipe reader error err={}", .{err});
-                unreachable;
-            }
-
-            if (quit_bytes > 0) {
-                log.info("read thread got quit signal", .{});
+            if (windows.exp.kernel32.ResetEvent(read_event) == 0) {
+                log.err("error resetting read event err={}", .{windows.kernel32.GetLastError()});
                 return;
             }
+
+            var overlapped = std.mem.zeroes(windows.OVERLAPPED);
+            overlapped.hEvent = read_event;
+
+            if (windows.kernel32.ReadFile(fd, &buf, buf.len, null, &overlapped) == 0) {
+                const err = windows.kernel32.GetLastError();
+                switch (err) {
+                    .IO_PENDING => {},
+                    .HANDLE_EOF, .BROKEN_PIPE, .NO_DATA => return,
+                    .OPERATION_ABORTED => {
+                        if (!windowsQuitRequested(quit)) {
+                            log.err("io reader operation aborted without quit signal", .{});
+                        }
+                        return;
+                    },
+                    else => {
+                        log.err("io reader submission error err={}", .{err});
+                        return;
+                    },
+                }
+            }
+
+            const quitting = windowsQuitRequested(quit);
+            if (quitting) {
+                // Cancel this exact request. The main IO thread also cancels
+                // all requests, but it may have done so before this ReadFile
+                // was submitted.
+                if (windows.kernel32.CancelIoEx(fd, &overlapped) == 0) {
+                    switch (windows.kernel32.GetLastError()) {
+                        .NOT_FOUND => {},
+                        else => |err| log.warn("error cancelling submitted read err={}", .{err}),
+                    }
+                }
+            }
+
+            const n = windowsCompleteRead(fd, quit, &overlapped, quitting) orelse return;
+            if (quitting) return;
+
+            @call(.always_inline, termio.Termio.processOutput, .{ io, buf[0..n] });
+
+            // See threadMainPosix: hand the renderer state mutex
+            // off if the renderer is waiting, since this loop
+            // would otherwise starve it under heavy output.
+            io.renderer_state.yieldToDemand();
         }
     }
+
+    /// Returns true when teardown requested the Windows reader to stop. A
+    /// broken quit pipe also stops the reader so teardown cannot deadlock.
+    fn windowsQuitRequested(quit: posix.fd_t) bool {
+        var quit_bytes: windows.DWORD = 0;
+        if (windows.exp.kernel32.PeekNamedPipe(quit, null, 0, null, &quit_bytes, null) == 0) {
+            log.err("quit pipe reader error err={}", .{windows.kernel32.GetLastError()});
+            return true;
+        }
+
+        if (quit_bytes == 0) return false;
+        log.info("read thread got quit signal", .{});
+        return true;
+    }
+
+    /// Waits until an overlapped read is fully complete before its buffer,
+    /// OVERLAPPED state, or event can be reused. Returns null for clean EOF,
+    /// cancellation during teardown, or an error that was already logged.
+    fn windowsCompleteRead(
+        fd: posix.fd_t,
+        quit: posix.fd_t,
+        overlapped: *windows.OVERLAPPED,
+        quitting: bool,
+    ) ?usize {
+        var n: windows.DWORD = 0;
+        if (windows.kernel32.GetOverlappedResult(
+            fd,
+            overlapped,
+            &n,
+            windows.TRUE,
+        ) == 0) {
+            const err = windows.kernel32.GetLastError();
+            switch (err) {
+                .OPERATION_ABORTED => {
+                    if (!quitting and !windowsQuitRequested(quit)) {
+                        log.err("io reader completion aborted without quit signal", .{});
+                    }
+                },
+                .HANDLE_EOF, .BROKEN_PIPE, .NO_DATA => {},
+                else => log.err("io reader completion error err={}", .{err}),
+            }
+            return null;
+        }
+
+        if (n == 0) return null;
+        return @intCast(n);
+    }
 };
+
+test "io-gather exits on persistent EOF readiness" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const source = try posix.open(
+        "/dev/null",
+        .{
+            .ACCMODE = .RDONLY,
+            .CLOEXEC = true,
+            .NONBLOCK = true,
+        },
+        0,
+    );
+    defer posix.close(source);
+
+    const quit_pipe = try posix.pipe2(.{
+        .CLOEXEC = true,
+        .NONBLOCK = true,
+    });
+    defer posix.close(quit_pipe[0]);
+    defer posix.close(quit_pipe[1]);
+
+    var pipeline: ReadThread.Pipeline = .{};
+    var returned: std.Thread.ResetEvent = .{};
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(
+            fd: posix.fd_t,
+            quit: posix.fd_t,
+            pipeline_ptr: *ReadThread.Pipeline,
+            returned_ptr: *std.Thread.ResetEvent,
+        ) void {
+            ReadThread.gatherMainPosix(fd, quit, pipeline_ptr);
+            returned_ptr.set();
+        }
+    }.run, .{ source, quit_pipe[0], &pipeline, &returned });
+    defer {
+        _ = posix.write(quit_pipe[1], "q") catch {};
+        thread.join();
+    }
+
+    try returned.timedWait(std.time.ns_per_s);
+    try testing.expect(pipeline.done);
+}
+
+test "subprocess stop reaps an already-exited child on Darwin" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const c = Subprocess.c;
+    const pid = try posix.fork();
+    if (pid == 0) {
+        _ = c.setsid();
+        c._exit(0);
+    }
+
+    var reaped = false;
+    defer if (!reaped) {
+        var status: c_int = 0;
+        _ = std.c.waitpid(pid, &status, 0);
+    };
+
+    // An exited-but-unreaped child is no longer visible to getpgid on
+    // Darwin. Wait for that state without consuming its wait status.
+    var exited = false;
+    for (0..100) |_| {
+        const pgid = c.getpgid(pid);
+        if (pgid < 0 and posix.errno(pgid) == .SRCH) {
+            exited = true;
+            break;
+        }
+        std.Thread.sleep(10 * std.time.ns_per_ms);
+    }
+    try testing.expect(exited);
+
+    try Subprocess.killPid(pid);
+
+    var status: c_int = 0;
+    const wait_result = std.c.waitpid(pid, &status, std.c.W.NOHANG);
+    const wait_err = posix.errno(wait_result);
+    reaped = wait_result == pid or
+        (wait_result < 0 and wait_err == .CHILD);
+
+    try testing.expectEqual(@as(c.pid_t, -1), wait_result);
+    try testing.expectEqual(posix.E.CHILD, wait_err);
+}
 
 /// Builds the argv array for the process we should exec for the
 /// configured command. This isn't as straightforward as it seems since
