@@ -6,6 +6,8 @@
 //!
 //! Ref: https://developer.apple.com/metal/cpp/
 
+const objc = @import("objc");
+
 /// https://developer.apple.com/documentation/metal/mtlcommandbufferstatus?language=objc
 pub const MTLCommandBufferStatus = enum(c_ulong) {
     not_enqueued = 0,
@@ -296,6 +298,17 @@ pub const MTLPurgeableState = enum(c_ulong) {
     @"volatile" = 3,
     empty = 4,
 };
+
+/// Tell Metal that a resource's contents are no longer needed before releasing
+/// its final owner. This keeps hidden-surface teardown from leaving discardable
+/// allocations charged to the process until later system memory pressure.
+pub fn discardResource(resource: objc.Object) void {
+    _ = resource.msgSend(
+        MTLPurgeableState,
+        objc.sel("setPurgeableState:"),
+        .{MTLPurgeableState.empty},
+    );
+}
 
 /// https://developer.apple.com/documentation/metal/mtlsamplerminmagfilter?language=objc
 pub const MTLSamplerMinMagFilter = enum(c_ulong) {

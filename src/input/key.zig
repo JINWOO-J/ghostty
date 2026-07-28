@@ -75,6 +75,16 @@ pub const KeyEvent = struct {
 
         return hasher.final();
     }
+
+    /// Returns a stable identity for pairing a consumed binding press with its
+    /// release. Modifiers are intentionally omitted because their key-up
+    /// events may arrive before the bound key's release.
+    pub fn bindingReleaseHash(self: KeyEvent) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        std.hash.autoHash(&hasher, self.key);
+        std.hash.autoHash(&hasher, self.unshifted_codepoint);
+        return hasher.final();
+    }
 };
 
 /// The action associated with an input event. This is backed by a c_int

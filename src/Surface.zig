@@ -101,6 +101,9 @@ mouse: Mouse,
 /// Keyboard input state.
 keyboard: Keyboard,
 
+/// Ghostty-owned cursor for cmux keyboard copy mode.
+keyboard_copy_cursor: ?KeyboardCopyCursor = null,
+
 /// A currently pressed key. This is used so that we can send a keyboard
 /// release event when the surface is unfocused. Note that when the surface
 /// is refocused, a key press event may not be sent again -- this depends
@@ -216,6 +219,18 @@ const Search = struct {
     }
 };
 
+const KeyboardCopyCursor = struct {
+    screen_key: terminal.ScreenSet.Key,
+    screen_generation: usize,
+    pin: *terminal.Pin,
+    selection: ?KeyboardCopySelectionState = null,
+};
+
+const KeyboardCopySelectionState = struct {
+    linewise: bool,
+    activity: u64,
+};
+
 /// Mouse state for the surface.
 const Mouse = struct {
     /// The last tracked mouse button state by button.
@@ -303,7 +318,82 @@ pub const Keyboard = struct {
     /// a combination to be handled by different bindings before the release
     /// of the prior (namely since you can't bind modifier-only).
     last_trigger: ?u64 = null,
+
+    fn prepareBindingEvent(self: *Keyboard, event: input.KeyEvent) void {
+        const last = self.last_trigger orelse return;
+        if (last == event.bindingReleaseHash()) self.last_trigger = null;
+    }
+
+    fn consumesBindingRelease(self: *const Keyboard, event: input.KeyEvent) bool {
+        const last = self.last_trigger orelse return false;
+        return last == event.bindingReleaseHash();
+    }
+
+    fn consumeMenuAction(
+        self: *Keyboard,
+        value: input.Binding.Set.Value,
+        event: input.KeyEvent,
+        action: input.Binding.Action,
+    ) bool {
+        if (self.sequence_set != null or self.table_stack.items.len > 0) {
+            return false;
+        }
+        if (!value.isMenuEquivalentAction(action)) return false;
+
+        self.last_trigger = event.bindingReleaseHash();
+        return true;
+    }
 };
+
+test "keyboard menu action owns the paired release outside sequences and tables" {
+    const testing = std.testing;
+    const copy: input.Binding.Action = .{ .copy_to_clipboard = .mixed };
+    const value: input.Binding.Set.Value = .{ .leaf = .{
+        .action = copy,
+        .flags = .{ .performable = true },
+    } };
+    const press: input.KeyEvent = .{
+        .action = .press,
+        .key = .key_c,
+        .mods = .{ .super = true },
+        .unshifted_codepoint = 'c',
+    };
+
+    var keyboard: Keyboard = .{};
+    var sequence_set: input.Binding.Set = .{};
+    keyboard.sequence_set = &sequence_set;
+    try testing.expect(!keyboard.consumeMenuAction(value, press, copy));
+
+    keyboard.sequence_set = null;
+    try keyboard.table_stack.append(testing.allocator, .{
+        .set = &sequence_set,
+        .once = true,
+    });
+    defer keyboard.table_stack.deinit(testing.allocator);
+    try testing.expect(!keyboard.consumeMenuAction(value, press, copy));
+
+    keyboard.table_stack.clearRetainingCapacity();
+    try testing.expect(keyboard.consumeMenuAction(value, press, copy));
+
+    var release = press;
+    release.action = .release;
+    // Modifier key-up can arrive first, so the paired C release no longer
+    // necessarily carries Super even though the consumed press did.
+    release.mods = .{};
+    try testing.expect(keyboard.consumesBindingRelease(release));
+    try testing.expect(keyboard.consumesBindingRelease(release));
+
+    var next_press = release;
+    next_press.action = .press;
+    keyboard.prepareBindingEvent(next_press);
+    try testing.expect(!keyboard.consumesBindingRelease(release));
+
+    try testing.expect(keyboard.consumeMenuAction(value, press, copy));
+    var repeat = release;
+    repeat.action = .repeat;
+    keyboard.prepareBindingEvent(repeat);
+    try testing.expect(!keyboard.consumesBindingRelease(release));
+}
 
 /// The configuration that a surface has, this is copied from the main
 /// Config struct usually to prevent sharing a single value.
@@ -672,8 +762,8 @@ pub fn init(
         // application owns the PTY/session and Ghostty only renders bytes and
         // encodes input. Delete this branch when upstream exposes an
         // embedder-owned IO backend.
-        const use_manual_io = if (comptime @hasDecl(apprt.runtime.Surface, "ioMode"))
-            rt_surface.ioMode() == .manual
+        const use_manual_io = if (comptime @hasDecl(apprt.runtime.Surface, "usesManualIo"))
+            rt_surface.usesManualIo()
         else
             false;
         var io_backend: termio.Backend = if (use_manual_io) manual: {
@@ -735,11 +825,23 @@ pub fn init(
             .full_config = config,
             .config = try termio.Termio.DerivedConfig.init(alloc, config),
             .backend = io_backend,
+            .suppress_terminal_responses = if (comptime @hasDecl(apprt.runtime.Surface, "suppressTerminalResponses"))
+                rt_surface.suppressTerminalResponses()
+            else
+                false,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
             .renderer_wakeup = render_thread.wakeup,
             .renderer_mailbox = render_thread.mailbox,
             .surface_mailbox = .{ .surface = self, .app = app_mailbox },
+            .pty_tee_cb = if (comptime @hasDecl(apprt.runtime.Surface, "ptyTeeCallback"))
+                rt_surface.ptyTeeCallback()
+            else
+                null,
+            .pty_tee_userdata = if (comptime @hasDecl(apprt.runtime.Surface, "ptyTeeUserdata"))
+                rt_surface.ptyTeeUserdata()
+            else
+                null,
         });
     }
     // Outside the block, IO has now taken ownership of our temporary state
@@ -784,6 +886,12 @@ pub fn init(
     );
     self.renderer_thr.setName(global.io(), "renderer") catch {};
 
+    // libghostty allows the embedder to free a surface as soon as creation
+    // returns. Wait until the renderer's stop watcher is armed so that teardown
+    // cannot race thread startup and lose the stop notification.
+    if (comptime apprt.runtime == apprt.embedded)
+        self.renderer_thread.started.waitUncancelable(global.io());
+
     // Start our IO thread
     self.io_thr = try std.Thread.spawn(
         .{},
@@ -791,6 +899,9 @@ pub fn init(
         .{ &self.io_thread, &self.io },
     );
     self.io_thr.setName(global.io(), "io") catch {};
+
+    if (comptime apprt.runtime == apprt.embedded)
+        self.io_thread.started.waitUncancelable(global.io());
 
     // Determine our initial window size if configured. We need to do this
     // quite late in the process because our height/width are in grid dimensions,
@@ -880,6 +991,7 @@ pub fn deinit(self: *Surface) void {
     self.renderer.deinit();
     self.io_thread.deinit();
     self.mouse.selection_gesture.deinit(&self.io.terminal);
+    _ = self.clearKeyboardCopyCursor();
     self.io.deinit();
 
     if (self.inspector) |v| {
@@ -908,6 +1020,20 @@ pub fn deinit(self: *Surface) void {
 /// the app's locked surface registry.
 pub fn appMailboxDrained(self: *Surface) void {
     self.renderer_thread.appMailboxDrained();
+}
+
+/// Acknowledge whether the embedder accepted an externally requested render.
+/// The renderer owns retry/coalescing state; the app thread only reports the
+/// result while this surface remains registered.
+pub fn externalRenderActionCompleted(
+    self: *Surface,
+    generation: u64,
+    accepted: bool,
+) void {
+    self.renderer_thread.externalRenderActionCompleted(
+        generation,
+        accepted,
+    );
 }
 
 /// Close this surface. This will trigger the runtime to start the
@@ -2365,14 +2491,911 @@ pub fn selectCursorLine(self: *Surface) !bool {
 
 /// Clear the active selection (cmux-specific).
 pub fn clearSelection(self: *Surface) !bool {
-    self.renderer_state.mutex.lockUncancelable(global.io());
-    defer self.renderer_state.mutex.unlock(global.io());
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
 
     const screen: *terminal.Screen = self.io.terminal.screens.active;
+    if (self.keyboard_copy_cursor) |*cursor| {
+        const screens = &self.io.terminal.screens;
+        if (cursor.screen_key == screens.active_key and
+            cursor.screen_generation == screens.generation(screens.active_key))
+            cursor.selection = null;
+    }
     if (screen.selection == null) return false;
     try self.setSelection(null);
     screen.dirty.selection = true;
     try self.queueRender();
+    return true;
+}
+
+fn viewportPin(
+    screen: *terminal.Screen,
+    column: u16,
+    row: u16,
+) ?terminal.Pin {
+    if (column >= screen.pages.cols or row >= screen.pages.rows) return null;
+    return screen.pages.pin(.{
+        .viewport = .{ .x = column, .y = row },
+    });
+}
+
+/// Resolve a visible viewport cell to the leading cell of its displayed glyph.
+fn canonicalSelectionCellViewport(
+    screen: *terminal.Screen,
+    column: u16,
+    row: u16,
+) ?terminal.Selection.CanonicalCell {
+    const pin = viewportPin(screen, column, row) orelse return null;
+    const cell = terminal.Selection.canonicalCell(pin) orelse return null;
+    const point = screen.pages.pointFromPin(.viewport, cell.pin) orelse
+        return null;
+    if (point.viewport.x >= screen.pages.cols or
+        point.viewport.y >= screen.pages.rows) return null;
+    return cell;
+}
+
+pub const KeyboardSelectionMove = enum(c_int) {
+    left,
+    right,
+    up,
+    down,
+    page_up,
+    page_down,
+    home,
+    end,
+    beginning_of_line,
+    end_of_line,
+};
+
+pub const KeyboardCopyScroll = enum(c_int) {
+    lines,
+    pages,
+    half_pages,
+    top,
+    bottom,
+    prompts,
+};
+
+pub const KeyboardCopySelectionKind = enum(c_int) {
+    none,
+    character,
+    line,
+};
+
+pub const KeyboardCopyCursorSnapshot = extern struct {
+    column: u16,
+    row: u16,
+    width_cells: u16,
+    color_red: u8,
+    color_green: u8,
+    color_blue: u8,
+};
+
+const KeyboardSelectionCell = struct {
+    pin: terminal.Pin,
+    width_cells: u16,
+};
+
+fn canonicalKeyboardSelectionResult(
+    pin: terminal.Pin,
+) ?terminal.Selection.CanonicalCell {
+    if (pin.rowAndCell().cell.wide != .spacer_head)
+        return terminal.Selection.canonicalCell(pin);
+
+    // A spacer head represents unused space before a wide glyph wraps to the
+    // next physical row. Vertical and row-edge movement must remain on the
+    // requested row, so resolve to the preceding displayed glyph.
+    if (pin.x == 0) return null;
+    const cell = terminal.Selection.canonicalCell(pin.left(1)) orelse
+        return null;
+    if (cell.pin.node != pin.node or cell.pin.y != pin.y) return null;
+    return cell;
+}
+
+fn keyboardSelectionHorizontalStep(
+    cell: terminal.Selection.CanonicalCell,
+    movement: KeyboardSelectionMove,
+) ?terminal.Selection.CanonicalCell {
+    return switch (movement) {
+        .left => left: {
+            if (cell.pin.x > 0)
+                break :left terminal.Selection.canonicalCell(cell.pin.left(1));
+
+            // A wide glyph at column zero can be preceded by a spacer head on
+            // the previous physical row. Cross only that wrapped-glyph
+            // boundary; ordinary row starts still clamp.
+            var previous_row = cell.pin.up(1) orelse return null;
+            previous_row.x = previous_row.node.cols() - 1;
+            if (previous_row.rowAndCell().cell.wide != .spacer_head)
+                return null;
+            const wrapped = terminal.Selection.canonicalCell(previous_row) orelse
+                return null;
+            if (!wrapped.pin.eql(cell.pin)) return null;
+            break :left canonicalKeyboardSelectionResult(previous_row);
+        },
+        .right => right: {
+            const next_x = @as(usize, cell.pin.x) + cell.width_cells;
+            if (next_x >= cell.pin.node.cols()) return null;
+            break :right terminal.Selection.canonicalCell(
+                cell.pin.right(cell.width_cells),
+            );
+        },
+        else => unreachable,
+    };
+}
+
+fn keyboardSelectionPin(
+    screen: *terminal.Screen,
+    start_pin: terminal.Pin,
+    movement: KeyboardSelectionMove,
+    count: u16,
+) ?KeyboardSelectionCell {
+    if (screen.pages.cols == 0 or screen.pages.rows == 0 or count == 0)
+        return null;
+
+    var result = start_pin;
+    const steps: usize = count;
+
+    switch (movement) {
+        .left, .right => {
+            var remaining = steps;
+            var cell = terminal.Selection.canonicalCell(result) orelse
+                return null;
+            if (result.rowAndCell().cell.wide == .spacer_head) {
+                remaining -= 1;
+                cell = if (movement == .left)
+                    canonicalKeyboardSelectionResult(result) orelse return null
+                else
+                    terminal.Selection.canonicalCell(result) orelse return null;
+            }
+
+            for (0..remaining) |_| {
+                const next = keyboardSelectionHorizontalStep(
+                    cell,
+                    movement,
+                ) orelse break;
+                if (next.pin.eql(cell.pin)) break;
+                cell = next;
+            }
+            result = cell.pin;
+        },
+        .up, .down, .page_up, .page_down => {
+            const row_multiplier: usize = switch (movement) {
+                .page_up, .page_down => screen.pages.rows,
+                else => 1,
+            };
+            const distance = std.math.mul(usize, steps, row_multiplier) catch
+                std.math.maxInt(usize);
+            result = switch (movement) {
+                .up, .page_up => switch (result.upOverflow(distance)) {
+                    .offset => |pin| pin,
+                    .overflow => |overflow| overflow.end,
+                },
+                .down, .page_down => switch (result.downOverflow(distance)) {
+                    .offset => |pin| pin,
+                    .overflow => |overflow| overflow.end,
+                },
+                else => unreachable,
+            };
+        },
+        .home => result = screen.pages.getTopLeft(.screen),
+        .end => result = screen.pages.getBottomRight(.screen) orelse return null,
+        .beginning_of_line => result.x = 0,
+        .end_of_line => result.x = result.node.cols() - 1,
+    }
+
+    result.x = @min(result.x, result.node.cols() - 1);
+    const cell = canonicalKeyboardSelectionResult(result) orelse return null;
+    return .{ .pin = cell.pin, .width_cells = cell.width_cells };
+}
+
+fn scrollPinIntoViewport(
+    screen: *terminal.Screen,
+    pin: terminal.Pin,
+) void {
+    const viewport_tl = screen.pages.getTopLeft(.viewport);
+    const viewport_br = screen.pages.getBottomRight(.viewport) orelse return;
+    if (pin.isBetween(viewport_tl, viewport_br)) return;
+
+    const target = if (pin.before(viewport_tl))
+        pin
+    else
+        pin.up(screen.pages.rows - 1) orelse pin;
+    screen.scroll(.{ .pin = target });
+}
+
+const KeyboardCopyCursorResolution = struct {
+    cell: KeyboardSelectionCell,
+    changed: bool,
+};
+
+fn keyboardSelectionCellOnViewportRow(
+    screen: *terminal.Screen,
+    row: usize,
+    preferred_column: usize,
+) ?terminal.Selection.CanonicalCell {
+    if (row >= screen.pages.rows or screen.pages.cols == 0) return null;
+    const preferred = @min(preferred_column, screen.pages.cols - 1);
+
+    var x = preferred + 1;
+    while (x > 0) {
+        x -= 1;
+        const pin = viewportPin(screen, @intCast(x), @intCast(row)) orelse
+            continue;
+        const cell = canonicalKeyboardSelectionResult(pin) orelse continue;
+        const point = screen.pages.pointFromPin(.viewport, cell.pin) orelse
+            continue;
+        if (point.viewport.y == row and
+            point.viewport.x < screen.pages.cols) return cell;
+    }
+
+    x = preferred + 1;
+    while (x < screen.pages.cols) : (x += 1) {
+        const pin = viewportPin(screen, @intCast(x), @intCast(row)) orelse
+            continue;
+        const cell = canonicalKeyboardSelectionResult(pin) orelse continue;
+        const point = screen.pages.pointFromPin(.viewport, cell.pin) orelse
+            continue;
+        if (point.viewport.y == row and
+            point.viewport.x < screen.pages.cols) return cell;
+    }
+    return null;
+}
+
+fn keyboardCopyCursorInitialCell(
+    screen: *terminal.Screen,
+) ?terminal.Selection.CanonicalCell {
+    if (terminal.Selection.canonicalCell(screen.cursor.page_pin.*)) |cell| {
+        if (screen.pages.pointFromPin(.viewport, cell.pin)) |point| {
+            if (point.viewport.x < screen.pages.cols and
+                point.viewport.y < screen.pages.rows) return cell;
+        }
+    }
+
+    var row = screen.pages.rows;
+    while (row > 0) {
+        row -= 1;
+        if (keyboardSelectionCellOnViewportRow(screen, row, 0)) |cell|
+            return cell;
+    }
+    return null;
+}
+
+fn untrackKeyboardCopyCursor(
+    screens: *terminal.ScreenSet,
+    cursor: KeyboardCopyCursor,
+) bool {
+    if (screens.generation(cursor.screen_key) != cursor.screen_generation)
+        return false;
+    var cleared_selection = false;
+    if (screens.get(cursor.screen_key)) |screen| {
+        if (cursor.selection) |state| {
+            if (screen.selection) |selection| {
+                if (screen.selection_activity == state.activity and
+                    selection.linewise == state.linewise and
+                    !selection.rectangle)
+                {
+                    screen.clearSelection();
+                    cleared_selection = true;
+                }
+            }
+        }
+        screen.pages.untrackPin(cursor.pin);
+    }
+    return cleared_selection;
+}
+
+fn clearKeyboardCopyCursor(self: *Surface) bool {
+    var cleared_selection = false;
+    if (self.keyboard_copy_cursor) |cursor|
+        cleared_selection = untrackKeyboardCopyCursor(
+            &self.io.terminal.screens,
+            cursor,
+        );
+    self.keyboard_copy_cursor = null;
+    return cleared_selection;
+}
+
+fn initializeKeyboardCopyCursor(
+    self: *Surface,
+    screen: *terminal.Screen,
+) !?*KeyboardCopyCursor {
+    const cell = keyboardCopyCursorInitialCell(screen) orelse return null;
+    const tracked = try screen.pages.trackPin(cell.pin);
+    self.keyboard_copy_cursor = .{
+        .screen_key = self.io.terminal.screens.active_key,
+        .screen_generation = self.io.terminal.screens.generation(
+            self.io.terminal.screens.active_key,
+        ),
+        .pin = tracked,
+    };
+    return if (self.keyboard_copy_cursor) |*cursor| cursor else null;
+}
+
+fn ensureKeyboardCopyCursor(
+    self: *Surface,
+    screen: *terminal.Screen,
+) !?*KeyboardCopyCursor {
+    const cursor = if (self.keyboard_copy_cursor) |*value| value else return null;
+    const screens = &self.io.terminal.screens;
+    if (cursor.screen_key == screens.active_key and
+        cursor.screen_generation == screens.generation(screens.active_key))
+        return cursor;
+
+    const cleared_selection = self.clearKeyboardCopyCursor();
+    const next = try self.initializeKeyboardCopyCursor(screen);
+    if (cleared_selection) try self.queueRender();
+    return next;
+}
+
+fn resolveTrackedKeyboardCopyCursor(
+    screen: *terminal.Screen,
+    tracked_pin: *terminal.Pin,
+) ?KeyboardCopyCursorResolution {
+    const original = tracked_pin.*;
+    var cell: terminal.Selection.CanonicalCell = cell: {
+        if (!original.garbage) {
+            if (terminal.Selection.canonicalCell(original)) |candidate| {
+                if (screen.pages.pointFromPin(.viewport, candidate.pin)) |point| {
+                    if (point.viewport.x < screen.pages.cols and
+                        point.viewport.y < screen.pages.rows)
+                        break :cell candidate;
+                }
+            }
+
+            if (screen.pages.pointFromPin(.viewport, original)) |point| {
+                if (point.viewport.x < screen.pages.cols and
+                    point.viewport.y < screen.pages.rows)
+                    break :cell keyboardSelectionCellOnViewportRow(
+                        screen,
+                        point.viewport.y,
+                        point.viewport.x,
+                    ) orelse return null;
+            }
+        }
+
+        const viewport_tl = screen.pages.getTopLeft(.viewport);
+        const above = original.garbage or original.before(viewport_tl);
+        const preferred_column = @min(original.x, screen.pages.cols - 1);
+        var row = if (above) @as(usize, 0) else screen.pages.rows - 1;
+        while (true) {
+            if (keyboardSelectionCellOnViewportRow(
+                screen,
+                row,
+                preferred_column,
+            )) |candidate| break :cell candidate;
+            if (above) {
+                if (row + 1 >= screen.pages.rows) return null;
+                row += 1;
+            } else {
+                if (row == 0) return null;
+                row -= 1;
+            }
+        }
+    };
+
+    const changed = original.garbage or !cell.pin.eql(original);
+    if (changed) tracked_pin.* = cell.pin;
+
+    // Re-read after assigning the tracked pin so callers always receive the
+    // cursor's authoritative value.
+    cell = terminal.Selection.canonicalCell(tracked_pin.*) orelse return null;
+    return .{
+        .cell = .{ .pin = cell.pin, .width_cells = cell.width_cells },
+        .changed = changed,
+    };
+}
+
+fn validateKeyboardCopySelection(
+    cursor: *KeyboardCopyCursor,
+    screen: *terminal.Screen,
+) ?bool {
+    const state = cursor.selection orelse return null;
+    const selection = screen.selection orelse {
+        cursor.selection = null;
+        return null;
+    };
+    if (screen.selection_activity != state.activity or
+        selection.linewise != state.linewise or
+        selection.rectangle)
+    {
+        cursor.selection = null;
+        return null;
+    }
+    return state.linewise;
+}
+
+fn resolveKeyboardCopyCursor(
+    self: *Surface,
+    screen: *terminal.Screen,
+) !?KeyboardCopyCursorResolution {
+    const cursor = try self.ensureKeyboardCopyCursor(screen) orelse return null;
+    const resolution = resolveTrackedKeyboardCopyCursor(
+        screen,
+        cursor.pin,
+    ) orelse return null;
+    if (validateKeyboardCopySelection(cursor, screen)) |linewise| {
+        if (resolution.changed) {
+            _ = screen.setSelectionEndpoint(resolution.cell.pin, linewise);
+            cursor.selection.?.activity = screen.selection_activity;
+        }
+    }
+
+    return resolution;
+}
+
+fn writeKeyboardCopyCursorViewport(
+    screen: *terminal.Screen,
+    resolution: KeyboardCopyCursorResolution,
+    resolved_column: *u16,
+    resolved_row: *u16,
+    width_cells: *u16,
+) bool {
+    const point = screen.pages.pointFromPin(
+        .viewport,
+        resolution.cell.pin,
+    ) orelse return false;
+    if (point.viewport.x >= screen.pages.cols or
+        point.viewport.y >= screen.pages.rows) return false;
+
+    resolved_column.* = @intCast(point.viewport.x);
+    resolved_row.* = @intCast(point.viewport.y);
+    width_cells.* = resolution.cell.width_cells;
+    return true;
+}
+
+fn effectiveKeyboardCopyCursorColor(
+    runtime_override: ?terminal.color.RGB,
+    configured: ?configpkg.Config.TerminalColor,
+    foreground: terminal.color.RGB,
+    background: terminal.color.RGB,
+    palette: *const terminal.color.Palette,
+    bold_color: ?terminal.Style.BoldColor,
+    pin: terminal.Pin,
+) terminal.color.RGB {
+    if (runtime_override) |color| return color;
+    const configured_color = configured orelse return foreground;
+    return switch (configured_color) {
+        .color => |color| color.toTerminalRGB(),
+        inline .@"cell-foreground",
+        .@"cell-background",
+        => |_, tag| {
+            const cell = pin.rowAndCell().cell;
+            const style = pin.style(cell);
+            const cell_foreground = style.fg(.{
+                .default = foreground,
+                .palette = palette,
+                .bold = bold_color,
+            });
+            const cell_background = style.bg(
+                cell,
+                palette,
+            ) orelse background;
+            return switch (tag) {
+                .color => unreachable,
+                .@"cell-foreground" => if (style.flags.inverse)
+                    cell_background
+                else
+                    cell_foreground,
+                .@"cell-background" => if (style.flags.inverse)
+                    cell_foreground
+                else
+                    cell_background,
+            };
+        },
+    };
+}
+
+fn writeKeyboardCopyCursorSnapshot(
+    self: *Surface,
+    screen: *terminal.Screen,
+    resolution: KeyboardCopyCursorResolution,
+    snapshot: *KeyboardCopyCursorSnapshot,
+) bool {
+    var column: u16 = 0;
+    var row: u16 = 0;
+    var width_cells: u16 = 0;
+    if (!writeKeyboardCopyCursorViewport(
+        screen,
+        resolution,
+        &column,
+        &row,
+        &width_cells,
+    )) return false;
+
+    var foreground = self.io.terminal.colors.foreground.get() orelse
+        self.io.config.foreground.toTerminalRGB();
+    var background = self.io.terminal.colors.background.get() orelse
+        self.io.config.background.toTerminalRGB();
+    if (self.io.terminal.modes.get(.reverse_colors))
+        std.mem.swap(terminal.color.RGB, &foreground, &background);
+    const color = effectiveKeyboardCopyCursorColor(
+        self.io.terminal.colors.cursor.override,
+        self.io.config.cursor_color,
+        foreground,
+        background,
+        &self.io.terminal.colors.palette.current,
+        self.io.config.bold_color,
+        resolution.cell.pin,
+    );
+    snapshot.* = .{
+        .column = column,
+        .row = row,
+        .width_cells = width_cells,
+        .color_red = color.r,
+        .color_green = color.g,
+        .color_blue = color.b,
+    };
+    return true;
+}
+
+/// Start or stop Ghostty's tracked keyboard-copy cursor.
+pub fn keyboardCopyCursorSet(
+    self: *Surface,
+    active: bool,
+    resolved_column: *u16,
+    resolved_row: *u16,
+    width_cells: *u16,
+) !bool {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    if (!active) {
+        if (self.clearKeyboardCopyCursor()) try self.queueRender();
+        resolved_column.* = 0;
+        resolved_row.* = 0;
+        width_cells.* = 0;
+        return true;
+    }
+
+    if (self.clearKeyboardCopyCursor()) try self.queueRender();
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    try self.setSelection(null);
+    _ = try self.initializeKeyboardCopyCursor(screen) orelse return false;
+    const resolution = try self.resolveKeyboardCopyCursor(screen) orelse
+        return false;
+    return writeKeyboardCopyCursorViewport(
+        screen,
+        resolution,
+        resolved_column,
+        resolved_row,
+        width_cells,
+    );
+}
+
+/// Return the tracked keyboard-copy cursor in the current viewport.
+pub fn keyboardCopyCursorViewport(
+    self: *Surface,
+    resolved_column: *u16,
+    resolved_row: *u16,
+    width_cells: *u16,
+) !bool {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const resolution = try self.resolveKeyboardCopyCursor(screen) orelse
+        return false;
+    if (resolution.changed) try self.queueRender();
+    return writeKeyboardCopyCursorViewport(
+        screen,
+        resolution,
+        resolved_column,
+        resolved_row,
+        width_cells,
+    );
+}
+
+/// Return tracked copy cursor geometry and its effective runtime color.
+pub fn keyboardCopyCursorSnapshot(
+    self: *Surface,
+    snapshot: *KeyboardCopyCursorSnapshot,
+) !bool {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const resolution = try self.resolveKeyboardCopyCursor(screen) orelse
+        return false;
+    if (resolution.changed) try self.queueRender();
+    return writeKeyboardCopyCursorSnapshot(
+        self,
+        screen,
+        resolution,
+        snapshot,
+    );
+}
+
+/// Return the kind of selection still owned by keyboard copy mode.
+pub fn keyboardCopySelectionKind(
+    self: *Surface,
+) !KeyboardCopySelectionKind {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const cursor = try self.ensureKeyboardCopyCursor(screen) orelse
+        return .none;
+    const linewise = validateKeyboardCopySelection(cursor, screen) orelse
+        return .none;
+    return if (linewise) .line else .character;
+}
+
+/// Start a characterwise or linewise selection at the tracked copy cursor.
+pub fn keyboardCopySelectionStart(
+    self: *Surface,
+    linewise: bool,
+    line_count: u16,
+    resolved_column: *u16,
+    resolved_row: *u16,
+    width_cells: *u16,
+) !bool {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    if (line_count == 0) return false;
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const start = try self.resolveKeyboardCopyCursor(screen) orelse
+        return false;
+    const cursor = try self.ensureKeyboardCopyCursor(screen) orelse return false;
+    var endpoint = start.cell;
+
+    if (linewise) {
+        if (line_count > 1) {
+            endpoint = keyboardSelectionPin(
+                screen,
+                start.cell.pin,
+                .down,
+                line_count - 1,
+            ) orelse return false;
+        }
+        try self.setSelection(terminal.Selection.initLinewise(
+            start.cell.pin,
+            endpoint.pin,
+        ));
+        cursor.pin.* = endpoint.pin;
+        scrollPinIntoViewport(screen, endpoint.pin);
+    } else {
+        try self.setSelection(terminal.Selection.init(
+            start.cell.pin,
+            start.cell.pin,
+            false,
+        ));
+    }
+    cursor.selection = .{
+        .linewise = linewise,
+        .activity = screen.selection_activity,
+    };
+
+    const resolution: KeyboardCopyCursorResolution = .{
+        .cell = endpoint,
+        .changed = !endpoint.pin.eql(start.cell.pin),
+    };
+    return writeKeyboardCopyCursorViewport(
+        screen,
+        resolution,
+        resolved_column,
+        resolved_row,
+        width_cells,
+    );
+}
+
+/// Move the tracked copy-mode cursor and optional selection endpoint.
+pub fn keyboardSelectionMove(
+    self: *Surface,
+    movement: KeyboardSelectionMove,
+    count: u16,
+    extend_selection: bool,
+    linewise: bool,
+    resolved_column: *u16,
+    resolved_row: *u16,
+    width_cells: *u16,
+) !bool {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const start = try self.resolveKeyboardCopyCursor(screen) orelse
+        return false;
+    const cursor = try self.ensureKeyboardCopyCursor(screen) orelse return false;
+    if (extend_selection) {
+        const owned_linewise = validateKeyboardCopySelection(
+            cursor,
+            screen,
+        ) orelse return false;
+        if (owned_linewise != linewise) return false;
+    } else if (validateKeyboardCopySelection(cursor, screen) != null) {
+        return false;
+    }
+
+    const moved = keyboardSelectionPin(
+        screen,
+        start.cell.pin,
+        movement,
+        count,
+    ) orelse return false;
+    cursor.pin.* = moved.pin;
+    scrollPinIntoViewport(screen, moved.pin);
+    const resolution = try self.resolveKeyboardCopyCursor(screen) orelse
+        return false;
+    if (extend_selection) {
+        if (!screen.setSelectionEndpoint(resolution.cell.pin, linewise))
+            return false;
+        cursor.selection.?.activity = screen.selection_activity;
+    }
+
+    try self.queueRender();
+    return writeKeyboardCopyCursorViewport(
+        screen,
+        resolution,
+        resolved_column,
+        resolved_row,
+        width_cells,
+    );
+}
+
+/// Apply a copy-mode viewport mutation while holding renderer state.
+pub fn keyboardCopyScroll(
+    self: *Surface,
+    action: KeyboardCopyScroll,
+    amount: i32,
+    resolved_column: *u16,
+    resolved_row: *u16,
+    width_cells: *u16,
+) !bool {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    _ = try self.resolveKeyboardCopyCursor(screen) orelse return false;
+    const rows: i64 = screen.pages.rows;
+    const signed_amount: i64 = amount;
+    const line_delta: i64 = switch (action) {
+        .lines => signed_amount,
+        .pages => std.math.mul(i64, signed_amount, rows) catch
+            if (signed_amount < 0) std.math.minInt(i64) else std.math.maxInt(i64),
+        .half_pages => std.math.mul(
+            i64,
+            signed_amount,
+            @divTrunc(rows, 2),
+        ) catch if (signed_amount < 0) std.math.minInt(i64) else std.math.maxInt(i64),
+        .prompts => signed_amount,
+        .top, .bottom => 0,
+    };
+    const delta = std.math.cast(isize, line_delta) orelse
+        if (line_delta < 0)
+            @as(isize, std.math.minInt(isize))
+        else
+            @as(isize, std.math.maxInt(isize));
+
+    switch (action) {
+        .lines, .pages, .half_pages => screen.scroll(.{ .delta_row = delta }),
+        .top => screen.scroll(.{ .top = {} }),
+        .bottom => screen.scroll(.{ .active = {} }),
+        .prompts => screen.scroll(.{ .delta_prompt = delta }),
+    }
+
+    const resolution = try self.resolveKeyboardCopyCursor(screen) orelse
+        return false;
+    try self.queueRender();
+    return writeKeyboardCopyCursorViewport(
+        screen,
+        resolution,
+        resolved_column,
+        resolved_row,
+        width_cells,
+    );
+}
+
+/// Select one visible cell using Ghostty's tracked terminal coordinates.
+pub fn selectViewportCell(
+    self: *Surface,
+    column: u16,
+    row: u16,
+) !bool {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const cell = canonicalSelectionCellViewport(screen, column, row) orelse
+        return false;
+
+    try self.setSelection(terminal.Selection.init(cell.pin, cell.pin, false));
+    return true;
+}
+
+/// Select inclusive visible rows using tracked full-line endpoints.
+pub fn selectViewportRows(
+    self: *Surface,
+    top_row: u16,
+    bottom_row: u16,
+) !bool {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    if (top_row > bottom_row) return false;
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    if (screen.pages.cols == 0 or
+        top_row >= screen.pages.rows or
+        bottom_row >= screen.pages.rows) return false;
+
+    const top_left = viewportPin(screen, 0, top_row) orelse
+        return false;
+    const bottom_right = viewportPin(
+        screen,
+        screen.pages.cols - 1,
+        bottom_row,
+    ) orelse return false;
+
+    try self.setSelection(terminal.Selection.initLinewise(
+        top_left,
+        bottom_right,
+    ));
+    return true;
+}
+
+/// Move the active selection endpoint to one visible cell.
+pub fn setSelectionEndpointViewport(
+    self: *Surface,
+    column: u16,
+    row: u16,
+    linewise: bool,
+) !bool {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const pin = if (linewise)
+        viewportPin(screen, column, row) orelse return false
+    else
+        (canonicalSelectionCellViewport(screen, column, row) orelse
+            return false).pin;
+    if (!screen.setSelectionEndpoint(pin, linewise)) return false;
+
+    try self.queueRender();
+    return true;
+}
+
+/// Resolve a viewport coordinate to a displayed glyph's leading cell and width.
+pub fn resolveViewportCell(
+    self: *Surface,
+    column: u16,
+    row: u16,
+    resolved_column: *u16,
+    resolved_row: *u16,
+    width_cells: *u16,
+) bool {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const cell = canonicalSelectionCellViewport(screen, column, row) orelse
+        return false;
+    const point = screen.pages.pointFromPin(.viewport, cell.pin) orelse
+        return false;
+    if (point.viewport.x >= screen.pages.cols or
+        point.viewport.y >= screen.pages.rows) return false;
+
+    resolved_column.* = @intCast(point.viewport.x);
+    resolved_row.* = @intCast(point.viewport.y);
+    width_cells.* = cell.width_cells;
+    return true;
+}
+
+/// Query the logical endpoint of the active selection in viewport cells.
+pub fn selectionEndpointViewport(
+    self: *Surface,
+    column: *u16,
+    row: *u16,
+) bool {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const endpoint = screen.selectionEndpointViewport() orelse return false;
+
+    column.* = @intCast(endpoint.viewport.x);
+    row.* = @intCast(endpoint.viewport.y);
     return true;
 }
 
@@ -2395,7 +3418,7 @@ pub fn selectScreenRows(self: *Surface, top_y: u32, bottom_y: u32) !bool {
         .screen = .{ .x = pages.cols -| 1, .y = bottom_y },
     }) orelse return false;
 
-    try screen.select(terminal.Selection.init(top_left, bottom_right, false));
+    try screen.select(terminal.Selection.initLinewise(top_left, bottom_right));
     screen.dirty.selection = true;
     try self.queueRender();
     return true;
@@ -2698,14 +3721,138 @@ fn copySelectionToClipboards(
     };
 }
 
+pub fn selectionWithinClipboardWorkBudget(
+    screen: *const terminal.Screen,
+    selection: terminal.Selection,
+    max_cells: usize,
+) bool {
+    if (max_cells == 0) return false;
+    const top_left = selection.topLeft(screen);
+    const bottom_right = selection.bottomRight(screen);
+    var remaining = max_cells;
+    var iterator = top_left.pageIterator(.right_down, bottom_right);
+    while (iterator.next()) |chunk| {
+        const row_count = chunk.end - chunk.start;
+        const cell_count = std.math.mul(
+            usize,
+            row_count,
+            chunk.node.cols(),
+        ) catch return false;
+        if (cell_count > remaining) return false;
+        remaining -= cell_count;
+    }
+    return true;
+}
+
+fn formatSelectionClipboardContentsBounded(
+    alloc: Allocator,
+    screen: *terminal.Screen,
+    selection: terminal.Selection,
+    opts_: terminal.formatter.Options,
+    max_bytes: usize,
+) ![]apprt.ClipboardContent {
+    if (max_bytes == 0 or
+        !selectionWithinClipboardWorkBudget(
+            screen,
+            selection,
+            max_bytes / 4,
+        ))
+    {
+        return error.ClipboardWorkBudgetExceeded;
+    }
+
+    const scratch = try alloc.alloc(u8, max_bytes);
+    defer alloc.free(scratch);
+
+    var opts = opts_;
+    opts.emit = .plain;
+    var formatter: terminal.formatter.ScreenFormatter = .init(screen, opts);
+    formatter.content = .{ .selection = selection };
+    var writer = std.Io.Writer.fixed(scratch);
+    try formatter.format(&writer);
+    const plain = try alloc.dupeZ(u8, writer.buffered());
+    errdefer alloc.free(plain);
+    const contents = try alloc.alloc(apprt.ClipboardContent, 2);
+    errdefer alloc.free(contents);
+    contents[0] = .{ .mime = "text/plain", .data = plain };
+
+    opts.emit = .html;
+    opts.background = null;
+    opts.foreground = null;
+    formatter = .init(screen, opts);
+    formatter.content = .{ .selection = selection };
+    writer = .fixed(scratch);
+    formatter.format(&writer) catch |err| switch (err) {
+        error.WriteFailed => return contents[0..1],
+        else => |other| return other,
+    };
+    const html = try alloc.dupeZ(u8, writer.buffered());
+    contents[1] = .{ .mime = "text/html", .data = html };
+
+    return contents;
+}
+
+/// Publish the active selection as bounded plain text plus HTML when it fits.
+/// Plain text remains available when only rich formatting exceeds the bound.
+///
+/// This intentionally does not clear the selection. The caller owns the
+/// keyboard-copy transaction and clears it only after publication succeeds.
+pub fn copySelectionToClipboardBounded(
+    self: *Surface,
+    max_bytes: usize,
+) !bool {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    const screen = self.io.terminal.screens.active;
+    const selection = screen.selection orelse return false;
+    var arena = ArenaAllocator.init(self.alloc);
+    defer arena.deinit();
+    const contents = try formatSelectionClipboardContentsBounded(
+        arena.allocator(),
+        screen,
+        selection,
+        .{
+            .emit = .plain,
+            .unwrap = true,
+            .trim = self.config.clipboard_trim_trailing_spaces,
+            .codepoint_map = self.config.clipboard_codepoint_map.map.list,
+            .background = self.io.terminal.colors.background.get(),
+            .foreground = self.io.terminal.colors.foreground.get(),
+            .palette = &self.io.terminal.colors.palette.current,
+        },
+        max_bytes,
+    );
+
+    self.rt_surface.setClipboard(
+        .standard,
+        contents,
+        false,
+    ) catch |err| {
+        log.err("error setting bounded clipboard selection err={}", .{err});
+        return false;
+    };
+    return true;
+}
+
 /// Set the active selection. The renderer observes the screen's selection
 /// activity token and notifies the apprt after releasing the terminal mutex.
 /// To also copy per `copy_on_select`, use `setSelectionAndCopy`.
 ///
 /// This must be called with the renderer mutex held.
 fn setSelection(self: *Surface, sel_: ?terminal.Selection) !void {
+    var invalidate_keyboard_selection = false;
+    if (self.keyboard_copy_cursor) |*cursor| {
+        const screens = &self.io.terminal.screens;
+        if (cursor.screen_key == screens.active_key and
+            cursor.screen_generation == screens.generation(screens.active_key))
+            invalidate_keyboard_selection = true;
+    }
     const activity = self.io.terminal.screens.active.selection_activity;
     try self.io.terminal.screens.active.select(sel_);
+    if (invalidate_keyboard_selection) {
+        if (self.keyboard_copy_cursor) |*cursor| cursor.selection = null;
+    }
 
     // Some selection callers return without otherwise scheduling a render.
     // Always wake the renderer after a genuine transition so it can deliver
@@ -3046,11 +4193,41 @@ pub fn keyEventIsBinding(
     self: *Surface,
     event_orig: input.KeyEvent,
 ) ?input.Binding.Flags {
-    // Apply key remappings for consistency with keyCallback
-    var event = event_orig;
-    if (self.config.key_remaps.isRemapped(event_orig.mods)) {
-        event.mods = self.config.key_remaps.apply(event_orig.mods);
+    const entry = self.keyEventBindingEntry(event_orig) orelse return null;
+
+    return switch (entry.value_ptr.*) {
+        .leader => .{},
+        inline .leaf, .leaf_chained => |v| v.flags,
+    };
+}
+
+/// Consume a key event whose corresponding native menu action was unavailable.
+///
+/// This is intentionally limited to a root, single-action, consumed,
+/// performable binding. Sequences, key tables, unconsumed bindings, and
+/// application-wide bindings must continue through normal key processing.
+/// Recording the trigger here also consumes the paired release event through
+/// the same lifecycle used by normally handled bindings.
+pub fn keyEventConsumeIfMenuAction(
+    self: *Surface,
+    event_orig: input.KeyEvent,
+    action: input.Binding.Action,
+) bool {
+    const event = self.keyEventWithRemappedMods(event_orig);
+    switch (event.action) {
+        .release => return false,
+        .press, .repeat => {},
     }
+
+    const entry = self.config.keybind.set.getEvent(event) orelse return false;
+    return self.keyboard.consumeMenuAction(entry.value_ptr.*, event, action);
+}
+
+fn keyEventBindingEntry(
+    self: *Surface,
+    event_orig: input.KeyEvent,
+) ?input.Binding.Set.Entry {
+    const event = self.keyEventWithRemappedMods(event_orig);
 
     switch (event.action) {
         .release => return null,
@@ -3077,11 +4254,18 @@ pub fn keyEventIsBinding(
         break :entry self.config.keybind.set.getEvent(event) orelse return null;
     };
 
-    // Return flags based on the
-    return switch (entry.value_ptr.*) {
-        .leader => .{},
-        inline .leaf, .leaf_chained => |v| v.flags,
-    };
+    return entry;
+}
+
+fn keyEventWithRemappedMods(
+    self: *const Surface,
+    event_orig: input.KeyEvent,
+) input.KeyEvent {
+    var event = event_orig;
+    if (self.config.key_remaps.isRemapped(event_orig.mods)) {
+        event.mods = self.config.key_remaps.apply(event_orig.mods);
+    }
+    return event;
 }
 
 /// Called for any key events. This handles keybindings, encoding and
@@ -3094,10 +4278,7 @@ pub fn keyCallback(
 
     // Apply key remappings to transform modifiers before any processing.
     // This allows users to remap modifier keys at the app level.
-    var event = event_orig;
-    if (self.config.key_remaps.isRemapped(event_orig.mods)) {
-        event.mods = self.config.key_remaps.apply(event_orig.mods);
-    }
+    const event = self.keyEventWithRemappedMods(event_orig);
 
     // Crash metadata in case we crash in here
     crash.sentry.thread_state = self.crashThreadState();
@@ -3291,20 +4472,21 @@ fn maybeHandleBinding(
         // Release events never trigger a binding but we need to check if
         // we consumed the press event so we don't encode the release.
         .release => {
-            if (self.keyboard.last_trigger) |last| {
-                if (last == event.bindingHash()) {
-                    // We don't reset the last trigger on release because
-                    // an apprt may send multiple release events for a single
-                    // press event.
-                    return .consumed;
-                }
+            if (self.keyboard.consumesBindingRelease(event)) {
+                // We don't reset the last trigger on release because
+                // an apprt may send multiple release events for a single
+                // press event.
+                return .consumed;
             }
 
             return null;
         },
 
-        // Carry on processing.
-        .press, .repeat => {},
+        // Resolve each press or repeat transactionally: expire any prior
+        // release identity for this key first, then record it again below only
+        // when this event is consumed. A forwarded event therefore keeps its
+        // eventual release, while duplicate release events remain consumed.
+        .press, .repeat => self.keyboard.prepareBindingEvent(event),
     }
 
     // Find an entry in the keybind set that matches our event.
@@ -3489,7 +4671,7 @@ fn maybeHandleBinding(
         self.endKeySequence(.drop, .retain);
 
         // Store our last trigger so we don't encode the release event
-        self.keyboard.last_trigger = event.bindingHash();
+        self.keyboard.last_trigger = event.bindingReleaseHash();
 
         if (insp_ev) |ev| {
             ev.binding = self.alloc.dupe(
@@ -4353,11 +5535,7 @@ pub fn mouseButtonCallback(
         if (self.config.copy_on_select != .false) {
             const prev_ = self.io.terminal.screens.active.selection;
             if (prev_) |prev| {
-                try self.setSelectionAndCopy(terminal.Selection.init(
-                    prev.start(),
-                    prev.end(),
-                    prev.rectangle,
-                ));
+                try self.setSelectionAndCopy(prev.snapshot());
             }
         }
 
@@ -6800,6 +7978,741 @@ pub fn getProcessInfo(self: *Surface, comptime info: ProcessInfo) ?ProcessInfo.T
     return self.io.getProcessInfo(info);
 }
 
+test "Surface: viewport selection canonicalizes wide glyph tails" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 10, .rows = 3 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("A橋B");
+
+    const screen = t.screens.active;
+    const tail = canonicalSelectionCellViewport(screen, 2, 0).?;
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 1, .y = 0 } },
+        screen.pages.pointFromPin(.viewport, tail.pin).?,
+    );
+    try testing.expectEqual(@as(u16, 2), tail.width_cells);
+    try screen.select(terminal.Selection.init(tail.pin, tail.pin, false));
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+    try testing.expectEqualSlices(
+        u16,
+        &.{ 1, 1 },
+        &state.row_data.items(.selection)[0].?,
+    );
+
+    const selected_wide = try screen.selectionString(alloc, .{
+        .sel = screen.selection.?,
+        .trim = false,
+    });
+    defer alloc.free(selected_wide);
+    try testing.expectEqualStrings("橋", selected_wide);
+
+    const anchor = canonicalSelectionCellViewport(screen, 0, 0).?;
+    try screen.select(terminal.Selection.init(anchor.pin, anchor.pin, false));
+    const endpoint = canonicalSelectionCellViewport(screen, 2, 0).?;
+    try testing.expect(screen.setSelectionEndpoint(endpoint.pin, false));
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 1, .y = 0 } },
+        screen.selectionEndpointViewport().?,
+    );
+    try state.update(alloc, &t);
+    try testing.expectEqualSlices(
+        u16,
+        &.{ 0, 1 },
+        &state.row_data.items(.selection)[0].?,
+    );
+
+    const selected_range = try screen.selectionString(alloc, .{
+        .sel = screen.selection.?,
+        .trim = false,
+    });
+    defer alloc.free(selected_range);
+    try testing.expectEqualStrings("A橋", selected_range);
+
+    const raw_tail = screen.pages.pin(.{
+        .viewport = .{ .x = 2, .y = 0 },
+    }).?;
+    try screen.select(terminal.Selection.init(anchor.pin, raw_tail, false));
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 1, .y = 0 } },
+        screen.selectionEndpointViewport().?,
+    );
+}
+
+test "Surface: keyboard selection movement batches wide glyph navigation" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 6, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("A橋B");
+
+    const screen = t.screens.active;
+    const start = viewportPin(screen, 0, 0).?;
+    const wide = keyboardSelectionPin(
+        screen,
+        start,
+        .right,
+        1,
+    ).?;
+    try testing.expectEqual(@as(terminal.size.CellCountInt, 1), wide.pin.x);
+    try testing.expectEqual(@as(u16, 2), wide.width_cells);
+
+    const after_wide = keyboardSelectionPin(
+        screen,
+        start,
+        .right,
+        2,
+    ).?;
+    try testing.expectEqual(@as(terminal.size.CellCountInt, 3), after_wide.pin.x);
+    try testing.expectEqual(@as(u16, 1), after_wide.width_cells);
+
+    const boundary = keyboardSelectionPin(
+        screen,
+        start,
+        .right,
+        9999,
+    ).?;
+    try testing.expectEqual(@as(terminal.size.CellCountInt, 5), boundary.pin.x);
+
+    const wide_tail = viewportPin(screen, 2, 0).?;
+    const before_wide = keyboardSelectionPin(
+        screen,
+        wide_tail,
+        .left,
+        1,
+    ).?;
+    try testing.expectEqual(@as(terminal.size.CellCountInt, 0), before_wide.pin.x);
+}
+
+test "Surface: wrapped wide glyph horizontal movement is reversible" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 4, .rows = 3 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("ABC橋D");
+
+    const screen = t.screens.active;
+    const before_wrap = viewportPin(screen, 2, 0).?;
+    const wrapped = keyboardSelectionPin(
+        screen,
+        before_wrap,
+        .right,
+        1,
+    ).?;
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 0, .y = 1 } },
+        screen.pages.pointFromPin(.viewport, wrapped.pin).?,
+    );
+    try testing.expectEqual(@as(u16, 2), wrapped.width_cells);
+
+    const restored = keyboardSelectionPin(
+        screen,
+        wrapped.pin,
+        .left,
+        1,
+    ).?;
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 2, .y = 0 } },
+        screen.pages.pointFromPin(.viewport, restored.pin).?,
+    );
+}
+
+test "Surface: counted horizontal movement crosses multiple wide wraps" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 4, .rows = 4 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("ABC橋X橋");
+
+    const screen = t.screens.active;
+    const start = viewportPin(screen, 0, 0).?;
+    const moved = keyboardSelectionPin(screen, start, .right, 5).?;
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 0, .y = 2 } },
+        screen.pages.pointFromPin(.viewport, moved.pin).?,
+    );
+    try testing.expectEqual(@as(u16, 2), moved.width_cells);
+}
+
+test "Surface: copy cursor color follows runtime and cell semantics" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 4, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b[38;2;10;20;30;48;2;40;50;60mX");
+
+    const screen = t.screens.active;
+    const pin = viewportPin(screen, 0, 0).?;
+    const foreground: terminal.color.RGB = .{ .r = 1, .g = 2, .b = 3 };
+    const background: terminal.color.RGB = .{ .r = 4, .g = 5, .b = 6 };
+
+    try testing.expectEqual(
+        terminal.color.RGB{ .r = 10, .g = 20, .b = 30 },
+        effectiveKeyboardCopyCursorColor(
+            null,
+            .@"cell-foreground",
+            foreground,
+            background,
+            &t.colors.palette.current,
+            null,
+            pin,
+        ),
+    );
+    try testing.expectEqual(
+        terminal.color.RGB{ .r = 40, .g = 50, .b = 60 },
+        effectiveKeyboardCopyCursorColor(
+            null,
+            .@"cell-background",
+            foreground,
+            background,
+            &t.colors.palette.current,
+            null,
+            pin,
+        ),
+    );
+    try testing.expectEqual(
+        terminal.color.RGB{ .r = 90, .g = 80, .b = 70 },
+        effectiveKeyboardCopyCursorColor(
+            .{ .r = 90, .g = 80, .b = 70 },
+            .@"cell-foreground",
+            foreground,
+            background,
+            &t.colors.palette.current,
+            null,
+            pin,
+        ),
+    );
+}
+
+test "Surface: bounded selection clipboard preserves plain and html" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 8, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("\x1b[31mred");
+
+    const screen = t.screens.active;
+    const selection = terminal.Selection.init(
+        viewportPin(screen, 0, 0).?,
+        viewportPin(screen, 2, 0).?,
+        false,
+    );
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const contents = try formatSelectionClipboardContentsBounded(
+        arena.allocator(),
+        screen,
+        selection,
+        .{
+            .emit = .plain,
+            .unwrap = true,
+            .trim = true,
+            .background = t.colors.background.get(),
+            .foreground = t.colors.foreground.get(),
+            .palette = &t.colors.palette.current,
+        },
+        4096,
+    );
+
+    try testing.expectEqual(@as(usize, 2), contents.len);
+    try testing.expectEqualStrings("text/plain", contents[0].mime);
+    try testing.expectEqualStrings("red", contents[0].data);
+    try testing.expectEqualStrings("text/html", contents[1].mime);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        contents[1].data,
+        "color:",
+    ) != null);
+}
+
+test "Surface: bounded selection clipboard falls back to plain when html exceeds budget" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 8, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice(
+        "\x1b[31ma\x1b[32mb\x1b[33mc\x1b[34md" ++
+            "\x1b[35me\x1b[36mf\x1b[37mg\x1b[31mh",
+    );
+
+    const screen = t.screens.active;
+    const selection = terminal.Selection.init(
+        viewportPin(screen, 0, 0).?,
+        viewportPin(screen, 7, 0).?,
+        false,
+    );
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const contents = try formatSelectionClipboardContentsBounded(
+        arena.allocator(),
+        screen,
+        selection,
+        .{
+            .emit = .plain,
+            .unwrap = true,
+            .trim = true,
+            .background = t.colors.background.get(),
+            .foreground = t.colors.foreground.get(),
+            .palette = &t.colors.palette.current,
+        },
+        64,
+    );
+
+    try testing.expectEqual(@as(usize, 1), contents.len);
+    try testing.expectEqualStrings("text/plain", contents[0].mime);
+    try testing.expectEqualStrings("abcdefgh", contents[0].data);
+}
+
+test "Surface: bounded selection clipboard accepts empty plain text" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 4, .rows = 2 });
+    defer t.deinit(alloc);
+    const screen = t.screens.active;
+    const pin = viewportPin(screen, 0, 0).?;
+    const selection = terminal.Selection.init(pin, pin, false);
+    var arena = ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const contents = try formatSelectionClipboardContentsBounded(
+        arena.allocator(),
+        screen,
+        selection,
+        .{
+            .emit = .plain,
+            .unwrap = true,
+            .trim = true,
+            .background = t.colors.background.get(),
+            .foreground = t.colors.foreground.get(),
+            .palette = &t.colors.palette.current,
+        },
+        4096,
+    );
+
+    try testing.expectEqualStrings("", contents[0].data);
+    try testing.expect(contents[1].data.len > 0);
+}
+
+test "Surface: tracked copy cursor is not reinterpreted after viewport drift" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 8, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("one\r\ntwo");
+
+    const screen = t.screens.active;
+    const original = viewportPin(screen, 0, 0).?;
+    const original_y = screen.pages.pointFromPin(.screen, original).?.screen.y;
+    const tracked = try screen.pages.trackPin(original);
+    defer screen.pages.untrackPin(tracked);
+
+    stream.nextSlice("\r\nthree\r\nfour\r\nfive");
+    const tracked_y = screen.pages.pointFromPin(.screen, tracked.*).?.screen.y;
+    const current_row_zero = viewportPin(screen, 0, 0).?;
+    const current_row_zero_y = screen.pages
+        .pointFromPin(.screen, current_row_zero).?
+        .screen
+        .y;
+    try testing.expectEqual(original_y, tracked_y);
+    try testing.expect(tracked_y != current_row_zero_y);
+
+    const resolved = resolveTrackedKeyboardCopyCursor(screen, tracked).?;
+    try testing.expect(resolved.changed);
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 0, .y = 0 } },
+        screen.pages.pointFromPin(.viewport, resolved.cell.pin).?,
+    );
+}
+
+test "Surface: tracked copy cursor recovery clears garbage state" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 8, .rows = 2 });
+    defer t.deinit(alloc);
+
+    const screen = t.screens.active;
+    const tracked = try screen.pages.trackPin(viewportPin(screen, 3, 1).?);
+    defer screen.pages.untrackPin(tracked);
+    screen.pages.reset();
+    try testing.expect(tracked.garbage);
+
+    const resolved = resolveTrackedKeyboardCopyCursor(screen, tracked).?;
+    try testing.expect(resolved.changed);
+    try testing.expect(!tracked.garbage);
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 0, .y = 0 } },
+        screen.pages.pointFromPin(.viewport, resolved.cell.pin).?,
+    );
+}
+
+test "Surface: stale alternate-screen copy cursor skips untracking" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var screens: terminal.ScreenSet = try .init(std.testing.io, alloc, .default);
+    defer screens.deinit(alloc);
+    const alternate = try screens.getInit(
+        std.testing.io,
+        alloc,
+        .alternate,
+        .default,
+    );
+    const tracked = try alternate.pages.trackPin(
+        alternate.pages.getTopLeft(.screen),
+    );
+    const cursor: KeyboardCopyCursor = .{
+        .screen_key = .alternate,
+        .screen_generation = screens.generation(.alternate),
+        .pin = tracked,
+    };
+
+    screens.remove(alloc, .alternate);
+    try testing.expect(!untrackKeyboardCopyCursor(&screens, cursor));
+    try testing.expect(screens.get(.alternate) == null);
+}
+
+test "Surface: copy cursor teardown reports cleared owned selection" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var screens: terminal.ScreenSet = try .init(std.testing.io, alloc, .default);
+    defer screens.deinit(alloc);
+    const screen = screens.active;
+    const pin = screen.pages.getTopLeft(.screen);
+    const tracked = try screen.pages.trackPin(pin);
+    try screen.select(terminal.Selection.init(pin, pin, false));
+    const cursor: KeyboardCopyCursor = .{
+        .screen_key = .primary,
+        .screen_generation = screens.generation(.primary),
+        .pin = tracked,
+        .selection = .{
+            .linewise = false,
+            .activity = screen.selection_activity,
+        },
+    };
+
+    try testing.expect(untrackKeyboardCopyCursor(&screens, cursor));
+    try testing.expect(screen.selection == null);
+}
+
+test "Surface: keyboard selection ownership rejects replacement selection" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 8, .rows = 2 });
+    defer t.deinit(alloc);
+    const screen = t.screens.active;
+    const pin = viewportPin(screen, 1, 0).?;
+    const tracked = try screen.pages.trackPin(pin);
+    defer screen.pages.untrackPin(tracked);
+
+    try screen.select(terminal.Selection.init(pin, pin, false));
+    var cursor: KeyboardCopyCursor = .{
+        .screen_key = .primary,
+        .screen_generation = t.screens.generation(.primary),
+        .pin = tracked,
+        .selection = .{
+            .linewise = false,
+            .activity = screen.selection_activity,
+        },
+    };
+    try testing.expectEqual(
+        false,
+        validateKeyboardCopySelection(&cursor, screen).?,
+    );
+
+    const foreign_endpoint = viewportPin(screen, 4, 1).?;
+    try screen.select(terminal.Selection.init(pin, foreign_endpoint, true));
+    try testing.expect(
+        validateKeyboardCopySelection(&cursor, screen) == null,
+    );
+    try testing.expect(cursor.selection == null);
+    try testing.expect(screen.selection.?.rectangle);
+    try testing.expect(screen.selection.?.end().eql(foreign_endpoint));
+}
+
+test "Surface: linewise keyboard movement includes blank physical rows" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{
+        .cols = 8,
+        .rows = 2,
+    });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("one\r\n\r\nthree\r\nfour\r\n");
+    t.scrollViewport(.top);
+
+    const screen = t.screens.active;
+    const start = viewportPin(screen, 0, 0).?;
+    const start_point = screen.pages.pointFromPin(.screen, start).?.screen;
+    const next = keyboardSelectionPin(
+        screen,
+        start,
+        .down,
+        1,
+    ).?;
+    const next_point = screen.pages.pointFromPin(.screen, next.pin).?.screen;
+    try testing.expectEqual(start_point.y + 1, next_point.y);
+
+    const end = keyboardSelectionPin(
+        screen,
+        start,
+        .end,
+        1,
+    ).?;
+    scrollPinIntoViewport(screen, end.pin);
+    const visible = screen.pages.pointFromPin(.viewport, end.pin).?.viewport;
+    try testing.expectEqual(@as(u32, screen.pages.rows - 1), visible.y);
+}
+
+test "Surface: counted linewise movement extends beyond the viewport" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 8, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("one\r\ntwo\r\nthree\r\nfour\r\nfive");
+    t.scrollViewport(.top);
+
+    const screen = t.screens.active;
+    const start = viewportPin(screen, 0, 1).?;
+    const start_y = screen.pages.pointFromPin(.screen, start).?.screen.y;
+    const endpoint = keyboardSelectionPin(screen, start, .down, 3).?;
+    const endpoint_y = screen.pages
+        .pointFromPin(.screen, endpoint.pin).?
+        .screen
+        .y;
+    try testing.expectEqual(start_y + 3, endpoint_y);
+
+    scrollPinIntoViewport(screen, endpoint.pin);
+    try testing.expectEqual(
+        @as(u32, screen.pages.rows - 1),
+        screen.pages.pointFromPin(.viewport, endpoint.pin).?.viewport.y,
+    );
+}
+
+test "Surface: linewise keyboard movement preserves the copy cursor column" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 8, .rows = 4 });
+    defer t.deinit(alloc);
+
+    const screen = t.screens.active;
+    const anchor = viewportPin(screen, 0, 0).?;
+    const row_edge = viewportPin(screen, 7, 1).?;
+    try screen.select(terminal.Selection.initLinewise(anchor, row_edge));
+
+    var start = row_edge;
+    start.x = 3;
+    const start_point = screen.pages.pointFromPin(.viewport, start).?.viewport;
+    try testing.expectEqual(@as(u32, 3), start_point.x);
+    try testing.expectEqual(@as(u32, 1), start_point.y);
+
+    const moved = keyboardSelectionPin(
+        screen,
+        start,
+        .down,
+        1,
+    ).?;
+    const moved_point = screen.pages.pointFromPin(.viewport, moved.pin).?.viewport;
+    try testing.expectEqual(@as(u32, 3), moved_point.x);
+    try testing.expectEqual(@as(u32, 2), moved_point.y);
+}
+
+test "Surface: linewise horizontal movement skips wide glyph tails" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 6, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("A橋B");
+
+    const screen = t.screens.active;
+    const anchor = viewportPin(screen, 0, 0).?;
+    const wide = viewportPin(screen, 1, 0).?;
+    try screen.select(terminal.Selection.initLinewise(anchor, wide));
+
+    const start = wide;
+    const moved = keyboardSelectionPin(screen, start, .right, 1).?;
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 3, .y = 0 } },
+        screen.pages.pointFromPin(.viewport, moved.pin).?,
+    );
+    try testing.expectEqual(@as(u16, 1), moved.width_cells);
+    try testing.expect(screen.setSelectionEndpoint(moved.pin, true));
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 3, .y = 0 } },
+        screen.selectionEndpointViewport().?,
+    );
+}
+
+test "Surface: viewport selection resolves a wrapped wide glyph head" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 4, .rows = 3 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("ABC橋D");
+
+    const screen = t.screens.active;
+    const spacer_head = screen.pages.pin(.{
+        .viewport = .{ .x = 3, .y = 0 },
+    }).?;
+    try testing.expectEqual(
+        terminal.page.Cell.Wide.spacer_head,
+        spacer_head.rowAndCell().cell.wide,
+    );
+
+    const cell = canonicalSelectionCellViewport(screen, 3, 0).?;
+    try testing.expectEqual(@as(u16, 2), cell.width_cells);
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 0, .y = 1 } },
+        screen.pages.pointFromPin(.viewport, cell.pin).?,
+    );
+    try screen.select(terminal.Selection.init(cell.pin, cell.pin, false));
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+    try testing.expectEqual(null, state.row_data.items(.selection)[0]);
+    try testing.expectEqualSlices(
+        u16,
+        &.{ 0, 0 },
+        &state.row_data.items(.selection)[1].?,
+    );
+
+    const selected = try screen.selectionString(alloc, .{
+        .sel = screen.selection.?,
+        .trim = false,
+    });
+    defer alloc.free(selected);
+    try testing.expectEqualStrings("橋", selected);
+}
+
+test "Surface: linewise viewport endpoint keeps its spacer-head row" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 4, .rows = 3 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("ABC橋");
+
+    const screen = t.screens.active;
+    const start_pin = viewportPin(screen, 0, 0).?;
+    const end_pin = viewportPin(screen, 3, 0).?;
+    try testing.expectEqual(
+        terminal.page.Cell.Wide.spacer_head,
+        end_pin.rowAndCell().cell.wide,
+    );
+    try screen.select(terminal.Selection.initLinewise(start_pin, end_pin));
+    const selection = screen.selection.?;
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 0, .y = 0 } },
+        screen.pages.pointFromPin(.viewport, selection.topLeft(screen)).?,
+    );
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 3, .y = 0 } },
+        screen.pages.pointFromPin(.viewport, selection.bottomRight(screen)).?,
+    );
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 3, .y = 0 } },
+        screen.selectionEndpointViewport().?,
+    );
+}
+
+test "Surface: viewport glyph resolution rejects an offscreen wrapped cell" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 4, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("pre\r\nABC橋\r\nlater\r\n");
+    t.scrollViewport(.top);
+
+    const screen = t.screens.active;
+    const bottom_right = viewportPin(screen, 3, 1).?;
+    try testing.expectEqual(
+        terminal.page.Cell.Wide.spacer_head,
+        bottom_right.rowAndCell().cell.wide,
+    );
+    try testing.expect(canonicalSelectionCellViewport(screen, 3, 1) == null);
+
+    const start = bottom_right;
+    const left = keyboardSelectionPin(screen, start, .left, 1).?;
+    const left_point = screen.pages.pointFromPin(.viewport, left.pin).?.viewport;
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 2, .y = 1 } },
+        terminal.point.Point{ .viewport = left_point },
+    );
+
+    const right = keyboardSelectionPin(screen, start, .right, 1).?;
+    scrollPinIntoViewport(screen, right.pin);
+    const right_point = screen.pages.pointFromPin(.viewport, right.pin).?.viewport;
+    try testing.expect(right_point.x < screen.pages.cols);
+    try testing.expect(right_point.y < screen.pages.rows);
+}
+
+test "Surface: vertical keyboard movement stays on a spacer-head row" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 4, .rows = 3 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice("ABC橋");
+
+    const screen = t.screens.active;
+    const start = viewportPin(screen, 3, 1).?;
+    const moved = keyboardSelectionPin(screen, start, .up, 1).?;
+    try testing.expectEqual(
+        terminal.point.Point{ .viewport = .{ .x = 2, .y = 0 } },
+        screen.pages.pointFromPin(.viewport, moved.pin).?,
+    );
+}
+
 test "Surface: mouseLinkRefreshAllowedState honors ctrl/super under mouse reporting" {
     const ctrl_or_super = input.ctrlOrSuper(.{});
 
@@ -7001,6 +8914,140 @@ test "Surface: path link selection spans an indented hard newline" {
         sentence_period,
         input.ctrlOrSuper(.{}),
     )) == null);
+}
+
+test "Surface: markdown path spans unindented hard newlines" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const prefix = "##  ";
+    const first = "/Users/austinwang/Library/Developer/Xcode/DerivedData/";
+    const second = "cmux-fix-split-resize/Build/Products/Debug/cmux DEV fix-";
+    const third = "split-resize.app";
+    const value = first ++ second ++ third;
+
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var screen = try terminal.Screen.init(std.testing.io, alloc, .{
+        .cols = 80,
+        .rows = 4,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+
+    screen.cursorSetSemanticContent(.output);
+    try screen.testWriteString(
+        prefix ++ first ++ "\r\n" ++ second ++ "\r\n" ++ third,
+    );
+
+    for ([_]terminal.point.Coordinate{
+        .{ .x = prefix.len + 10, .y = 0 },
+        .{ .x = 12, .y = 1 },
+        .{ .x = 6, .y = 2 },
+    }) |point| {
+        const pin = screen.pages.pin(.{ .active = point }).?;
+        var link = (try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            pin,
+            input.ctrlOrSuper(.{}),
+        )) orelse return error.TestExpectedEqual;
+        defer link.deinit(alloc);
+        try testing.expectEqualStrings(value, linkActionTarget(link));
+    }
+}
+
+test "Surface: URL spans unindented hard newlines" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const first = "https://github.com/manaflow-ai/cmux/issues/8583#issuecomment-";
+    const second = "0123456789-";
+    const third = "abcdefghijklmnopqrstuvwxyz";
+    const value = first ++ second ++ third;
+
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var screen = try terminal.Screen.init(std.testing.io, alloc, .{
+        .cols = 96,
+        .rows = 4,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+    screen.cursorSetSemanticContent(.output);
+    try screen.testWriteString(first ++ "\r\n" ++ second ++ "\r\n" ++ third);
+
+    for ([_]terminal.point.Coordinate{
+        .{ .x = 20, .y = 0 },
+        .{ .x = 5, .y = 1 },
+        .{ .x = 10, .y = 2 },
+    }) |point| {
+        const pin = screen.pages.pin(.{ .active = point }).?;
+        var link = (try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            pin,
+            input.ctrlOrSuper(.{}),
+        )) orelse return error.TestExpectedEqual;
+        defer link.deinit(alloc);
+        try testing.expectEqualStrings(value, linkActionTarget(link));
+    }
+}
+
+test "Surface: file URL spans soft-wrapped rows" {
+    if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const value = "file:///Users/admin/berkshire-vault/raw/product/strategy/buyer-decision-model.html";
+    const cols = 32;
+    const last_index = value.len - 1;
+
+    try oni.testing.ensureInit();
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    var screen = try terminal.Screen.init(std.testing.io, alloc, .{
+        .cols = cols,
+        .rows = 4,
+        .max_scrollback = 0,
+    });
+    defer screen.deinit();
+    screen.cursorSetSemanticContent(.output);
+    try screen.testWriteString(value);
+
+    for ([_]terminal.point.Coordinate{
+        .{ .x = 5, .y = 0 },
+        .{
+            .x = @intCast(last_index % cols),
+            .y = @intCast(last_index / cols),
+        },
+    }) |point| {
+        const pin = screen.pages.pin(.{ .active = point }).?;
+        var link = (try linkAtScreenPin(
+            alloc,
+            &screen,
+            derived.links,
+            pin,
+            input.ctrlOrSuper(.{}),
+        )) orelse return error.TestExpectedEqual;
+        defer link.deinit(alloc);
+        try testing.expectEqualStrings(value, linkActionTarget(link));
+    }
 }
 
 test "Surface: wrapped path preserves mapped trailing spaces for copy policy" {

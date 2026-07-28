@@ -10,10 +10,51 @@ const Metal = @import("../Metal.zig");
 const Target = @import("Target.zig");
 const RenderPass = @import("RenderPass.zig");
 
-const Health = @import("../../renderer.zig").Health;
-const FramePresentation = @import("../../renderer.zig").FramePresentation;
+const rendererpkg = @import("../../renderer.zig");
+const Health = rendererpkg.Health;
+const FrameToken = rendererpkg.frame_lease.Token;
+const FramePresentation = rendererpkg.FramePresentation;
 
 const log = std.log.scoped(.metal);
+const command_buffer_selector = "commandBufferWithUnretainedReferences";
+
+pub fn commandBufferRequiresMetalRetention(
+    has_background_image: bool,
+    has_terminal_images: bool,
+    has_custom_shaders: bool,
+) bool {
+    return has_background_image or
+        has_terminal_images or
+        has_custom_shaders;
+}
+
+test "metal frame command buffers use renderer-owned resource lifetimes" {
+    try std.testing.expectEqualStrings(
+        "commandBufferWithUnretainedReferences",
+        command_buffer_selector,
+    );
+
+    try std.testing.expect(!commandBufferRequiresMetalRetention(
+        false,
+        false,
+        false,
+    ));
+    try std.testing.expect(commandBufferRequiresMetalRetention(
+        true,
+        false,
+        false,
+    ));
+    try std.testing.expect(commandBufferRequiresMetalRetention(
+        false,
+        true,
+        false,
+    ));
+    try std.testing.expect(commandBufferRequiresMetalRetention(
+        false,
+        false,
+        true,
+    ));
+}
 
 /// Options for beginning a frame.
 pub const Options = struct {
@@ -22,6 +63,10 @@ pub const Options = struct {
 
     /// Ref-counted renderer access gate for asynchronous completion.
     completion_lifetime: *Metal.RendererCompletionLifetime,
+
+    /// Dynamic images and custom shaders can replace resources while a prior
+    /// frame is still in flight, so those frames keep Metal's retain table.
+    retain_references: bool,
 };
 
 /// MTLCommandBuffer
@@ -34,13 +79,25 @@ pub fn begin(
     opts: Options,
     /// The target is presented via the provided renderer's API when completed.
     target: *Target,
+    frame_token: FrameToken,
+    host_context: u64,
     presentation: ?FramePresentation,
 ) !Self {
-    const buffer = opts.queue.msgSend(
-        objc.Object,
-        objc.sel("commandBuffer"),
-        .{},
-    );
+    const buffer = if (opts.retain_references)
+        opts.queue.msgSend(
+            objc.Object,
+            objc.sel("commandBuffer"),
+            .{},
+        )
+    else
+        // Default terminal frames encode swap-chain-owned resources and
+        // process-shared standard pipelines. The exact-slot frame lease keeps
+        // them alive through completion without Metal's duplicate retain table.
+        opts.queue.msgSend(
+            objc.Object,
+            objc.sel(command_buffer_selector),
+            .{},
+        );
 
     // Create our block to register for completion updates.
     // The block is deallocated by the objC runtime on success.
@@ -49,6 +106,8 @@ pub fn begin(
             .completion_lifetime = opts.completion_lifetime,
             .target = target,
             .sync = false,
+            .frame_token = frame_token,
+            .host_context = host_context,
             .presentation_callback = if (presentation) |value| value.callback else null,
             .presentation_userdata = if (presentation) |value| value.userdata else null,
             .presentation_token = if (presentation) |value| value.token else 0,
@@ -66,6 +125,8 @@ const CompletionBlock = objc.Block(struct {
     completion_lifetime: *Metal.RendererCompletionLifetime,
     target: *Target,
     sync: bool,
+    frame_token: FrameToken,
+    host_context: u64,
     presentation_callback: ?*const fn (?*anyopaque, u64) callconv(.c) void,
     presentation_userdata: ?*anyopaque,
     presentation_token: u64,
@@ -106,6 +167,8 @@ fn bufferCompleted(
             renderer,
             block.target,
             block.sync,
+            block.frame_token,
+            block.host_context,
             if (block.presentation_callback) |callback| .{
                 .callback = callback,
                 .userdata = block.presentation_userdata,
@@ -117,7 +180,12 @@ fn bufferCompleted(
         return;
     }
 
-    renderer.frameCompleted(block.target, health);
+    renderer.frameCompleted(
+        block.target,
+        health,
+        block.frame_token,
+        false,
+    );
 }
 
 /// Present one healthy completed frame and recycle its exact swap-chain slot.
@@ -127,12 +195,14 @@ fn completeHealthyFrame(
     renderer: anytype,
     target: anytype,
     sync: bool,
+    frame_token: FrameToken,
+    host_context: u64,
     presentation: ?FramePresentation,
 ) void {
     if (presentation) |value| {
         var frozen = renderer.api.detachPresentationTarget(target) catch |err| {
             log.warn("Failed to detach tokened render target: err={}", .{err});
-            renderer.frameCompleted(target, .healthy);
+            renderer.frameCompleted(target, .healthy, frame_token, false);
             return;
         };
         defer frozen.releasePresentationOwnership();
@@ -141,15 +211,27 @@ fn completeHealthyFrame(
         // still protected by this frame. Recycling happens before dispatch,
         // so an external callback can never precede renderer bookkeeping.
         const prepared = renderer.api.preparePresentation(frozen, value);
-        renderer.frameCompleted(target, .healthy);
+        renderer.frameCompleted(target, .healthy, frame_token, false);
         prepared.dispatch();
         return;
     }
 
-    renderer.api.present(target.*, sync) catch |err| {
+    const host_acquired = renderer.api.present(
+        renderer,
+        target.*,
+        sync,
+        frame_token,
+        host_context,
+    ) catch |err| failed: {
         log.err("Failed to present render target: err={}", .{err});
+        break :failed false;
     };
-    renderer.frameCompleted(target, .healthy);
+    renderer.frameCompleted(
+        target,
+        .healthy,
+        frame_token,
+        host_acquired,
+    );
 }
 
 /// Add a render pass to this frame with the provided attachments.
@@ -173,13 +255,13 @@ pub inline fn complete(self: *Self, sync: bool) ?FramePresentation {
     // blocking `waitUntilCompleted` here would park that queue forever if the
     // GPU present stalls during a foreground resize storm. Force async
     // completion on iOS so the queue thread returns right after `commit`; the
-    // completion handler (bufferCompleted -> frameCompleted -> releaseFrame)
-    // still reposts the frame_sema permit. Today the iOS `render_now` path
+    // completion handler (bufferCompleted -> frameCompleted -> finishFrame)
+    // still returns the exact swap-chain permit. Today the iOS `render_now` path
     // already passes sync=false, so this is a no-op for the current build and
     // unchanged for macOS (use_sync == sync); it is a structural guarantee that
     // no future sync=true path can reintroduce the freeze on iOS. `use_sync` is
     // the SINGLE source of truth for both branches so exactly one completion
-    // path runs per committed buffer (net-zero frame_sema balance).
+    // path runs per committed buffer (net-zero swap-chain permit balance).
     const use_sync = sync and builtin.os.tag != .ios;
 
     // The ObjC block copy retains Objective-C captures but not this raw Zig
@@ -279,8 +361,16 @@ test "tokened completion freezes target before recycling slot" {
             return .{ .target_id = target.id, .state = self.state };
         }
 
-        fn present(self: *@This(), target: MockTarget, _: bool) !void {
+        fn present(
+            self: *@This(),
+            _: anytype,
+            target: MockTarget,
+            _: bool,
+            _: FrameToken,
+            _: u64,
+        ) !bool {
             self.state.append(.present, target.id);
+            return false;
         }
     };
     const MockRenderer = struct {
@@ -290,6 +380,8 @@ test "tokened completion freezes target before recycling slot" {
             self: *@This(),
             target: *MockTarget,
             health: Health,
+            _: FrameToken,
+            _: bool,
         ) void {
             std.debug.assert(health == .healthy);
             self.api.state.append(.complete, target.id);
@@ -310,7 +402,7 @@ test "tokened completion freezes target before recycling slot" {
     var state: State = .{};
     var renderer: MockRenderer = .{ .api = .{ .state = &state } };
     var target: MockTarget = .{ .id = 1, .state = &state };
-    completeHealthyFrame(&renderer, &target, false, presentation);
+    completeHealthyFrame(&renderer, &target, false, 1, 0, presentation);
     try testing.expectEqualSlices(Event, &.{
         .{ .kind = .detach, .target_id = 1 },
         .{ .kind = .prepare, .target_id = 1 },
@@ -324,7 +416,7 @@ test "tokened completion freezes target before recycling slot" {
     state = .{ .fail_detach = true };
     renderer.api.state = &state;
     target = .{ .id = 4, .state = &state };
-    completeHealthyFrame(&renderer, &target, false, presentation);
+    completeHealthyFrame(&renderer, &target, false, 2, 0, presentation);
     try testing.expectEqualSlices(Event, &.{
         .{ .kind = .complete, .target_id = 4 },
     }, state.events[0..state.len]);
@@ -333,7 +425,7 @@ test "tokened completion freezes target before recycling slot" {
     state = .{};
     renderer.api.state = &state;
     target = .{ .id = 7, .state = &state };
-    completeHealthyFrame(&renderer, &target, false, null);
+    completeHealthyFrame(&renderer, &target, false, 3, 0, null);
     try testing.expectEqualSlices(Event, &.{
         .{ .kind = .present, .target_id = 7 },
         .{ .kind = .complete, .target_id = 7 },

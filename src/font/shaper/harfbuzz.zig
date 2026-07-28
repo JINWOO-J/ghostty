@@ -860,7 +860,7 @@ test "shape hebrew RTL" {
     var testdata = try testShaperWithFont(alloc, .julia_mono);
     defer testdata.deinit();
 
-    var t = try terminal.Terminal.init(alloc, .{ .cols = 30, .rows = 3 });
+    var t = try terminal.Terminal.init(std.testing.io, alloc, .{ .cols = 30, .rows = 3 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
@@ -904,7 +904,7 @@ test "shape arabic with tashkeel on middle letters" {
     var testdata = try testShaperWithFont(alloc, .arabic);
     defer testdata.deinit();
 
-    var t = try terminal.Terminal.init(alloc, .{ .cols = 30, .rows = 3 });
+    var t = try terminal.Terminal.init(std.testing.io, alloc, .{ .cols = 30, .rows = 3 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
@@ -947,7 +947,7 @@ test "shape arabic tanween stays on hamza before space" {
     var testdata = try testShaperWithFont(alloc, .arabic);
     defer testdata.deinit();
 
-    var t = try terminal.Terminal.init(alloc, .{ .cols = 30, .rows = 3 });
+    var t = try terminal.Terminal.init(std.testing.io, alloc, .{ .cols = 30, .rows = 3 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
@@ -997,7 +997,7 @@ test "shape arabic end tashkeel no overlap" {
     var testdata = try testShaperWithFont(alloc, .arabic);
     defer testdata.deinit();
 
-    var t = try terminal.Terminal.init(alloc, .{ .cols = 30, .rows = 3 });
+    var t = try terminal.Terminal.init(std.testing.io, alloc, .{ .cols = 30, .rows = 3 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
@@ -1068,7 +1068,7 @@ test "shape arabic end tanween no overlap" {
     var testdata = try testShaperWithFont(alloc, .arabic);
     defer testdata.deinit();
 
-    var t = try terminal.Terminal.init(alloc, .{ .cols = 30, .rows = 3 });
+    var t = try terminal.Terminal.init(std.testing.io, alloc, .{ .cols = 30, .rows = 3 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
@@ -1135,7 +1135,7 @@ test "shape arabic multiword end tashkeel stays anchored" {
     var testdata = try testShaperWithFont(alloc, .arabic);
     defer testdata.deinit();
 
-    var t = try terminal.Terminal.init(alloc, .{ .cols = 30, .rows = 3 });
+    var t = try terminal.Terminal.init(std.testing.io, alloc, .{ .cols = 30, .rows = 3 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
@@ -1212,7 +1212,7 @@ test "shape LTR then RTL splits at direction boundary" {
     var testdata = try testShaperWithFont(alloc, .arabic);
     defer testdata.deinit();
 
-    var t = try terminal.Terminal.init(alloc, .{ .cols = 30, .rows = 3 });
+    var t = try terminal.Terminal.init(std.testing.io, alloc, .{ .cols = 30, .rows = 3 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
@@ -1250,7 +1250,7 @@ test "shape digits between RTL split into LTR run" {
     var testdata = try testShaperWithFont(alloc, .arabic);
     defer testdata.deinit();
 
-    var t = try terminal.Terminal.init(alloc, .{ .cols = 30, .rows = 3 });
+    var t = try terminal.Terminal.init(std.testing.io, alloc, .{ .cols = 30, .rows = 3 });
     defer t.deinit(alloc);
 
     var s = t.vtStream();
@@ -2014,7 +2014,7 @@ test "shape Bengali sentence keeps base clusters anchored" {
     ) catch return error.SkipZigTest;
     defer testdata.deinit();
 
-    var t = try terminal.Terminal.init(alloc, .{ .cols = 200, .rows = 3 });
+    var t = try terminal.Terminal.init(std.testing.io, alloc, .{ .cols = 200, .rows = 3 });
     defer t.deinit(alloc);
 
     t.modes.set(.grapheme_cluster, true);
@@ -2073,7 +2073,7 @@ test "shape Bengali sentence in mixed-direction line keeps base clusters anchore
     ) catch return error.SkipZigTest;
     defer testdata.deinit();
 
-    var t = try terminal.Terminal.init(alloc, .{ .cols = 220, .rows = 3 });
+    var t = try terminal.Terminal.init(std.testing.io, alloc, .{ .cols = 220, .rows = 3 });
     defer t.deinit(alloc);
 
     t.modes.set(.grapheme_cluster, true);

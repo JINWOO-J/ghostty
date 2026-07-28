@@ -101,6 +101,10 @@ pub const Shaders = struct {
     /// against the output of the previous shader.
     post_pipelines: []const Pipeline,
 
+    /// Non-null only for the process-wide standard pipeline cache. Custom
+    /// shader sets remain renderer-owned because their source is user-specific.
+    shared: ?*SharedStandardShaders = null,
+
     /// Set to true when deinited, if you try to deinit a defunct set
     /// of shaders it will just be ignored, to prevent double-free.
     defunct: bool = false,
@@ -111,6 +115,19 @@ pub const Shaders = struct {
     /// against the final drawable texture. This is an array of shader source
     /// code, not file paths.
     pub fn init(
+        alloc: Allocator,
+        device: objc.Object,
+        post_shaders: []const [:0]const u8,
+        pixel_format: mtl.MTLPixelFormat,
+    ) !Shaders {
+        if (post_shaders.len == 0) {
+            return try initSharedStandard(alloc, device, pixel_format);
+        }
+
+        return try initOwned(alloc, device, post_shaders, pixel_format);
+    }
+
+    fn initOwned(
         alloc: Allocator,
         device: objc.Object,
         post_shaders: []const [:0]const u8,
@@ -167,6 +184,15 @@ pub const Shaders = struct {
         if (self.defunct) return;
         self.defunct = true;
 
+        if (self.shared) |entry| {
+            releaseSharedStandard(entry);
+            return;
+        }
+
+        self.deinitOwned(alloc);
+    }
+
+    fn deinitOwned(self: *Shaders, alloc: Allocator) void {
         // Release our primary shaders
         inline for (pipeline_descs) |pipeline| {
             @field(self.pipelines, pipeline[0]).deinit();
@@ -182,6 +208,133 @@ pub const Shaders = struct {
         }
     }
 };
+
+const SharedStandardShadersKey = struct {
+    device: usize,
+    pixel_format: mtl.MTLPixelFormat,
+
+    fn eql(self: SharedStandardShadersKey, other: SharedStandardShadersKey) bool {
+        return self.device == other.device and
+            self.pixel_format == other.pixel_format;
+    }
+};
+
+const SharedStandardShaders = struct {
+    key: SharedStandardShadersKey,
+    device: objc.Object,
+    resource_allocator: Allocator,
+    library: objc.Object,
+    pipelines: PipelineCollection,
+    post_pipelines: []const Pipeline,
+    references: usize,
+};
+
+const shared_standard_allocator = std.heap.c_allocator;
+var shared_standard_mutex: std.Io.Mutex = .init;
+var shared_standard_entries: std.ArrayListUnmanaged(*SharedStandardShaders) = .empty;
+var shared_standard_build_count = std.atomic.Value(usize).init(0);
+
+fn initSharedStandard(
+    alloc: Allocator,
+    device: objc.Object,
+    pixel_format: mtl.MTLPixelFormat,
+) !Shaders {
+    const key: SharedStandardShadersKey = .{
+        .device = @intFromPtr(device.value),
+        .pixel_format = pixel_format,
+    };
+
+    // Pipeline compilation is expensive and Metal retains significant
+    // process-wide compiler state even after duplicate pipelines are
+    // released. Serialize cache misses so concurrent surface initialization
+    // cannot compile the same standard pipeline collection more than once.
+    shared_standard_mutex.lockUncancelable(global.io());
+    defer shared_standard_mutex.unlock(global.io());
+
+    if (findSharedStandardLocked(key)) |entry| {
+        entry.references += 1;
+        return shadersFromSharedStandard(entry);
+    }
+
+    _ = shared_standard_build_count.fetchAdd(1, .monotonic);
+    var candidate = try Shaders.initOwned(alloc, device, &.{}, pixel_format);
+    const entry = shared_standard_allocator.create(SharedStandardShaders) catch |err| {
+        candidate.deinit(alloc);
+        return err;
+    };
+    entry.* = .{
+        .key = key,
+        .device = device.retain(),
+        .resource_allocator = alloc,
+        .library = candidate.library,
+        .pipelines = candidate.pipelines,
+        .post_pipelines = candidate.post_pipelines,
+        .references = 1,
+    };
+
+    shared_standard_entries.append(
+        shared_standard_allocator,
+        entry,
+    ) catch |err| {
+        candidate.deinit(alloc);
+        entry.device.release();
+        shared_standard_allocator.destroy(entry);
+        return err;
+    };
+
+    candidate.shared = entry;
+    return candidate;
+}
+
+fn findSharedStandardLocked(
+    key: SharedStandardShadersKey,
+) ?*SharedStandardShaders {
+    for (shared_standard_entries.items) |entry| {
+        if (entry.key.eql(key)) return entry;
+    }
+    return null;
+}
+
+fn shadersFromSharedStandard(entry: *SharedStandardShaders) Shaders {
+    return .{
+        .library = entry.library,
+        .pipelines = entry.pipelines,
+        .post_pipelines = entry.post_pipelines,
+        .shared = entry,
+    };
+}
+
+fn releaseSharedStandard(entry: *SharedStandardShaders) void {
+    shared_standard_mutex.lockUncancelable(global.io());
+    defer shared_standard_mutex.unlock(global.io());
+
+    std.debug.assert(entry.references > 0);
+    entry.references -= 1;
+    // Keep a zero-reference standard entry alive for the process lifetime.
+    // Native tab selection can unrealize the outgoing renderer before
+    // realizing the incoming renderer. Destroying the entry in that gap
+    // recompiles identical pipelines on every tab switch, and Metal retains
+    // the associated driver allocations after the objects are released.
+}
+
+fn clearSharedStandardCacheForTesting() void {
+    shared_standard_mutex.lockUncancelable(global.io());
+    defer shared_standard_mutex.unlock(global.io());
+
+    for (shared_standard_entries.items) |entry| {
+        std.debug.assert(entry.references == 0);
+        var owned: Shaders = .{
+            .library = entry.library,
+            .pipelines = entry.pipelines,
+            .post_pipelines = entry.post_pipelines,
+        };
+        owned.deinit(entry.resource_allocator);
+        entry.device.release();
+        shared_standard_allocator.destroy(entry);
+    }
+    shared_standard_entries.deinit(shared_standard_allocator);
+    shared_standard_entries = .empty;
+}
 
 /// The uniforms that are passed to our shaders.
 pub const Uniforms = extern struct {
@@ -255,6 +408,162 @@ pub const Uniforms = extern struct {
         _padding: u4 = 0,
     };
 };
+
+test "standard shaders reuse pipeline state across surfaces and restores" {
+    const testing = std.testing;
+    const device_ptr = mtl.MTLCreateSystemDefaultDevice() orelse {
+        return error.SkipZigTest;
+    };
+    const device = objc.Object.fromId(device_ptr);
+    defer device.release();
+
+    {
+        var active = try Shaders.init(
+            testing.allocator,
+            device,
+            &.{},
+            .bgra8unorm,
+        );
+        defer active.deinit(testing.allocator);
+
+        {
+            var hidden = try Shaders.init(
+                testing.allocator,
+                device,
+                &.{},
+                .bgra8unorm,
+            );
+            defer hidden.deinit(testing.allocator);
+
+            try testing.expectEqual(
+                active.pipelines.bg_color.state.value,
+                hidden.pipelines.bg_color.state.value,
+            );
+        }
+
+        {
+            var restored = try Shaders.init(
+                testing.allocator,
+                device,
+                &.{},
+                .bgra8unorm,
+            );
+            defer restored.deinit(testing.allocator);
+
+            try testing.expectEqual(
+                active.pipelines.bg_color.state.value,
+                restored.pipelines.bg_color.state.value,
+            );
+        }
+    }
+
+    clearSharedStandardCacheForTesting();
+    shared_standard_mutex.lockUncancelable(global.io());
+    defer shared_standard_mutex.unlock(global.io());
+    try testing.expectEqual(@as(usize, 0), shared_standard_entries.items.len);
+}
+
+test "concurrent standard shader initialization compiles once" {
+    const testing = std.testing;
+    const device_ptr = mtl.MTLCreateSystemDefaultDevice() orelse {
+        return error.SkipZigTest;
+    };
+    const device = objc.Object.fromId(device_ptr);
+    defer device.release();
+
+    const Context = struct {
+        start: *std.Io.Event,
+        device: objc.Object,
+        shaders: ?Shaders = null,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.start.waitUncancelable(global.io());
+            self.shaders = Shaders.init(
+                std.heap.c_allocator,
+                self.device,
+                &.{},
+                .bgra8unorm_srgb,
+            ) catch |err| {
+                self.err = err;
+                return;
+            };
+        }
+    };
+
+    const thread_count = 5;
+    var start: std.Io.Event = .unset;
+    var contexts: [thread_count]Context = undefined;
+    var threads: [thread_count]std.Thread = undefined;
+
+    shared_standard_build_count.store(0, .monotonic);
+    for (&contexts, &threads) |*context, *thread| {
+        context.* = .{
+            .start = &start,
+            .device = device,
+        };
+        thread.* = try std.Thread.spawn(.{}, Context.run, .{context});
+    }
+
+    start.set(global.io());
+    for (&threads) |*thread| thread.join();
+
+    defer {
+        for (&contexts) |*context| {
+            if (context.shaders) |*value| {
+                value.deinit(std.heap.c_allocator);
+            }
+        }
+        clearSharedStandardCacheForTesting();
+    }
+
+    for (&contexts) |*context| {
+        if (context.err) |err| return err;
+        try testing.expect(context.shaders != null);
+        try testing.expectEqual(
+            contexts[0].shaders.?.pipelines.bg_color.state.value,
+            context.shaders.?.pipelines.bg_color.state.value,
+        );
+    }
+
+    try testing.expectEqual(
+        @as(usize, 1),
+        shared_standard_build_count.load(.monotonic),
+    );
+}
+
+test "standard shader cache survives a renderer handoff gap" {
+    const testing = std.testing;
+    const device_ptr = mtl.MTLCreateSystemDefaultDevice() orelse {
+        return error.SkipZigTest;
+    };
+    const device = objc.Object.fromId(device_ptr);
+    defer device.release();
+
+    shared_standard_build_count.store(0, .monotonic);
+
+    var hidden = try Shaders.init(
+        testing.allocator,
+        device,
+        &.{},
+        .bgra8unorm,
+    );
+    hidden.deinit(testing.allocator);
+
+    var restored = try Shaders.init(
+        testing.allocator,
+        device,
+        &.{},
+        .bgra8unorm,
+    );
+    restored.deinit(testing.allocator);
+    defer clearSharedStandardCacheForTesting();
+
+    try testing.expectEqual(
+        @as(usize, 1),
+        shared_standard_build_count.load(.monotonic),
+    );
+}
 
 /// This is a single parameter for the terminal cell shader.
 pub const CellText = extern struct {

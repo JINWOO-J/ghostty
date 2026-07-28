@@ -66,38 +66,60 @@ const DrawDamageCommit = struct {
     }
 };
 
-/// Deinitialize only slots whose exact ownership state is idle. A counting
-/// semaphore reports how many slots are idle, not which slots are idle.
-fn deinitIdleFrames(frames: anytype) void {
+/// Initialize a fixed frame array transactionally. A failed later frame must
+/// release every resource owned by the successfully initialized prefix before
+/// the caller retries swap-chain realization.
+fn initializeFrameStates(
+    frames: anytype,
+    api: anytype,
+    custom_shaders: bool,
+) !void {
+    var initialized: usize = 0;
+    errdefer for (frames[0..initialized]) |*frame| frame.deinit();
+
     for (frames) |*frame| {
-        if (!frame.in_flight.load(.acquire)) frame.deinit();
+        frame.* = try @TypeOf(frame.*).init(api, custom_shaders);
+        initialized += 1;
     }
 }
 
-/// Claim the next exact idle slot in circular order. The semaphore guarantees
-/// an idle count, while this compare-exchange identifies and owns that slot.
-fn claimNextIdleFrame(
-    frames: anytype,
-    frame_index: anytype,
-) ?@TypeOf(&frames[0]) {
-    if (frames.len == 0) return null;
+/// Own the graphics API's partial realization until the replacement renderer
+/// resources commit. Downstream failure rolls the API back to its logically
+/// unrealized state; success forces the cached CPU cells into the fresh swap
+/// chain even when synchronized output suppresses the terminal-state update.
+fn RendererRealization(comptime GraphicsAPI: type) type {
+    return struct {
+        const Realization = @This();
 
-    const start: usize = @intCast(frame_index.*);
-    for (1..frames.len + 1) |offset| {
-        const index = (start + offset) % frames.len;
-        const frame = &frames[index];
-        if (frame.in_flight.cmpxchgStrong(
-            false,
-            true,
-            .acq_rel,
-            .acquire,
-        ) == null) {
-            frame_index.* = @intCast(index);
-            return frame;
+        api: *GraphicsAPI,
+        cached_frame_redraw: *bool,
+        committed: bool = false,
+
+        fn begin(
+            api: *GraphicsAPI,
+            cached_frame_redraw: *bool,
+        ) !Realization {
+            if (@hasDecl(GraphicsAPI, "displayRealized")) {
+                try api.displayRealized();
+            }
+            return .{
+                .api = api,
+                .cached_frame_redraw = cached_frame_redraw,
+            };
         }
-    }
 
-    return null;
+        fn commit(self: *Realization) void {
+            self.cached_frame_redraw.* = true;
+            self.committed = true;
+        }
+
+        fn deinit(self: *Realization) void {
+            if (self.committed) return;
+            if (@hasDecl(GraphicsAPI, "displayRealizedRollback")) {
+                self.api.displayRealizedRollback();
+            }
+        }
+    };
 }
 
 fn advanceShaperCellIndexToX(
@@ -150,6 +172,19 @@ fn advanceShaperCellIndexToX(
 ///
 /// [ Texture ] - An abstraction over a GPU texture.
 ///
+fn disposePresentedTarget(resource: anytype) void {
+    // A queued main-thread layer clear may still composite this target.
+    // Release renderer ownership without making its IOSurface purgeable;
+    // Core Animation's retained reference keeps the pixels valid until
+    // the clear callback removes the layer contents.
+    const Resource = @TypeOf(resource.*);
+    if (comptime @hasDecl(Resource, "releasePresentationOwnership")) {
+        resource.releasePresentationOwnership();
+    } else {
+        resource.deinit();
+    }
+}
+
 pub fn Renderer(comptime GraphicsAPI: type) type {
     return struct {
         const Self = @This();
@@ -164,6 +199,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         const shaderpkg = GraphicsAPI.shaders;
         const Shaders = shaderpkg.Shaders;
+
+        fn disposeOwned(resource: anytype, comptime purge: bool) void {
+            const Resource = @TypeOf(resource.*);
+            if (comptime purge and @hasDecl(Resource, "discard")) {
+                resource.discard();
+            } else {
+                resource.deinit();
+            }
+        }
 
         /// Allocator that can be used
         alloc: std.mem.Allocator,
@@ -316,6 +360,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // This is comptime because there isn't a good reason to change
             // this at runtime and there is a lot of complexity to support it.
             const buf_count = GraphicsAPI.swap_chain_count;
+            const LeasePool = renderer.frame_lease.Pool(buf_count);
 
             // cmux iOS fork: bounded acquire deadline for `nextFrame`. On iOS
             // `render_now` produces frames synchronously on a single serial
@@ -333,11 +378,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             /// `buf_count` structs that can hold the
             /// data needed by the GPU to draw a frame.
             frames: [buf_count]FrameState,
-            /// Index of the most recently used frame state struct.
-            frame_index: std.math.IntFittingRange(0, buf_count) = 0,
-            /// Semaphore that we wait on to make sure we have an available
-            /// frame state struct so we can start working on a new frame.
-            frame_sema: std.Io.Semaphore = .{ .permits = buf_count },
+            /// Exact-slot ownership and generation tokens for the swap chain.
+            /// The GPU and an external compositor may release frames out of
+            /// submission order, so a bare counting semaphore is insufficient.
+            leases: LeasePool = .{},
 
             /// Set to true when deinited, if you try to deinit a defunct
             /// swap chain it will just be ignored, to prevent double-free.
@@ -347,104 +391,132 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             /// the renderer is deinited after that.
             defunct: bool = false,
 
+            const DrainedFrames = struct {
+                swap_chain: *SwapChain,
+                indices: [buf_count]usize = undefined,
+                count: usize = 0,
+
+                fn dispose(
+                    self: *DrainedFrames,
+                    comptime purge: bool,
+                ) void {
+                    for (self.indices[0..self.count]) |index| {
+                        self.swap_chain.frames[index]
+                            .deinitWithDisposition(purge);
+                    }
+                    self.count = 0;
+                }
+            };
+
             pub fn init(api: GraphicsAPI, custom_shaders: bool) !SwapChain {
                 var result: SwapChain = .{ .frames = undefined };
+                result.leases.io = global.io();
 
-                // Initialize all of our frame state.
-                for (&result.frames) |*frame| {
-                    frame.* = try FrameState.init(api, custom_shaders);
-                }
+                try initializeFrameStates(
+                    &result.frames,
+                    api,
+                    custom_shaders,
+                );
 
                 return result;
             }
 
-            /// Try to consume one frame permit without blocking. Zig 0.16's
-            /// `std.Io.Semaphore` removed `timedWait`, so the iOS recovery
-            /// deadline uses this primitive plus a short sleep.
-            fn tryAcquireFrame(self: *SwapChain) bool {
-                self.frame_sema.mutex.lockUncancelable(global.io());
-                defer self.frame_sema.mutex.unlock(global.io());
-
-                if (self.frame_sema.permits == 0) return false;
-                self.frame_sema.permits -= 1;
-                if (self.frame_sema.permits > 0)
-                    self.frame_sema.cond.signal(global.io());
-                return true;
-            }
-
-            fn waitFrameWithTimeout(self: *SwapChain, timeout_ns: u64) bool {
-                const deadline = std.Io.Timestamp.now(global.io(), .awake).addDuration(
-                    .fromNanoseconds(@intCast(timeout_ns)),
-                );
-
-                while (!self.tryAcquireFrame()) {
-                    if (std.Io.Timestamp.now(global.io(), .awake).toNanoseconds() >=
-                        deadline.toNanoseconds()) return false;
-                    std.Io.sleep(global.io(), .fromMilliseconds(1), .awake) catch return false;
-                }
-                return true;
-            }
-
             pub fn deinit(self: *SwapChain) void {
-                if (self.defunct) return;
+                var drained = self.drainForDeinit();
+                drained.dispose(false);
+            }
+
+            pub fn discard(self: *SwapChain) void {
+                var drained = self.drainForDeinit();
+                drained.dispose(true);
+            }
+
+            fn drainForDeinit(self: *SwapChain) DrainedFrames {
+                var drained: DrainedFrames = .{ .swap_chain = self };
+                if (self.defunct) return drained;
                 self.defunct = true;
+                self.leases.beginDeinit();
 
                 // Wait for all of our inflight draws to complete so that we can
                 // cleanly deinit our GPU state. cmux iOS fork: bound each wait
-                // on iOS so a permit leaked by a stalled completion handler
-                // can't deadlock teardown. A semaphore permit has no slot
-                // identity, so after the drain deadline we consult each frame's
-                // exact ownership bit, deinit idle slots, and leak only slots
-                // whose command buffers are still in flight. `defunct` is
-                // already set, so no new acquire races us.
+                // on iOS so a stalled GPU completion or host-held external
+                // lease cannot deadlock teardown. The lease pool returns exact
+                // idle slots; after the deadline we deinit those and leak only
+                // slots still owned by the GPU or host. `defunct` is already
+                // set, so no new acquire races us.
                 if (comptime builtin.os.tag == .ios) {
-                    var acquired: usize = 0;
-                    while (acquired < buf_count) : (acquired += 1) {
-                        if (!self.waitFrameWithTimeout(frame_acquire_timeout_ns)) break;
+                    while (drained.count < buf_count) {
+                        const index = self.leases.takeForDeinit(
+                            frame_acquire_timeout_ns,
+                        ) catch break;
+                        drained.indices[drained.count] = index;
+                        drained.count += 1;
                     }
-                    deinitIdleFrames(&self.frames);
                 } else {
-                    for (0..buf_count) |_| self.frame_sema.waitUncancelable(global.io());
-                    for (&self.frames) |*frame| frame.deinit();
+                    for (0..buf_count) |_| {
+                        const index = self.leases.takeForDeinit(null) catch unreachable;
+                        drained.indices[drained.count] = index;
+                        drained.count += 1;
+                    }
                 }
+
+                return drained;
             }
+
+            const AcquiredFrame = struct {
+                state: *FrameState,
+                token: renderer.frame_lease.Token,
+            };
 
             /// Get the next frame state to draw to. This will wait on the
             /// semaphore to ensure that the frame is available. This must
-            /// always be paired with a call to releaseFrame.
-            pub fn nextFrame(
-                self: *SwapChain,
-            ) error{ Defunct, Timeout, FrameUnavailable }!*FrameState {
+            /// always be paired with a call to finishFrame.
+            pub fn nextFrame(self: *SwapChain) error{ Defunct, Timeout }!AcquiredFrame {
                 if (self.defunct) return error.Defunct;
 
                 // cmux iOS fork: bound the acquire so a stalled GPU completion
                 // can't wedge the serial output queue (see
                 // `frame_acquire_timeout_ns`). On timeout no permit is consumed
-                // because `tryAcquireFrame` decrements only after observing an
+                // because the lease pool decrements only after observing an
                 // available permit, so balance is preserved and the frame is skipped.
                 // macOS/OpenGL keep the proven unbounded wait (they drive
                 // frames from the renderer-thread vsync loop where this is
                 // legitimate backpressure, never a serial-queue wedge).
-                if (comptime builtin.os.tag == .ios) {
-                    if (!self.waitFrameWithTimeout(frame_acquire_timeout_ns))
-                        return error.Timeout;
-                } else {
-                    self.frame_sema.waitUncancelable(global.io());
-                }
-                // Restore the aggregate permit if the supposedly impossible
-                // no-idle-slot invariant fails after a successful wait.
-                errdefer self.frame_sema.post(global.io());
-                return claimNextIdleFrame(
-                    &self.frames,
-                    &self.frame_index,
-                ) orelse error.FrameUnavailable;
+                const lease = try self.leases.acquire(if (comptime builtin.os.tag == .ios)
+                    frame_acquire_timeout_ns
+                else
+                    null);
+                return .{
+                    .state = &self.frames[lease.slot],
+                    .token = lease.token,
+                };
             }
 
-            /// This should be called when the frame has completed drawing.
-            pub fn releaseFrame(self: *SwapChain, frame: *FrameState) void {
-                const was_in_flight = frame.in_flight.swap(false, .acq_rel);
-                assert(was_in_flight);
-                self.frame_sema.post(global.io());
+            /// Mark a GPU-complete frame as entering the external presentation
+            /// callback. Host releases are accepted after this transition.
+            pub fn beginExternalPresentation(
+                self: *SwapChain,
+                token: renderer.frame_lease.Token,
+            ) bool {
+                return self.leases.beginPresentation(token);
+            }
+
+            /// This should be called exactly once when GPU completion and any
+            /// external presentation callback have both finished.
+            pub fn finishFrame(
+                self: *SwapChain,
+                token: renderer.frame_lease.Token,
+                host_acquired: bool,
+            ) bool {
+                return self.leases.finish(token, host_acquired);
+            }
+
+            /// Release a frame previously acquired by the external host.
+            pub fn releaseExternalFrame(
+                self: *SwapChain,
+                token: renderer.frame_lease.Token,
+            ) bool {
+                return self.leases.releaseHost(token);
             }
         };
 
@@ -458,10 +530,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         ///
         /// This is used to implement double/triple buffering.
         const FrameState = struct {
-            /// Exact ownership state for bounded teardown. The semaphore only
-            /// carries an aggregate count and cannot identify an idle slot.
-            in_flight: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-
             uniforms: UniformBuffer,
             cells: CellTextBuffer,
             cells_bg: CellBgBuffer,
@@ -557,14 +625,28 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             pub fn deinit(self: *FrameState) void {
-                self.target.deinit();
-                self.uniforms.deinit();
-                self.cells.deinit();
-                self.cells_bg.deinit();
-                self.grayscale.deinit();
-                self.color.deinit();
-                self.bg_image_buffer.deinit();
-                if (self.custom_shader_state) |*state| state.deinit();
+                self.deinitWithDisposition(false);
+            }
+
+            pub fn discard(self: *FrameState) void {
+                self.deinitWithDisposition(true);
+            }
+
+            fn deinitWithDisposition(
+                self: *FrameState,
+                comptime purge: bool,
+            ) void {
+                // SwapChain only calls this after the frame lease drains.
+                disposePresentedTarget(&self.target);
+                disposeOwned(&self.uniforms, purge);
+                disposeOwned(&self.cells, purge);
+                disposeOwned(&self.cells_bg, purge);
+                disposeOwned(&self.grayscale, purge);
+                disposeOwned(&self.color, purge);
+                disposeOwned(&self.bg_image_buffer, purge);
+                if (self.custom_shader_state) |*state| {
+                    state.deinitWithDisposition(purge);
+                }
             }
 
             pub fn resize(
@@ -646,10 +728,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             pub fn deinit(self: *CustomShaderState) void {
-                self.front_texture.deinit();
-                self.back_texture.deinit();
-                self.sampler.deinit();
-                self.uniforms.deinit();
+                self.deinitWithDisposition(false);
+            }
+
+            pub fn discard(self: *CustomShaderState) void {
+                self.deinitWithDisposition(true);
+            }
+
+            fn deinitWithDisposition(
+                self: *CustomShaderState,
+                comptime purge: bool,
+            ) void {
+                disposeOwned(&self.front_texture, purge);
+                disposeOwned(&self.back_texture, purge);
+                disposeOwned(&self.sampler, purge);
+                disposeOwned(&self.uniforms, purge);
             }
 
             pub fn resize(
@@ -1100,10 +1193,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// reinitialized due to any of the events mentioned in
         /// the doc comment for `displayUnrealized`.
         pub fn displayRealized(self: *Self) !void {
-            // If our API has to do things on realize, let it.
-            if (@hasDecl(GraphicsAPI, "displayRealized")) {
-                self.api.displayRealized();
-            }
+            var realization = try RendererRealization(GraphicsAPI).begin(
+                &self.api,
+                &self.cells_rebuilt,
+            );
+            defer realization.deinit();
 
             // Lock the draw mutex so that we can
             // safely reinitialize our GPU resources.
@@ -1131,6 +1225,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.swap_chain = swap_chain;
             self.reinitialize_shaders = false;
             self.target_config_modified = 1;
+            realization.commit();
         }
 
         /// This is called by the GTK apprt when the surface is being destroyed.
@@ -1142,20 +1237,34 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.api.displayUnrealized();
             }
 
-            // Lock the draw mutex so that we can
-            // safely deinitialize our GPU resources.
-            self.draw_mutex.lockUncancelable(global.io());
-            defer self.draw_mutex.unlock(global.io());
-
-            // We deinit our swap chain and shaders.
-            //
-            // This will mark them as defunct so that they
-            // can't be double-freed or used in draw calls.
-            self.swap_chain.deinit();
-            if (@hasDecl(GraphicsAPI, "finishFrameGeneration")) {
-                self.api.finishFrameGeneration();
+            var drained: SwapChain.DrainedFrames = undefined;
+            {
+                // Mark the swap chain defunct and wait for every available
+                // frame lease before releasing the draw lock.
+                self.draw_mutex.lockUncancelable(global.io());
+                defer self.draw_mutex.unlock(global.io());
+                drained = self.swap_chain.drainForDeinit();
+                if (@hasDecl(GraphicsAPI, "finishFrameGeneration")) {
+                    self.api.finishFrameGeneration();
+                }
             }
-            self.shaders.deinit(self.alloc);
+
+            // Flush queued compositor assignments after all frame leases drain.
+            // This must run without the draw mutex because a main-thread host
+            // callback may acquire it.
+            if (@hasDecl(GraphicsAPI, "displayUnrealizedAfterDrain")) {
+                self.api.displayUnrealizedAfterDrain();
+            }
+
+            {
+                // No draw can acquire a defunct swap chain. Clear compositor
+                // ownership first, then make only these teardown resources
+                // purgeable before releasing their final renderer references.
+                self.draw_mutex.lockUncancelable(global.io());
+                defer self.draw_mutex.unlock(global.io());
+                drained.dispose(true);
+                self.shaders.deinit(self.alloc);
+            }
         }
 
         fn displayLinkCallback(
@@ -1738,9 +1847,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             defer damage.deinit();
 
             // Wait for a frame to be available.
-            const frame = try self.swap_chain.nextFrame();
-            errdefer self.swap_chain.releaseFrame(frame);
-            // log.debug("drawing frame index={}", .{self.swap_chain.frame_index});
+            const acquired = try self.swap_chain.nextFrame();
+            const frame = acquired.state;
+            errdefer assert(self.swap_chain.finishFrame(acquired.token, false));
+            // log.debug("drawing frame token={}", .{acquired.token});
 
             // If we need to reinitialize our shaders, do so.
             if (self.reinitialize_shaders) {
@@ -1834,10 +1944,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             // Get a frame context from the graphics API.
-            var frame_ctx = if (presentation) |value|
-                try self.api.beginFrameWithPresentation(self, &frame.target, value)
+            const external_context = if (@hasDecl(GraphicsAPI, "externalFrameContext"))
+                self.api.externalFrameContext()
             else
-                try self.api.beginFrame(self, &frame.target);
+                0;
+            var frame_ctx = try self.api.beginFrame(
+                self,
+                &frame.target,
+                acquired.token,
+                external_context,
+                presentation,
+            );
 
             {
                 var pass = frame_ctx.renderPass(&.{.{
@@ -1993,6 +2110,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self: *Self,
             target: *Target,
             health: Health,
+            token: renderer.frame_lease.Token,
+            host_acquired: bool,
         ) void {
             // If our health value hasn't changed, then we do nothing. We don't
             // do a cmpxchg here because strict atomicity isn't important.
@@ -2018,11 +2137,30 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (pushed > 0) self.health.store(health, .seq_cst);
             }
 
-            // Always release the exact frame before reposting the aggregate
-            // semaphore permit. Metal completion order does not identify a
-            // slot during bounded teardown.
-            const frame: *FrameState = @fieldParentPtr("target", target);
-            self.swap_chain.releaseFrame(frame);
+            _ = target;
+            // Return this exact slot, or transfer it to the external host.
+            // Completion callbacks are allowed to arrive out of order.
+            assert(self.swap_chain.finishFrame(token, host_acquired));
+        }
+
+        /// Mark an exact GPU-complete slot as entering a leased external
+        /// presentation callback. This is thread-safe and intentionally occurs
+        /// before invoking the callback so an immediate cross-process release
+        /// cannot race ownership establishment.
+        pub fn beginExternalFramePresentation(
+            self: *Self,
+            token: renderer.frame_lease.Token,
+        ) bool {
+            return self.swap_chain.beginExternalPresentation(token);
+        }
+
+        /// Release a leased external frame. This may be called from any host
+        /// thread while the surface remains alive.
+        pub fn releaseExternalFrame(
+            self: *Self,
+            token: renderer.frame_lease.Token,
+        ) bool {
+            return self.swap_chain.releaseExternalFrame(token);
         }
 
         /// Call this any time the background image path changes.
@@ -3649,11 +3787,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             texture: *Texture,
         ) !void {
             if (atlas.size > texture.width) {
-                // Free our old texture
+                const replacement = try self.api.initAtlasTexture(atlas);
                 texture.*.deinit();
-
-                // Reallocate
-                texture.* = try self.api.initAtlasTexture(atlas);
+                texture.* = replacement;
             }
 
             try texture.replaceRegion(0, 0, atlas.size, atlas.size, atlas.data);
@@ -3697,56 +3833,124 @@ test "prepared frame damage remains retryable until draw commit" {
     try std.testing.expect(!cells_rebuilt);
 }
 
-test "stalled swap chain teardown releases exact non-prefix idle frames" {
-    const testing = std.testing;
-    const TestFrame = struct {
-        in_flight: std.atomic.Value(bool),
-        deinit_count: usize = 0,
+test "renderer teardown releases presented target without purging" {
+    const Resource = struct {
+        released: *usize,
+        deinited: *usize,
+        discarded: *usize,
 
-        fn init(in_flight: bool) @This() {
-            return .{ .in_flight = std.atomic.Value(bool).init(in_flight) };
+        fn releasePresentationOwnership(self: @This()) void {
+            self.released.* += 1;
         }
 
         fn deinit(self: *@This()) void {
-            self.deinit_count += 1;
+            self.deinited.* += 1;
+        }
+
+        fn discard(self: *@This()) void {
+            self.discarded.* += 1;
         }
     };
 
-    // Only the middle slot is idle. A counting semaphore can report one
-    // permit, but that permit does not identify frames[0] as the idle slot.
-    var frames = [_]TestFrame{
-        .init(true),
-        .init(false),
-        .init(true),
+    var released: usize = 0;
+    var deinited: usize = 0;
+    var discarded: usize = 0;
+    var target: Resource = .{
+        .released = &released,
+        .deinited = &deinited,
+        .discarded = &discarded,
     };
-    deinitIdleFrames(frames[0..]);
 
-    try testing.expectEqual(@as(usize, 0), frames[0].deinit_count);
-    try testing.expectEqual(@as(usize, 1), frames[1].deinit_count);
-    try testing.expectEqual(@as(usize, 0), frames[2].deinit_count);
+    disposePresentedTarget(&target);
+
+    try std.testing.expectEqual(@as(usize, 1), released);
+    try std.testing.expectEqual(@as(usize, 0), deinited);
+    try std.testing.expectEqual(@as(usize, 0), discarded);
 }
 
-test "swap chain claims the exact non-prefix idle frame" {
+test "swap chain initialization cleans its successful prefix on failure" {
     const testing = std.testing;
-    const TestFrame = struct {
-        in_flight: std.atomic.Value(bool),
+    const State = struct {
+        initialized: usize = 0,
+        deinited: usize = 0,
+        fail_at: usize = 2,
+    };
+    const Frame = struct {
+        state: *State,
 
-        fn init(in_flight: bool) @This() {
-            return .{ .in_flight = std.atomic.Value(bool).init(in_flight) };
+        fn init(state: *State, _: bool) !@This() {
+            if (state.initialized == state.fail_at) return error.InitFailed;
+            state.initialized += 1;
+            return .{ .state = state };
+        }
+
+        fn deinit(self: *@This()) void {
+            self.state.deinited += 1;
         }
     };
 
-    // The cursor's nominal next slot (1) is still busy because slot 2
-    // completed first. One aggregate permit exists for slot 2 specifically.
-    var frames = [_]TestFrame{
-        .init(true),
-        .init(true),
-        .init(false),
-    };
-    var frame_index: usize = 0;
-    const claimed = claimNextIdleFrame(frames[0..], &frame_index).?;
+    var state: State = .{};
+    var frames: [3]Frame = undefined;
+    try testing.expectError(
+        error.InitFailed,
+        initializeFrameStates(&frames, &state, false),
+    );
+    try testing.expectEqual(@as(usize, 2), state.initialized);
+    try testing.expectEqual(state.initialized, state.deinited);
+}
 
-    try testing.expect(claimed == &frames[2]);
-    try testing.expectEqual(@as(usize, 2), frame_index);
-    try testing.expect(frames[2].in_flight.load(.acquire));
+test "renderer realization rolls back failure and redraws cached frame on commit" {
+    const testing = std.testing;
+    const MockAPI = struct {
+        realized: usize = 0,
+        rolled_back: usize = 0,
+
+        fn displayRealized(self: *@This()) !void {
+            self.realized += 1;
+        }
+
+        fn displayRealizedRollback(self: *@This()) void {
+            self.rolled_back += 1;
+        }
+    };
+    const Harness = struct {
+        fn failAfterAPI(
+            api: *MockAPI,
+            cached_frame_redraw: *bool,
+        ) !void {
+            var realization = try RendererRealization(MockAPI).begin(
+                api,
+                cached_frame_redraw,
+            );
+            defer realization.deinit();
+            return error.DownstreamFailure;
+        }
+
+        fn succeed(
+            api: *MockAPI,
+            cached_frame_redraw: *bool,
+        ) !void {
+            var realization = try RendererRealization(MockAPI).begin(
+                api,
+                cached_frame_redraw,
+            );
+            defer realization.deinit();
+            realization.commit();
+        }
+    };
+
+    var api: MockAPI = .{};
+    var cached_frame_redraw = false;
+    try testing.expectError(
+        error.DownstreamFailure,
+        Harness.failAfterAPI(&api, &cached_frame_redraw),
+    );
+    try testing.expectEqual(@as(usize, 1), api.realized);
+    try testing.expectEqual(@as(usize, 1), api.rolled_back);
+    try testing.expect(!cached_frame_redraw);
+
+    try Harness.succeed(&api, &cached_frame_redraw);
+    try testing.expectEqual(@as(usize, 2), api.realized);
+    try testing.expectEqual(@as(usize, 1), api.rolled_back);
+    try testing.expect(cached_frame_redraw);
 }

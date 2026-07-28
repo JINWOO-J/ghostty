@@ -80,12 +80,14 @@ pub const FILE_FLAG_OVERLAPPED = 0x40000000;
 pub const FILE_NON_DIRECTORY_FILE = 0x00000040;
 pub const FILE_SHARE_READ = 0x00000001;
 pub const GENERIC_READ = 0x80000000;
+pub const GENERIC_WRITE = 0x40000000;
 pub const HANDLE_FLAG_INHERIT = 0x00000001;
 pub const MEM_COMMIT = 0x1000;
 pub const MEM_RELEASE = 0x8000;
 pub const MEM_RESERVE = 0x2000;
 pub const OPEN_EXISTING = 3; // Known as FILE_OPEN in Windows docs
 pub const PAGE_READWRITE = 0x04;
+pub const PIPE_ACCESS_INBOUND = 0x00000001;
 pub const PIPE_ACCESS_OUTBOUND = 0x00000002;
 pub const PIPE_TYPE_BYTE = 0x00000000;
 pub const PROC_THREAD_ATTRIBUTE_ADDITIVE = 0x00040000;
@@ -93,7 +95,10 @@ pub const PROC_THREAD_ATTRIBUTE_INPUT = 0x00020000;
 pub const PROC_THREAD_ATTRIBUTE_NUMBER = 0x0000FFFF;
 pub const PROC_THREAD_ATTRIBUTE_THREAD = 0x00010000;
 pub const S_OK = 0;
+pub const SYNCHRONIZE = 0x00100000;
 pub const WAIT_FAILED = 0xFFFFFFFF;
+pub const CREATE_EVENT_MANUAL_RESET = 0x00000001;
+pub const EVENT_ALL_ACCESS = 0x001F0003;
 
 pub const PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = ProcThreadAttributeValue(
     .ProcThreadAttributePseudoConsole,
@@ -151,6 +156,21 @@ pub const exp = struct {
             lpBytesRead: ?*DWORD,
             lpTotalBytesAvail: ?*DWORD,
             lpBytesLeftThisMessage: ?*DWORD,
+        ) callconv(.winapi) BOOL;
+        pub extern "kernel32" fn ResetEvent(
+            hEvent: HANDLE,
+        ) callconv(.winapi) BOOL;
+        pub extern "kernel32" fn CreateEventExW(
+            lpEventAttributes: ?*SECURITY_ATTRIBUTES,
+            lpName: ?LPCWSTR,
+            dwFlags: DWORD,
+            dwDesiredAccess: DWORD,
+        ) callconv(.winapi) ?HANDLE;
+        pub extern "kernel32" fn GetOverlappedResult(
+            hFile: HANDLE,
+            lpOverlapped: *OVERLAPPED,
+            lpNumberOfBytesTransferred: *DWORD,
+            bWait: BOOL,
         ) callconv(.winapi) BOOL;
         // Duplicated here because lpCommandLine is not marked optional in zig std
         pub extern "kernel32" fn CreateProcessW(

@@ -7,12 +7,15 @@
 //! APIs. The renderers in this package assume that the renderer is already
 //! setup (OpenGL has a context, Vulkan has a surface, etc.)
 
+const builtin = @import("builtin");
 const build_config = @import("build_config.zig");
 
 const cursor = @import("renderer/cursor.zig");
 const instrumentation = @import("renderer/instrumentation.zig");
 const message = @import("renderer/message.zig");
 const size = @import("renderer/size.zig");
+pub const frame_lease = @import("renderer/frame_lease.zig");
+pub const external_frame = @import("renderer/external_frame.zig");
 pub const shadertoy = @import("renderer/shadertoy.zig");
 pub const Backend = @import("renderer/backend.zig").Backend;
 pub const GenericRenderer = @import("renderer/generic.zig").Renderer;
@@ -97,6 +100,19 @@ test "forced draw transfers synchronous presentation to its caller" {
     try testing.expect(payload == ?FramePresentation);
 }
 
+test "renderer thread exposes lossless realization publication" {
+    const testing = @import("std").testing;
+    try testing.expect(@hasDecl(Thread, "publishRendererRealized"));
+}
+
+test "metal frame resources expose destructive disposal" {
+    if (comptime builtin.os.tag.isDarwin()) {
+        const testing = @import("std").testing;
+        try testing.expect(@hasDecl(Metal.Texture, "discard"));
+        try testing.expect(@hasDecl(Metal.Buffer(u8), "discard"));
+    }
+}
+
 /// The implementation to use for the renderer. This is comptime chosen
 /// so that every build has exactly one renderer implementation.
 pub const Renderer = switch (build_config.renderer) {
@@ -127,6 +143,8 @@ test {
     _ = cursor;
     _ = instrumentation;
     _ = message;
+    _ = frame_lease;
+    _ = external_frame;
     _ = shadertoy;
     _ = size;
     _ = Thread;
