@@ -1861,6 +1861,32 @@ test "surface lifecycle state bypasses a full renderer mailbox and keeps latest 
     );
 }
 
+test "renderer rebuild survives a redundant realize publication" {
+    var state: SurfaceStateRequests = .{};
+
+    state.publishRendererRebuild();
+    state.publishRendererRealized(true);
+
+    const update = state.take();
+    try std.testing.expectEqual(
+        .rebuild,
+        update.renderer_realized.?,
+    );
+}
+
+test "renderer unrealize supersedes a pending rebuild" {
+    var state: SurfaceStateRequests = .{};
+
+    state.publishRendererRebuild();
+    state.publishRendererRealized(false);
+
+    const update = state.take();
+    try std.testing.expectEqual(
+        .unrealize,
+        update.renderer_realized.?,
+    );
+}
+
 test "surface lifecycle retry restoration preserves newer publications" {
     var state: SurfaceStateRequests = .{};
     try std.testing.expect(!state.hasPending());
