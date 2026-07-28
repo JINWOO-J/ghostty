@@ -81,4 +81,19 @@ struct RendererTabSelectionTests {
             selection: .ambiguous
         ))
     }
+
+    @Test func missingSurfaceDoesNotRetryRendererReclamation() {
+        var releaseAttempts = 0
+
+        let needsRetry = RendererReclamationRetry.shouldRetry(
+            hasSurface: false,
+            releaseAccepted: {
+                releaseAttempts += 1
+                return false
+            }()
+        )
+
+        #expect(!needsRetry)
+        #expect(releaseAttempts == 0)
+    }
 }
