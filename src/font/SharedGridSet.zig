@@ -197,7 +197,7 @@ fn collection(
                     if (try disco_it.next()) |face| {
                         log.info("font {s}: {s}", .{
                             field.name,
-                            try face.name(&name_buf),
+                            face.name(&name_buf) catch "<unknown>",
                         });
 
                         _ = try c.addDeferred(self.alloc, face, .{
@@ -228,7 +228,7 @@ fn collection(
                     if (try disco_it.next()) |face| {
                         log.info("font {s}: {s}", .{
                             field.name,
-                            try face.name(&name_buf),
+                            face.name(&name_buf) catch "<unknown>",
                         });
 
                         _ = try c.addDeferred(self.alloc, face, .{
