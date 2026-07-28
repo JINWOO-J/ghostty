@@ -3828,3 +3828,59 @@ test "swap chain initialization cleans its successful prefix on failure" {
     try testing.expectEqual(@as(usize, 2), state.initialized);
     try testing.expectEqual(state.initialized, state.deinited);
 }
+
+test "renderer realization rolls back failure and redraws cached frame on commit" {
+    const testing = std.testing;
+    const MockAPI = struct {
+        realized: usize = 0,
+        rolled_back: usize = 0,
+
+        fn displayRealized(self: *@This()) !void {
+            self.realized += 1;
+        }
+
+        fn displayRealizedRollback(self: *@This()) void {
+            self.rolled_back += 1;
+        }
+    };
+    const Harness = struct {
+        fn failAfterAPI(
+            api: *MockAPI,
+            cached_frame_redraw: *bool,
+        ) !void {
+            var realization = try RendererRealization(MockAPI).begin(
+                api,
+                cached_frame_redraw,
+            );
+            defer realization.deinit();
+            return error.DownstreamFailure;
+        }
+
+        fn succeed(
+            api: *MockAPI,
+            cached_frame_redraw: *bool,
+        ) !void {
+            var realization = try RendererRealization(MockAPI).begin(
+                api,
+                cached_frame_redraw,
+            );
+            defer realization.deinit();
+            realization.commit();
+        }
+    };
+
+    var api: MockAPI = .{};
+    var cached_frame_redraw = false;
+    try testing.expectError(
+        error.DownstreamFailure,
+        Harness.failAfterAPI(&api, &cached_frame_redraw),
+    );
+    try testing.expectEqual(@as(usize, 1), api.realized);
+    try testing.expectEqual(@as(usize, 1), api.rolled_back);
+    try testing.expect(!cached_frame_redraw);
+
+    try Harness.succeed(&api, &cached_frame_redraw);
+    try testing.expectEqual(@as(usize, 2), api.realized);
+    try testing.expectEqual(@as(usize, 1), api.rolled_back);
+    try testing.expect(cached_frame_redraw);
+}

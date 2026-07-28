@@ -50,6 +50,26 @@ struct RendererTabSelectionTests {
         ))
     }
 
+    @Test func tabOverviewClassifiesEveryMemberAsOverview() {
+        #expect(RendererTabSelection.classify(
+            hasTabGroup: true,
+            selectedWindowMatches: false,
+            isKeyOrMain: false,
+            isOverviewVisible: true
+        ) == .overview)
+    }
+
+    @Test func tabOverviewKeepsRendererVisibleAndNonReclaimable() {
+        #expect(RendererTabVisibility.isVisible(
+            selection: .overview,
+            occlusionVisible: false,
+            isKeyOrMain: false
+        ))
+        #expect(!RendererTabVisibility.shouldReclaimSynchronously(
+            selection: .overview
+        ))
+    }
+
     @Test func deselectedTabReclaimsRendererInCurrentVisibilityPass() {
         #expect(RendererTabVisibility.shouldReclaimSynchronously(
             selection: .deselected
