@@ -3,6 +3,62 @@ import SwiftUI
 import Combine
 import GhosttyKit
 
+enum RendererTabSelection: Equatable {
+    case selected
+    case deselected
+    case overview
+    case ambiguous
+
+    static func classify(
+        hasTabGroup: Bool,
+        selectedWindowMatches: Bool?,
+        isKeyOrMain: Bool,
+        isOverviewVisible: Bool = false
+    ) -> Self {
+        if hasTabGroup, isOverviewVisible {
+            return .overview
+        }
+        if isKeyOrMain {
+            return .selected
+        }
+        guard hasTabGroup else {
+            return .selected
+        }
+        guard let selectedWindowMatches else {
+            return .ambiguous
+        }
+        return selectedWindowMatches ? .selected : .deselected
+    }
+}
+
+enum RendererTabVisibility {
+    static func isVisible(
+        selection: RendererTabSelection,
+        occlusionVisible: Bool,
+        isKeyOrMain: Bool
+    ) -> Bool {
+        if selection == .overview { return true }
+        guard selection != .deselected else { return false }
+        return occlusionVisible || (selection == .selected && isKeyOrMain)
+    }
+
+    static func shouldReclaimSynchronously(
+        selection: RendererTabSelection
+    ) -> Bool {
+        selection == .deselected
+    }
+}
+
+enum RendererReclamationRetry {
+    static func shouldRetry(
+        hasSurface: Bool,
+        releaseAccepted: @autoclosure () -> Bool
+    ) -> Bool {
+        guard hasSurface else { return false }
+        return !releaseAccepted()
+    }
+}
+
 /// A base class for windows that can contain Ghostty windows. This base class implements
 /// the bare minimum functionality that every terminal window in Ghostty should implement.
 ///
@@ -70,6 +126,15 @@ class BaseTerminalController: NSWindowController,
 
     /// Event monitor (see individual events for why)
     private var eventMonitor: Any?
+
+    /// Hidden terminal windows keep their PTYs and terminal state but release
+    /// GPU swap-chain resources in the same tab-selection pass. Retry only if
+    /// the renderer state handoff is temporarily unavailable.
+    private static let rendererReclamationRetryDelay: TimeInterval = 0.05
+    private var rendererReclamationTimer: Timer?
+    private weak var observedRendererTabGroup: NSWindowTabGroup?
+    private var rendererTabSelectionObservation: NSKeyValueObservation?
+    private var rendererTabOverviewObservation: NSKeyValueObservation?
 
     /// The previous frame information from the window
     private var savedFrame: SavedFrame?
@@ -222,6 +287,9 @@ class BaseTerminalController: NSWindowController,
     }
 
     deinit {
+        rendererReclamationTimer?.invalidate()
+        rendererTabSelectionObservation?.invalidate()
+        rendererTabOverviewObservation?.invalidate()
         NotificationCenter.default.removeObserver(self)
         undoManager?.removeAllActions(withTarget: self)
         if let eventMonitor {
@@ -292,7 +360,7 @@ class BaseTerminalController: NSWindowController,
         if to.isEmpty {
             focusedSurface = nil
         }
-        syncSurfaceTreeOcclusionState()
+        syncRendererVisibilityForWindowGroup()
     }
 
     /// Update all surfaces with the focus state. This ensures that libghostty has an accurate view about
@@ -1238,6 +1306,14 @@ class BaseTerminalController: NSWindowController,
     func windowWillClose(_ notification: Notification) {
         guard let window else { return }
 
+        rendererReclamationTimer?.invalidate()
+        rendererReclamationTimer = nil
+        rendererTabSelectionObservation?.invalidate()
+        rendererTabSelectionObservation = nil
+        rendererTabOverviewObservation?.invalidate()
+        rendererTabOverviewObservation = nil
+        observedRendererTabGroup = nil
+
         // Emit a final bell-state transition so any observers can clear state
         // without separately tracking NSWindow lifecycle events.
         if bell {
@@ -1259,6 +1335,8 @@ class BaseTerminalController: NSWindowController,
     }
 
     func windowDidBecomeKey(_ notification: Notification) {
+        syncRendererVisibilityForWindowGroup()
+
         // If when we become key our first responder is the window itself, then we
         // want to move focus to our focused terminal surface. This works around
         // various weirdness with moving surfaces around.
@@ -1279,19 +1357,173 @@ class BaseTerminalController: NSWindowController,
         // Becoming/losing key means we have to notify our surface(s) that we have focus
         // so things like cursors blink, pty events are sent, etc.
         self.syncFocusToSurfaceTree()
+        syncRendererVisibilityForWindowGroup()
     }
 
     func windowDidChangeOcclusionState(_ notification: Notification) {
-        syncSurfaceTreeOcclusionState()
+        syncRendererVisibilityForWindowGroup()
+    }
+
+    /// Reconcile every native tab from the tab group's authoritative selection.
+    /// AppKit can switch selected tabs without sending key-window notifications
+    /// to each underlying NSWindow.
+    func syncRendererVisibilityForWindowGroup() {
+        guard let window else {
+            syncSurfaceTreeOcclusionState()
+            return
+        }
+
+        let windows = window.tabGroup?.windows ?? [window]
+        let controllers = windows.compactMap {
+            $0.windowController as? BaseTerminalController
+        }
+        if controllers.isEmpty {
+            syncSurfaceTreeOcclusionState()
+            return
+        }
+
+        for controller in controllers {
+            controller.syncRendererTabSelectionObservation()
+        }
+
+        // Publish every deselection before realizing the selected tab. This
+        // prevents a tab switch from growing two renderer allocations at once.
+        for controller in controllers
+            where controller.rendererTabSelection == .deselected {
+            controller.syncSurfaceTreeOcclusionState()
+        }
+        for controller in controllers
+            where controller.rendererTabSelection != .deselected {
+            controller.syncSurfaceTreeOcclusionState()
+        }
+    }
+
+    /// Observe native tab selection and overview directly. Key/main-window
+    /// callbacks do not cover tab-bar clicks or Show All Tabs transitions.
+    private func syncRendererTabSelectionObservation() {
+        let tabGroup = window?.tabGroup
+        guard observedRendererTabGroup !== tabGroup else { return }
+
+        rendererTabSelectionObservation?.invalidate()
+        rendererTabSelectionObservation = nil
+        rendererTabOverviewObservation?.invalidate()
+        rendererTabOverviewObservation = nil
+        observedRendererTabGroup = tabGroup
+
+        guard let tabGroup else { return }
+        rendererTabSelectionObservation = tabGroup.observe(
+            \.selectedWindow,
+             options: [.new]
+        ) { [weak self] _, _ in
+            Task { @MainActor [weak self] in
+                self?.syncRendererVisibilityForWindowGroup()
+            }
+        }
+        rendererTabOverviewObservation = tabGroup.observe(
+            \.isOverviewVisible,
+             options: [.new]
+        ) { [weak self] _, _ in
+            Task { @MainActor [weak self] in
+                self?.syncRendererVisibilityForWindowGroup()
+            }
+        }
+    }
+
+    /// Native-tab selection and overview are durable across AppKit's transient
+    /// occlusion changes while tab groups are being assembled. Key/main status
+    /// is a conservative fallback because AppKit can briefly report no selected
+    /// window while the active tab is changing.
+    private var rendererTabSelection: RendererTabSelection {
+        guard let window else { return .ambiguous }
+        let tabGroup = window.tabGroup
+        return .classify(
+            hasTabGroup: tabGroup != nil,
+            selectedWindowMatches: tabGroup?.selectedWindow.map { $0 === window },
+            isKeyOrMain: window.isKeyWindow || window.isMainWindow,
+            isOverviewVisible: tabGroup?.isOverviewVisible ?? false
+        )
+    }
+
+    private func windowIsRendererVisible(
+        selection: RendererTabSelection
+    ) -> Bool {
+        guard let window else { return false }
+        return RendererTabVisibility.isVisible(
+            selection: selection,
+            occlusionVisible: window.occlusionState.contains(.visible),
+            isKeyOrMain: window.isKeyWindow || window.isMainWindow
+        )
     }
 
     private func syncSurfaceTreeOcclusionState() {
-        let visible = self.window?.occlusionState.contains(.visible) ?? false
+        let selection = rendererTabSelection
+        let selected = selection == .selected
+        let visible = windowIsRendererVisible(selection: selection)
+
+        if selection != .deselected {
+            rendererReclamationTimer?.invalidate()
+            rendererReclamationTimer = nil
+        }
+
         for view in surfaceTree {
-            if let surface = view.surface, view.isWindowVisible != visible {
-                ghostty_surface_set_occlusion(surface, visible)
-                view.isWindowVisible = visible
+            guard let surface = view.surface else { continue }
+
+            // A selected tab owns a renderer even while AppKit transiently
+            // reports it occluded during native-tab assembly. An ambiguous
+            // tab only realizes when AppKit says it is actually visible.
+            if (selected || visible), !view.setRendererRealized(true) {
+                continue
             }
+            guard view.isWindowVisible != visible else { continue }
+
+            if visible {
+                ghostty_surface_set_occlusion(surface, true)
+                view.isWindowVisible = true
+            } else {
+                // Stop drawing before releasing this deselected tab's renderer.
+                ghostty_surface_set_occlusion(surface, false)
+                view.isWindowVisible = false
+            }
+        }
+
+        if RendererTabVisibility.shouldReclaimSynchronously(
+            selection: selection
+        ) {
+            reclaimDeselectedRenderers()
+        }
+    }
+
+    private func reclaimDeselectedRenderers() {
+        guard rendererTabSelection == .deselected else { return }
+
+        rendererReclamationTimer?.invalidate()
+        rendererReclamationTimer = nil
+
+        var needsRetry = false
+        for view in surfaceTree where !view.isWindowVisible {
+            if RendererReclamationRetry.shouldRetry(
+                hasSurface: view.surface != nil,
+                releaseAccepted: view.setRendererRealized(false)
+            ) {
+                needsRetry = true
+            }
+        }
+
+        if needsRetry {
+            scheduleRendererReclamationRetry()
+        }
+    }
+
+    private func scheduleRendererReclamationRetry() {
+        guard rendererReclamationTimer == nil else { return }
+
+        rendererReclamationTimer = Timer.scheduledTimer(
+            withTimeInterval: Self.rendererReclamationRetryDelay,
+            repeats: false
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.rendererReclamationTimer = nil
+            self.reclaimDeselectedRenderers()
         }
     }
 

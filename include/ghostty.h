@@ -1618,6 +1618,9 @@ GHOSTTY_API void ghostty_surface_free_text(ghostty_surface_t, ghostty_text_s*);
 #ifdef __APPLE__
 GHOSTTY_API void ghostty_surface_set_display_id(ghostty_surface_t, uint32_t);
 GHOSTTY_API bool ghostty_surface_set_renderer_realized(ghostty_surface_t, bool);
+// Force one renderer-thread unrealize/realize transaction without freeing the
+// surface, PTY, terminal state, or scrollback.
+GHOSTTY_API bool ghostty_surface_rebuild_renderer(ghostty_surface_t);
 GHOSTTY_API void* ghostty_surface_quicklook_font(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_quicklook_word(ghostty_surface_t, ghostty_text_s*);
 #endif
