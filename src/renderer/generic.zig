@@ -81,6 +81,45 @@ fn initializeFrameStates(
     }
 }
 
+/// Own the graphics API's partial realization until the replacement renderer
+/// resources commit. Downstream failure rolls the API back to its logically
+/// unrealized state; success forces the cached CPU cells into the fresh swap
+/// chain even when synchronized output suppresses the terminal-state update.
+fn RendererRealization(comptime GraphicsAPI: type) type {
+    return struct {
+        const Realization = @This();
+
+        api: *GraphicsAPI,
+        cached_frame_redraw: *bool,
+        committed: bool = false,
+
+        fn begin(
+            api: *GraphicsAPI,
+            cached_frame_redraw: *bool,
+        ) !Realization {
+            if (@hasDecl(GraphicsAPI, "displayRealized")) {
+                try api.displayRealized();
+            }
+            return .{
+                .api = api,
+                .cached_frame_redraw = cached_frame_redraw,
+            };
+        }
+
+        fn commit(self: *Realization) void {
+            self.cached_frame_redraw.* = true;
+            self.committed = true;
+        }
+
+        fn deinit(self: *Realization) void {
+            if (self.committed) return;
+            if (@hasDecl(GraphicsAPI, "displayRealizedRollback")) {
+                self.api.displayRealizedRollback();
+            }
+        }
+    };
+}
+
 fn advanceShaperCellIndexToX(
     run_offset: usize,
     shaped_cells: []const font.shape.Cell,
@@ -1138,10 +1177,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// reinitialized due to any of the events mentioned in
         /// the doc comment for `displayUnrealized`.
         pub fn displayRealized(self: *Self) !void {
-            // If our API has to do things on realize, let it.
-            if (@hasDecl(GraphicsAPI, "displayRealized")) {
-                try self.api.displayRealized();
-            }
+            var realization = try RendererRealization(GraphicsAPI).begin(
+                &self.api,
+                &self.cells_rebuilt,
+            );
+            defer realization.deinit();
 
             // Lock the draw mutex so that we can
             // safely reinitialize our GPU resources.
@@ -1169,6 +1209,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.swap_chain = swap_chain;
             self.reinitialize_shaders = false;
             self.target_config_modified = 1;
+            realization.commit();
         }
 
         /// This is called by the GTK apprt when the surface is being destroyed.

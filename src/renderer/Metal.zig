@@ -321,6 +321,12 @@ pub fn displayRealized(self: *Metal) !void {
     try self.queue.ensureLive(self.device);
 }
 
+/// Undo API resources recreated before generic swap-chain realization failed.
+/// The renderer remains logically unrealized and may retry from a clean state.
+pub fn displayRealizedRollback(self: *Metal) void {
+    self.queue.release();
+}
+
 /// Install a distinct gate before replacement swap-chain frames can be used.
 pub fn startFrameGeneration(self: *Metal) !void {
     const renderer: *Renderer = @alignCast(@fieldParentPtr("api", self));

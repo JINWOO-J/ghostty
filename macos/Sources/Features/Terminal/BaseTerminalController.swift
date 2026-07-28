@@ -6,13 +6,18 @@ import GhosttyKit
 enum RendererTabSelection: Equatable {
     case selected
     case deselected
+    case overview
     case ambiguous
 
     static func classify(
         hasTabGroup: Bool,
         selectedWindowMatches: Bool?,
-        isKeyOrMain: Bool
+        isKeyOrMain: Bool,
+        isOverviewVisible: Bool = false
     ) -> Self {
+        if hasTabGroup, isOverviewVisible {
+            return .overview
+        }
         if isKeyOrMain {
             return .selected
         }
@@ -32,6 +37,7 @@ enum RendererTabVisibility {
         occlusionVisible: Bool,
         isKeyOrMain: Bool
     ) -> Bool {
+        if selection == .overview { return true }
         guard selection != .deselected else { return false }
         return occlusionVisible || (selection == .selected && isKeyOrMain)
     }
@@ -118,6 +124,7 @@ class BaseTerminalController: NSWindowController,
     private var rendererReclamationTimer: Timer?
     private weak var observedRendererTabGroup: NSWindowTabGroup?
     private var rendererTabSelectionObservation: NSKeyValueObservation?
+    private var rendererTabOverviewObservation: NSKeyValueObservation?
 
     /// The previous frame information from the window
     private var savedFrame: SavedFrame?
@@ -272,6 +279,7 @@ class BaseTerminalController: NSWindowController,
     deinit {
         rendererReclamationTimer?.invalidate()
         rendererTabSelectionObservation?.invalidate()
+        rendererTabOverviewObservation?.invalidate()
         NotificationCenter.default.removeObserver(self)
         undoManager?.removeAllActions(withTarget: self)
         if let eventMonitor {
@@ -1292,6 +1300,8 @@ class BaseTerminalController: NSWindowController,
         rendererReclamationTimer = nil
         rendererTabSelectionObservation?.invalidate()
         rendererTabSelectionObservation = nil
+        rendererTabOverviewObservation?.invalidate()
+        rendererTabOverviewObservation = nil
         observedRendererTabGroup = nil
 
         // Emit a final bell-state transition so any observers can clear state
@@ -1378,14 +1388,16 @@ class BaseTerminalController: NSWindowController,
         }
     }
 
-    /// Observe native tab selection directly. Key/main-window callbacks do not
-    /// cover every AppKit tab activation path, especially tab-bar clicks.
+    /// Observe native tab selection and overview directly. Key/main-window
+    /// callbacks do not cover tab-bar clicks or Show All Tabs transitions.
     private func syncRendererTabSelectionObservation() {
         let tabGroup = window?.tabGroup
         guard observedRendererTabGroup !== tabGroup else { return }
 
         rendererTabSelectionObservation?.invalidate()
         rendererTabSelectionObservation = nil
+        rendererTabOverviewObservation?.invalidate()
+        rendererTabOverviewObservation = nil
         observedRendererTabGroup = tabGroup
 
         guard let tabGroup else { return }
@@ -1393,15 +1405,23 @@ class BaseTerminalController: NSWindowController,
             \.selectedWindow,
              options: [.new]
         ) { [weak self] _, _ in
-            DispatchQueue.main.async { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.syncRendererVisibilityForWindowGroup()
+            }
+        }
+        rendererTabOverviewObservation = tabGroup.observe(
+            \.isOverviewVisible,
+             options: [.new]
+        ) { [weak self] _, _ in
+            Task { @MainActor [weak self] in
                 self?.syncRendererVisibilityForWindowGroup()
             }
         }
     }
 
-    /// Native-tab selection is durable across AppKit's transient occlusion
-    /// changes while tab groups are being assembled. Key/main status is a
-    /// conservative fallback because AppKit can briefly report no selected
+    /// Native-tab selection and overview are durable across AppKit's transient
+    /// occlusion changes while tab groups are being assembled. Key/main status
+    /// is a conservative fallback because AppKit can briefly report no selected
     /// window while the active tab is changing.
     private var rendererTabSelection: RendererTabSelection {
         guard let window else { return .ambiguous }
@@ -1409,7 +1429,8 @@ class BaseTerminalController: NSWindowController,
         return .classify(
             hasTabGroup: tabGroup != nil,
             selectedWindowMatches: tabGroup?.selectedWindow.map { $0 === window },
-            isKeyOrMain: window.isKeyWindow || window.isMainWindow
+            isKeyOrMain: window.isKeyWindow || window.isMainWindow,
+            isOverviewVisible: tabGroup?.isOverviewVisible ?? false
         )
     }
 
