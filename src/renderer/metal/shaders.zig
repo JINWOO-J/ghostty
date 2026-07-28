@@ -570,6 +570,53 @@ test "standard shader cache survives a renderer handoff gap" {
     );
 }
 
+test "custom shader cache survives a renderer handoff gap" {
+    const testing = std.testing;
+    const device_ptr = mtl.MTLCreateSystemDefaultDevice() orelse {
+        return error.SkipZigTest;
+    };
+    const device = objc.Object.fromId(device_ptr);
+    defer device.release();
+    defer clearSharedStandardCacheForTesting();
+
+    const custom_shader: [:0]const u8 =
+        \\#include <metal_stdlib>
+        \\using namespace metal;
+        \\fragment float4 main0(float4 position [[position]]) {
+        \\    return float4(position.x, position.y, 0.0, 1.0);
+        \\}
+    ;
+
+    var hidden = try Shaders.init(
+        testing.allocator,
+        device,
+        &.{custom_shader},
+        .bgra8unorm,
+    );
+    try testing.expect(hidden.shared != null);
+    const standard_pipeline = hidden.pipelines.bg_color.state.value;
+    const post_pipeline = hidden.post_pipelines[0].state.value;
+    hidden.deinit(testing.allocator);
+
+    var restored = try Shaders.init(
+        testing.allocator,
+        device,
+        &.{custom_shader},
+        .bgra8unorm,
+    );
+    defer restored.deinit(testing.allocator);
+
+    try testing.expect(restored.shared != null);
+    try testing.expectEqual(
+        standard_pipeline,
+        restored.pipelines.bg_color.state.value,
+    );
+    try testing.expectEqual(
+        post_pipeline,
+        restored.post_pipelines[0].state.value,
+    );
+}
+
 /// This is a single parameter for the terminal cell shader.
 pub const CellText = extern struct {
     glyph_pos: [2]u32 align(8) = .{ 0, 0 },

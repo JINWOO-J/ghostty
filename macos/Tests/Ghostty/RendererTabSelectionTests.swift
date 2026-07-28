@@ -96,4 +96,12 @@ struct RendererTabSelectionTests {
         #expect(!needsRetry)
         #expect(releaseAttempts == 0)
     }
+
+    @Test func tabGroupElectsOneRendererObservationOwner() {
+        let observers = (0..<100).filter {
+            RendererTabObservationPlan.shouldObserve(controllerIndex: $0)
+        }
+
+        #expect(observers == [0])
+    }
 }
