@@ -136,8 +136,8 @@ pub fn Stream(comptime xev: type, comptime T: type, comptime options: Options) t
     };
 }
 
-test "queued writes retain the head request during transient backpressure" {
-    const FakeXev = struct {
+fn QueueWriteTestXev(comptime WriteErrorType: type) type {
+    return struct {
         const Self = @This();
 
         pub const dynamic = false;
@@ -156,10 +156,7 @@ test "queued writes retain the head request during transient backpressure" {
             rearm,
         };
 
-        pub const WriteError = error{
-            BrokenPipe,
-            WouldBlock,
-        };
+        pub const WriteError = WriteErrorType;
 
         pub const WriteBuffer = union(enum) {
             slice: []const u8,
@@ -206,8 +203,10 @@ test "queued writes retain the head request during transient backpressure" {
         pub const WriteRequest = Shared(Self).WriteRequest;
         pub const WriteQueue = Shared(Self).WriteQueue;
     };
+}
 
-    const FakeStream = struct {
+fn QueueWriteTestStream(comptime xev: type) type {
+    return struct {
         fd: i32,
 
         fn initFd(fd: i32) @This() {
@@ -216,8 +215,8 @@ test "queued writes retain the head request during transient backpressure" {
 
         fn writeInit(
             self: @This(),
-            completion: *FakeXev.Completion,
-            buffer: FakeXev.WriteBuffer,
+            completion: *xev.Completion,
+            buffer: xev.WriteBuffer,
         ) void {
             completion.* = .{
                 .op = .{
@@ -229,23 +228,34 @@ test "queued writes retain the head request during transient backpressure" {
             };
         }
     };
+}
 
-    const CallbackState = struct {
+fn QueueWriteTestCallbackState(comptime xev: type, comptime StreamType: type) type {
+    return struct {
         calls: usize = 0,
 
         fn callback(
             state: ?*@This(),
-            _: *FakeXev.Loop,
-            _: *FakeXev.Completion,
-            _: FakeStream,
-            _: FakeXev.WriteBuffer,
-            result: FakeXev.WriteError!usize,
-        ) FakeXev.CallbackAction {
+            _: *xev.Loop,
+            _: *xev.Completion,
+            _: StreamType,
+            _: xev.WriteBuffer,
+            result: xev.WriteError!usize,
+        ) xev.CallbackAction {
             _ = result catch {};
             state.?.calls += 1;
             return .disarm;
         }
     };
+}
+
+test "queued writes retain the head request during transient backpressure" {
+    const FakeXev = QueueWriteTestXev(error{
+        BrokenPipe,
+        WouldBlock,
+    });
+    const FakeStream = QueueWriteTestStream(FakeXev);
+    const CallbackState = QueueWriteTestCallbackState(FakeXev, FakeStream);
 
     const Writer = Writeable(
         FakeXev,
@@ -294,6 +304,45 @@ test "queued writes retain the head request during transient backpressure" {
     try std.testing.expectEqual(@as(usize, 0), callback_state.calls);
     try std.testing.expect(write_queue.head == &requests[0]);
     try std.testing.expect(loop.added == &requests[0].completion);
+}
+
+test "queued writes support backends without WouldBlock" {
+    const FakeXev = QueueWriteTestXev(error{BrokenPipe});
+    const FakeStream = QueueWriteTestStream(FakeXev);
+    const CallbackState = QueueWriteTestCallbackState(FakeXev, FakeStream);
+    const Writer = Writeable(
+        FakeXev,
+        FakeStream,
+        .{ .write = .write },
+    );
+
+    var loop: FakeXev.Loop = .{};
+    var write_queue: FakeXev.WriteQueue = .{};
+    var request: FakeXev.WriteRequest = undefined;
+    var callback_state: CallbackState = .{};
+    const writer: FakeStream = .{ .fd = 1 };
+
+    Writer.queueWrite(
+        writer,
+        &loop,
+        &write_queue,
+        &request,
+        .{ .slice = "first" },
+        CallbackState,
+        &callback_state,
+        CallbackState.callback,
+    );
+
+    const completion = loop.added.?;
+    _ = completion.callback.?(
+        completion.userdata,
+        &loop,
+        completion,
+        .{ .write = 5 },
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), callback_state.calls);
+    try std.testing.expect(write_queue.head == null);
 }
 
 fn Pollable(comptime xev: type, comptime T: type, comptime options: Options) type {
@@ -1000,7 +1049,7 @@ pub fn Writeable(comptime xev: type, comptime T: type, comptime options: Options
                                 req_inner.full_write_buffer,
                             );
                             break :retry null;
-                        } else |err| switch (err) {
+                        } else |err| switch (@as(anyerror, err)) {
                             error.WouldBlock => break :retry cb_res.buf,
                             else => break :retry null,
                         }
