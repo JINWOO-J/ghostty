@@ -11,6 +11,7 @@ const Allocator = std.mem.Allocator;
 const objc = @import("objc");
 const apprt = @import("../apprt.zig");
 const font = @import("../font/main.zig");
+const global = @import("../global.zig");
 const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
@@ -355,7 +356,7 @@ pub const App = struct {
         _: apprt.ipc.Target,
         comptime action: apprt.ipc.Action.Key,
         _: apprt.ipc.Action.Value(action),
-    ) (Allocator.Error || std.posix.WriteError || apprt.ipc.Errors)!bool {
+    ) (Allocator.Error || apprt.ipc.Errors)!bool {
         switch (action) {
             .new_window => return false,
             .toggle_quick_terminal => return false,
@@ -462,7 +463,7 @@ pub const Platform = union(PlatformTag) {
 
     /// Initialize a Platform a tag and configuration from the C ABI.
     pub fn init(tag_int: c_int, c_platform: C) !Platform {
-        const tag = try std.meta.intToEnum(PlatformTag, tag_int);
+        const tag = std.enums.fromInt(PlatformTag, tag_int) orelse return error.InvalidEnumTag;
         return switch (tag) {
             .macos => if (MacOS != void) macos: {
                 const config = c_platform.macos;
@@ -664,13 +665,13 @@ pub const RenderPresentedCallback = *const fn (?*anyopaque, u64) callconv(.c) vo
 
 const SurfaceActionLifetime = struct {
     const ReleasePauseForTesting = struct {
-        reached: *std.Thread.ResetEvent,
-        continue_release: *std.Thread.ResetEvent,
+        reached: *std.Io.Event,
+        continue_release: *std.Io.Event,
     };
 
     references: std.atomic.Value(usize) = .{ .raw = 1 },
-    mutex: std.Thread.Mutex = .{},
-    drained: std.Thread.Condition = .{},
+    mutex: std.Io.Mutex = .init,
+    drained: std.Io.Condition = .init,
     active_actions: usize = 0,
     active_thread: ?std.Thread.Id = null,
     teardown_started: bool = false,
@@ -678,8 +679,8 @@ const SurfaceActionLifetime = struct {
         if (builtin.is_test) null else {},
 
     fn retain(self: *SurfaceActionLifetime) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(global.io());
+        defer self.mutex.unlock(global.io());
 
         assert(!self.teardown_started);
         const current_thread = std.Thread.getCurrentId();
@@ -701,21 +702,21 @@ const SurfaceActionLifetime = struct {
     /// the current host callback must continue immediately to avoid deadlock;
     /// that callback's lease still keeps the outer allocation alive.
     fn waitForActionsBeforeTeardown(self: *SurfaceActionLifetime) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(global.io());
+        defer self.mutex.unlock(global.io());
 
         self.teardown_started = true;
         const current_thread = std.Thread.getCurrentId();
         while (self.active_actions > 0 and
             self.active_thread.? != current_thread)
         {
-            self.drained.wait(&self.mutex);
+            self.drained.waitUncancelable(global.io(), &self.mutex);
         }
     }
 
     /// Returns true when an action released the final allocation reference.
     fn releaseAction(self: *SurfaceActionLifetime) bool {
-        self.mutex.lock();
+        self.mutex.lockUncancelable(global.io());
         assert(self.active_actions > 0);
         assert(self.active_thread.? == std.Thread.getCurrentId());
 
@@ -728,17 +729,17 @@ const SurfaceActionLifetime = struct {
 
         if (builtin.is_test) {
             if (self.release_pause_for_testing) |pause| {
-                pause.reached.set();
-                pause.continue_release.wait();
+                pause.reached.set(global.io());
+                pause.continue_release.waitUncancelable(global.io());
             }
         }
 
         self.active_actions -= 1;
         if (self.active_actions == 0) {
             self.active_thread = null;
-            self.drained.broadcast();
+            self.drained.broadcast(global.io());
         }
-        self.mutex.unlock();
+        self.mutex.unlock(global.io());
 
         return previous == 1;
     }
@@ -949,16 +950,16 @@ pub const Surface = struct {
         if (opts.working_directory) |c_wd| {
             const wd = std.mem.sliceTo(c_wd, 0);
             if (wd.len > 0) wd: {
-                var dir = std.fs.openDirAbsolute(wd, .{}) catch |err| {
+                var dir = std.Io.Dir.openDirAbsolute(global.io(), wd, .{}) catch |err| {
                     log.warn(
                         "error opening requested working directory dir={s} err={}",
                         .{ wd, err },
                     );
                     break :wd;
                 };
-                defer dir.close();
+                defer dir.close(global.io());
 
-                const stat = dir.stat() catch |err| {
+                const stat = dir.stat(global.io()) catch |err| {
                     log.warn(
                         "failed to stat requested working directory dir={s} err={}",
                         .{ wd, err },
@@ -1594,32 +1595,32 @@ pub const Surface = struct {
         };
     }
 
-    pub fn defaultTermioEnv(self: *const Surface) !std.process.EnvMap {
-        const alloc = self.app.core_app.alloc;
-        var env = try internal_os.getEnvMap(alloc);
+    pub fn defaultTermioEnv(self: *const Surface) !std.process.Environ.Map {
+        _ = self;
+        var env = try global.environMap();
         errdefer env.deinit();
 
         if (comptime builtin.target.os.tag.isDarwin()) {
             if (env.get("__XCODE_BUILT_PRODUCTS_DIR_PATHS") != null) {
-                env.remove("__XCODE_BUILT_PRODUCTS_DIR_PATHS");
-                env.remove("__XPC_DYLD_LIBRARY_PATH");
-                env.remove("DYLD_FRAMEWORK_PATH");
-                env.remove("DYLD_INSERT_LIBRARIES");
-                env.remove("DYLD_LIBRARY_PATH");
-                env.remove("LD_LIBRARY_PATH");
-                env.remove("SECURITYSESSIONID");
-                env.remove("XPC_SERVICE_NAME");
+                _ = env.orderedRemove("__XCODE_BUILT_PRODUCTS_DIR_PATHS");
+                _ = env.orderedRemove("__XPC_DYLD_LIBRARY_PATH");
+                _ = env.orderedRemove("DYLD_FRAMEWORK_PATH");
+                _ = env.orderedRemove("DYLD_INSERT_LIBRARIES");
+                _ = env.orderedRemove("DYLD_LIBRARY_PATH");
+                _ = env.orderedRemove("LD_LIBRARY_PATH");
+                _ = env.orderedRemove("SECURITYSESSIONID");
+                _ = env.orderedRemove("XPC_SERVICE_NAME");
             }
 
             // Remove this so that running `ghostty` within Ghostty works.
-            env.remove("GHOSTTY_MAC_LAUNCH_SOURCE");
+            _ = env.orderedRemove("GHOSTTY_MAC_LAUNCH_SOURCE");
 
             // If we were launched from the desktop then we want to
             // remove the LANGUAGE env var so that we don't inherit
             // our translation settings for Ghostty. If we aren't from
             // the desktop then we didn't set our LANGUAGE var so we
             // don't need to remove it.
-            if (internal_os.launchedFromDesktop()) env.remove("LANGUAGE");
+            if (internal_os.launchedFromDesktop()) _ = env.orderedRemove("LANGUAGE");
         }
 
         return env;
@@ -1666,31 +1667,31 @@ test "surface teardown waits for a cross-thread action lease" {
     {
         const Context = struct {
             lifetime: *Lifetime,
-            action_ready: std.Thread.ResetEvent = .{},
-            allow_action_return: std.Thread.ResetEvent = .{},
-            action_finished: std.Thread.ResetEvent = .{},
-            release_action_reached: std.Thread.ResetEvent = .{},
-            allow_release_completion: std.Thread.ResetEvent = .{},
-            teardown_started: std.Thread.ResetEvent = .{},
-            teardown_finished: std.Thread.ResetEvent = .{},
+            action_ready: std.Io.Event = .unset,
+            allow_action_return: std.Io.Event = .unset,
+            action_finished: std.Io.Event = .unset,
+            release_action_reached: std.Io.Event = .unset,
+            allow_release_completion: std.Io.Event = .unset,
+            teardown_started: std.Io.Event = .unset,
+            teardown_finished: std.Io.Event = .unset,
             action_released_final: std.atomic.Value(bool) = .{ .raw = true },
 
             fn runAction(self: *@This()) void {
                 self.lifetime.retain();
-                self.action_ready.set();
-                self.allow_action_return.wait();
+                self.action_ready.set(global.io());
+                self.allow_action_return.waitUncancelable(global.io());
                 self.action_released_final.store(
                     self.lifetime.releaseAction(),
                     .release,
                 );
-                self.action_finished.set();
+                self.action_finished.set(global.io());
             }
 
             fn runTeardown(self: *@This()) void {
-                self.action_ready.wait();
-                self.teardown_started.set();
+                self.action_ready.waitUncancelable(global.io());
+                self.teardown_started.set(global.io());
                 self.lifetime.waitForActionsBeforeTeardown();
-                self.teardown_finished.set();
+                self.teardown_finished.set(global.io());
             }
         };
 
@@ -1704,24 +1705,30 @@ test "surface teardown waits for a cross-thread action lease" {
         defer action_thread.join();
         const teardown_thread = try std.Thread.spawn(.{}, Context.runTeardown, .{&context});
         defer teardown_thread.join();
-        defer context.allow_action_return.set();
-        defer context.allow_release_completion.set();
+        defer context.allow_action_return.set(global.io());
+        defer context.allow_release_completion.set(global.io());
 
-        context.teardown_started.wait();
+        context.teardown_started.waitUncancelable(global.io());
         try std.testing.expectError(
             error.Timeout,
-            context.teardown_finished.timedWait(20 * std.time.ns_per_ms),
+            context.teardown_finished.waitTimeout(global.io(), .{ .duration = .{
+                .clock = .awake,
+                .raw = .fromMilliseconds(20),
+            } }),
         );
 
-        context.allow_action_return.set();
-        context.release_action_reached.wait();
+        context.allow_action_return.set(global.io());
+        context.release_action_reached.waitUncancelable(global.io());
         try std.testing.expectError(
             error.Timeout,
-            context.teardown_finished.timedWait(100 * std.time.ns_per_ms),
+            context.teardown_finished.waitTimeout(global.io(), .{ .duration = .{
+                .clock = .awake,
+                .raw = .fromMilliseconds(100),
+            } }),
         );
-        context.allow_release_completion.set();
-        context.teardown_finished.wait();
-        context.action_finished.wait();
+        context.allow_release_completion.set(global.io());
+        context.teardown_finished.waitUncancelable(global.io());
+        context.action_finished.waitUncancelable(global.io());
         try std.testing.expect(
             !context.action_released_final.load(.acquire),
         );
@@ -1780,7 +1787,7 @@ pub const Inspector = struct {
     content_scale: f64 = 1,
 
     /// Our previous instant used to calculate delta time for animations.
-    instant: ?std.time.Instant = null,
+    instant: ?std.Io.Timestamp = null,
 
     const Backend = enum {
         metal,
@@ -2009,9 +2016,9 @@ pub const Inspector = struct {
         const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
 
         // Determine our delta time
-        const now = try std.time.Instant.now();
+        const now: std.Io.Timestamp = .now(global.io(), .awake);
         io.DeltaTime = if (self.instant) |prev| delta: {
-            const since_ns: f64 = @floatFromInt(now.since(prev));
+            const since_ns: f64 = @floatFromInt(prev.durationTo(now).toNanoseconds());
             const ns_per_s: f64 = @floatFromInt(std.time.ns_per_s);
             const since_s: f32 = @floatCast(since_ns / ns_per_s);
             break :delta @max(0.00001, since_s);
@@ -2022,8 +2029,6 @@ pub const Inspector = struct {
 
 // C API
 pub const CAPI = struct {
-    const global = &@import("../global.zig").state;
-
     /// This is the same as Surface.KeyEvent but this is the raw C API version.
     const KeyEvent = extern struct {
         action: input.Action,
@@ -2154,7 +2159,7 @@ pub const CAPI = struct {
 
         pub fn deinit(self: *Text) void {
             if (self.text) |ptr| {
-                global.alloc.free(ptr[0..self.text_len :0]);
+                global.alloc().free(ptr[0..self.text_len :0]);
             }
         }
     };
@@ -2264,12 +2269,12 @@ pub const CAPI = struct {
         opts: *const apprt.runtime.App.Options,
         config: *const Config,
     ) !*App {
-        const core_app = try CoreApp.create(global.alloc);
+        const core_app = try CoreApp.create(global.alloc());
         errdefer core_app.destroy();
 
         // Create our runtime app
-        var app = try global.alloc.create(App);
-        errdefer global.alloc.destroy(app);
+        var app = try global.alloc().create(App);
+        errdefer global.alloc().destroy(app);
         try app.init(core_app, config, opts.*);
         errdefer app.terminate();
 
@@ -2292,7 +2297,7 @@ pub const CAPI = struct {
     export fn ghostty_app_free(v: *App) void {
         const core_app = v.core_app;
         v.terminate();
-        global.alloc.destroy(v);
+        global.alloc().destroy(v);
         core_app.destroy();
     }
 
@@ -2374,13 +2379,7 @@ pub const CAPI = struct {
 
     /// Update the color scheme of the app.
     export fn ghostty_app_set_color_scheme(v: *App, scheme_raw: c_int) void {
-        const scheme = std.meta.intToEnum(apprt.ColorScheme, scheme_raw) catch {
-            log.warn(
-                "invalid color scheme to ghostty_surface_set_color_scheme value={}",
-                .{scheme_raw},
-            );
-            return;
-        };
+        const scheme = std.enums.fromInt(apprt.ColorScheme, scheme_raw) orelse return;
 
         v.core_app.colorSchemeEvent(v, scheme) catch |err| {
             log.err("error setting color scheme err={}", .{err});
@@ -2758,8 +2757,8 @@ pub const CAPI = struct {
         result: *Text,
     ) bool {
         const core_surface = &surface.core_surface;
-        core_surface.renderer_state.mutex.lock();
-        defer core_surface.renderer_state.mutex.unlock();
+        core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer core_surface.renderer_state.mutex.unlock(global.io());
 
         // If we don't have a selection, do nothing.
         const core_sel = core_surface.io.terminal.screens.active.selection orelse return false;
@@ -2776,8 +2775,8 @@ pub const CAPI = struct {
         result: *Text,
     ) bool {
         const core_surface = &surface.core_surface;
-        core_surface.renderer_state.lockDemand();
-        defer core_surface.renderer_state.unlockDemand();
+        core_surface.renderer_state.lockDemand(global.io());
+        defer core_surface.renderer_state.unlockDemand(global.io());
 
         const core_sel = core_surface.io.terminal.screens.active.selection orelse
             return false;
@@ -2808,8 +2807,8 @@ pub const CAPI = struct {
         sel: Selection,
         result: *Text,
     ) bool {
-        surface.core_surface.renderer_state.mutex.lock();
-        defer surface.core_surface.renderer_state.mutex.unlock();
+        surface.core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer surface.core_surface.renderer_state.mutex.unlock(global.io());
 
         const core_sel = sel.core(
             surface.core_surface.renderer_state.terminal.screens.active,
@@ -2827,8 +2826,8 @@ pub const CAPI = struct {
         max_bytes: usize,
         result: *Text,
     ) bool {
-        surface.core_surface.renderer_state.mutex.lock();
-        defer surface.core_surface.renderer_state.mutex.unlock();
+        surface.core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer surface.core_surface.renderer_state.mutex.unlock(global.io());
 
         if (top_y > bottom_y) return false;
 
@@ -2855,8 +2854,8 @@ pub const CAPI = struct {
         max_bytes: usize,
         result: *Text,
     ) bool {
-        surface.core_surface.renderer_state.mutex.lock();
-        defer surface.core_surface.renderer_state.mutex.unlock();
+        surface.core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer surface.core_surface.renderer_state.mutex.unlock(global.io());
 
         return readScreenTailVTLocked(surface, max_rows, max_bytes, result);
     }
@@ -2870,8 +2869,8 @@ pub const CAPI = struct {
         result: *Text,
         next_sequence: *u64,
     ) bool {
-        surface.core_surface.renderer_state.mutex.lock();
-        defer surface.core_surface.renderer_state.mutex.unlock();
+        surface.core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer surface.core_surface.renderer_state.mutex.unlock(global.io());
 
         const snapshot_succeeded = readScreenTailVTLocked(
             surface,
@@ -2907,17 +2906,17 @@ pub const CAPI = struct {
             opts,
         );
 
-        const scratch = global.alloc.alloc(u8, max_bytes) catch |err| {
+        const scratch = global.alloc().alloc(u8, max_bytes) catch |err| {
             log.warn("error allocating bounded screen tail buffer err={}", .{err});
             return false;
         };
-        defer global.alloc.free(scratch);
+        defer global.alloc().free(scratch);
 
         const formatted = formatter.formatTailBounded(scratch, max_rows) catch |err| {
             log.warn("error formatting bounded screen tail err={}", .{err});
             return false;
         };
-        const owned = global.alloc.dupeZ(u8, formatted) catch |err| {
+        const owned = global.alloc().dupeZ(u8, formatted) catch |err| {
             log.warn("error allocating bounded screen tail result err={}", .{err});
             return false;
         };
@@ -2952,7 +2951,7 @@ pub const CAPI = struct {
 
         // Get our text directly from the core surface.
         const text = core_surface.dumpTextLocked(
-            global.alloc,
+            global.alloc(),
             core_sel,
         ) catch |err| {
             log.warn("error reading text err={}", .{err});
@@ -3014,18 +3013,18 @@ pub const CAPI = struct {
         );
         formatter.content = .{ .selection = core_sel };
 
-        const scratch = global.alloc.alloc(u8, max_bytes) catch |err| {
+        const scratch = global.alloc().alloc(u8, max_bytes) catch |err| {
             log.warn("error allocating bounded clipboard text buffer err={}", .{err});
             return false;
         };
-        defer global.alloc.free(scratch);
+        defer global.alloc().free(scratch);
 
         var writer = std.Io.Writer.fixed(scratch);
         formatter.format(&writer) catch |err| {
             log.warn("error formatting clipboard text err={}", .{err});
             return false;
         };
-        const formatted = global.alloc.dupeZ(u8, writer.buffered()) catch |err| {
+        const formatted = global.alloc().dupeZ(u8, writer.buffered()) catch |err| {
             log.warn("error allocating clipboard text err={}", .{err});
             return false;
         };
@@ -3115,8 +3114,8 @@ pub const CAPI = struct {
         surface: *Surface,
         result: *SurfaceGridMetrics,
     ) bool {
-        surface.core_surface.renderer_state.lockDemand();
-        defer surface.core_surface.renderer_state.unlockDemand();
+        surface.core_surface.renderer_state.lockDemand(global.io());
+        defer surface.core_surface.renderer_state.unlockDemand(global.io());
         const screen = surface.core_surface
             .renderer_state
             .terminal
@@ -3180,8 +3179,8 @@ pub const CAPI = struct {
         result: *SurfaceScrollbar,
     ) bool {
         const core_surface = &surface.core_surface;
-        core_surface.renderer_state.lockDemand();
-        defer core_surface.renderer_state.unlockDemand();
+        core_surface.renderer_state.lockDemand(global.io());
+        defer core_surface.renderer_state.unlockDemand(global.io());
 
         const screens = &core_surface.renderer_state.terminal.screens;
         const screen_key = screens.active_key;
@@ -3362,7 +3361,7 @@ pub const CAPI = struct {
 
         var next = style;
         next.id = @intCast(styles.items.len);
-        try styles.append(global.alloc, next);
+        try styles.append(global.alloc(), next);
         return next.id;
     }
 
@@ -3382,7 +3381,7 @@ pub const CAPI = struct {
         const background_semantics: RenderGridColorSemantics = switch (cell.content_tag) {
             .bg_color_palette => .{
                 .source = .palette,
-                .palette_index = cell.content.color_palette,
+                .palette_index = cell.content.color_palette.data,
             },
             .bg_color_rgb => .{ .source = .rgb },
             else => renderGridColorSemantics(style.bg_color),
@@ -3508,7 +3507,7 @@ pub const CAPI = struct {
         include_theme: bool,
         anchor_active: bool,
     ) !String {
-        const alloc = global.alloc;
+        const alloc = global.alloc();
         const core_surface = &surface.core_surface;
         var config_background: terminal.color.RGB = undefined;
         var config_foreground: terminal.color.RGB = undefined;
@@ -3518,8 +3517,8 @@ pub const CAPI = struct {
         var config_selection_foreground: ?configpkg.Config.TerminalColor = null;
         var bold_color: ?terminal.Style.BoldColor = null;
         {
-            core_surface.renderer.draw_mutex.lock();
-            defer core_surface.renderer.draw_mutex.unlock();
+            core_surface.renderer.draw_mutex.lockUncancelable(global.io());
+            defer core_surface.renderer.draw_mutex.unlock(global.io());
             const config = &core_surface.renderer.config;
             config_background = config.background;
             config_foreground = config.foreground;
@@ -3573,8 +3572,8 @@ pub const CAPI = struct {
         var row_space_revision: u64 = 0;
 
         {
-            core_surface.renderer_state.mutex.lock();
-            defer core_surface.renderer_state.mutex.unlock();
+            core_surface.renderer_state.mutex.lockUncancelable(global.io());
+            defer core_surface.renderer_state.mutex.unlock(global.io());
 
             const t: *terminal.Terminal = core_surface.renderer_state.terminal;
             const s: *terminal.Screen = t.screens.active;
@@ -4114,14 +4113,7 @@ pub const CAPI = struct {
 
     /// Update the color scheme of the surface.
     export fn ghostty_surface_set_color_scheme(surface: *Surface, scheme_raw: c_int) void {
-        const scheme = std.meta.intToEnum(apprt.ColorScheme, scheme_raw) catch {
-            log.warn(
-                "invalid color scheme to ghostty_surface_set_color_scheme value={}",
-                .{scheme_raw},
-            );
-            return;
-        };
-
+        const scheme = std.enums.fromInt(apprt.ColorScheme, scheme_raw) orelse return;
         surface.colorSchemeCallback(scheme);
     }
 
@@ -4349,17 +4341,7 @@ pub const CAPI = struct {
         stage_raw: u32,
         pressure: f64,
     ) void {
-        const stage = std.meta.intToEnum(
-            input.MousePressureStage,
-            stage_raw,
-        ) catch {
-            log.warn(
-                "invalid mouse pressure stage value={}",
-                .{stage_raw},
-            );
-            return;
-        };
-
+        const stage = std.enums.fromInt(input.MousePressureStage, stage_raw) orelse return;
         surface.mousePressureCallback(stage, pressure);
     }
 
@@ -4643,8 +4625,8 @@ pub const CAPI = struct {
             // read the font face. It should not be deferred since
             // we're loading the primary face.
             const grid = ptr.core_surface.renderer.font_grid;
-            grid.lock.lockShared();
-            defer grid.lock.unlockShared();
+            grid.lock.lockSharedUncancelable(global.io());
+            defer grid.lock.unlockShared(global.io());
 
             const collection = &grid.resolver.collection;
             const face = collection.getFace(.{}) catch return null;
@@ -4681,8 +4663,8 @@ pub const CAPI = struct {
             result: *Text,
         ) bool {
             const surface = &ptr.core_surface;
-            surface.renderer_state.mutex.lock();
-            defer surface.renderer_state.mutex.unlock();
+            surface.renderer_state.mutex.lockUncancelable(global.io());
+            defer surface.renderer_state.mutex.unlock(global.io());
 
             // Get our word selection
             const sel = sel: {
@@ -4755,7 +4737,7 @@ test "output sequence publishes only with successful VT tail snapshot" {
 test "clipboard selection work budget rejects blank history" {
     const testing = std.testing;
     const alloc = testing.allocator;
-    var term = try terminal.Terminal.init(alloc, .{
+    var term = try terminal.Terminal.init(std.testing.io, alloc, .{
         .cols = 4,
         .rows = 2,
     });
@@ -4785,7 +4767,7 @@ test "clipboard selection work budget rejects blank history" {
 test "grid metrics reject resize skew and report an offscreen cursor" {
     const testing = std.testing;
     const alloc = testing.allocator;
-    var term = try terminal.Terminal.init(alloc, .{
+    var term = try terminal.Terminal.init(std.testing.io, alloc, .{
         .cols = 10,
         .rows = 2,
     });
@@ -4837,7 +4819,7 @@ test "grid metrics reject resize skew and report an offscreen cursor" {
 test "grid metrics canonicalize a wide-tail cursor" {
     const testing = std.testing;
     const alloc = testing.allocator;
-    var term = try terminal.Terminal.init(alloc, .{
+    var term = try terminal.Terminal.init(std.testing.io, alloc, .{
         .cols = 6,
         .rows = 2,
     });
@@ -4870,7 +4852,7 @@ test "grid metrics canonicalize a wide-tail cursor" {
 test "grid metrics resolve a spacer-head cursor to its wrapped glyph" {
     const testing = std.testing;
     const alloc = testing.allocator;
-    var term = try terminal.Terminal.init(alloc, .{
+    var term = try terminal.Terminal.init(std.testing.io, alloc, .{
         .cols = 4,
         .rows = 3,
     });

@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 const macos = @import("macos");
 const objc = @import("objc");
 const math = @import("../../math.zig");
+const global = @import("../../global.zig");
 
 const mtl = @import("api.zig");
 const Pipeline = @import("Pipeline.zig");
@@ -76,22 +77,16 @@ const PipelineDescription = struct {
 
 /// We create a type for the pipeline collection based on our desc array.
 const PipelineCollection = t: {
-    var fields: [pipeline_descs.len]std.builtin.Type.StructField = undefined;
-    for (pipeline_descs, 0..) |pipeline, i| {
-        fields[i] = .{
-            .name = pipeline[0],
-            .type = Pipeline,
-            .default_value_ptr = null,
-            .is_comptime = false,
-            .alignment = @alignOf(Pipeline),
-        };
+    const StructField = std.builtin.Type.StructField;
+
+    var names: [pipeline_descs.len][]const u8 = undefined;
+    var types = [_]type{Pipeline} ** pipeline_descs.len;
+    var attrs = [_]StructField.Attributes{.{ .@"align" = @alignOf(Pipeline) }} ** pipeline_descs.len;
+
+    for (pipeline_descs, &names) |pipeline, *name| {
+        name.* = pipeline[0];
     }
-    break :t @Type(.{ .@"struct" = .{
-        .layout = .auto,
-        .fields = &fields,
-        .decls = &.{},
-        .is_tuple = false,
-    } });
+    break :t @Struct(.auto, null, &names, &types, &attrs);
 };
 
 /// This contains the state for the shaders used by the Metal renderer.
@@ -235,7 +230,7 @@ const SharedStandardShaders = struct {
 };
 
 const shared_standard_allocator = std.heap.c_allocator;
-var shared_standard_mutex: std.Thread.Mutex = .{};
+var shared_standard_mutex: std.Io.Mutex = .init;
 var shared_standard_entries: std.ArrayListUnmanaged(*SharedStandardShaders) = .empty;
 var shared_standard_build_count = std.atomic.Value(usize).init(0);
 
@@ -253,8 +248,8 @@ fn initSharedStandard(
     // process-wide compiler state even after duplicate pipelines are
     // released. Serialize cache misses so concurrent surface initialization
     // cannot compile the same standard pipeline collection more than once.
-    shared_standard_mutex.lock();
-    defer shared_standard_mutex.unlock();
+    shared_standard_mutex.lockUncancelable(global.io());
+    defer shared_standard_mutex.unlock(global.io());
 
     if (findSharedStandardLocked(key)) |entry| {
         entry.references += 1;
@@ -310,8 +305,8 @@ fn shadersFromSharedStandard(entry: *SharedStandardShaders) Shaders {
 }
 
 fn releaseSharedStandard(entry: *SharedStandardShaders) void {
-    shared_standard_mutex.lock();
-    defer shared_standard_mutex.unlock();
+    shared_standard_mutex.lockUncancelable(global.io());
+    defer shared_standard_mutex.unlock(global.io());
 
     std.debug.assert(entry.references > 0);
     entry.references -= 1;
@@ -323,8 +318,8 @@ fn releaseSharedStandard(entry: *SharedStandardShaders) void {
 }
 
 fn clearSharedStandardCacheForTesting() void {
-    shared_standard_mutex.lock();
-    defer shared_standard_mutex.unlock();
+    shared_standard_mutex.lockUncancelable(global.io());
+    defer shared_standard_mutex.unlock(global.io());
 
     for (shared_standard_entries.items) |entry| {
         std.debug.assert(entry.references == 0);
@@ -463,8 +458,8 @@ test "standard shaders reuse pipeline state across surfaces and restores" {
     }
 
     clearSharedStandardCacheForTesting();
-    shared_standard_mutex.lock();
-    defer shared_standard_mutex.unlock();
+    shared_standard_mutex.lockUncancelable(global.io());
+    defer shared_standard_mutex.unlock(global.io());
     try testing.expectEqual(@as(usize, 0), shared_standard_entries.items.len);
 }
 
@@ -477,13 +472,13 @@ test "concurrent standard shader initialization compiles once" {
     defer device.release();
 
     const Context = struct {
-        start: *std.Thread.ResetEvent,
+        start: *std.Io.Event,
         device: objc.Object,
         shaders: ?Shaders = null,
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {
-            self.start.wait();
+            self.start.waitUncancelable(global.io());
             self.shaders = Shaders.init(
                 std.heap.c_allocator,
                 self.device,
@@ -497,7 +492,7 @@ test "concurrent standard shader initialization compiles once" {
     };
 
     const thread_count = 5;
-    var start: std.Thread.ResetEvent = .{};
+    var start: std.Io.Event = .unset;
     var contexts: [thread_count]Context = undefined;
     var threads: [thread_count]std.Thread = undefined;
 
@@ -510,7 +505,7 @@ test "concurrent standard shader initialization compiles once" {
         thread.* = try std.Thread.spawn(.{}, Context.run, .{context});
     }
 
-    start.set();
+    start.set(global.io());
     for (&threads) |*thread| thread.join();
 
     defer {
@@ -641,7 +636,7 @@ pub const BgImage = extern struct {
 
 /// Initialize the MTLLibrary. A MTLLibrary is a collection of shaders.
 fn initLibrary(device: objc.Object) !objc.Object {
-    const start = try std.time.Instant.now();
+    const start: std.Io.Timestamp = .now(global.io(), .awake);
 
     const data = try macos.dispatch.Data.create(
         @embedFile("ghostty_metallib"),
@@ -661,8 +656,7 @@ fn initLibrary(device: objc.Object) !objc.Object {
     );
     try checkError(err);
 
-    const end = try std.time.Instant.now();
-    log.debug("shader library loaded time={}us", .{end.since(start) / std.time.ns_per_us});
+    log.debug("shader library loaded time={}us", .{start.untilNow(global.io(), .awake).toMicroseconds()});
 
     return library;
 }
