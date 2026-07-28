@@ -2035,6 +2035,15 @@ test "renderer realization retries coalesce with bounded backoff" {
     );
 }
 
+test "external renderer retry timer is handed to loop owner once" {
+    var handoff: RendererRealizedRetryTimerHandoff = .{};
+
+    handoff.publish(250);
+
+    try std.testing.expectEqual(@as(?u64, 250), handoff.take());
+    try std.testing.expectEqual(@as(?u64, null), handoff.take());
+}
+
 test "synchronous presentation is delivered after thread draw cleanup" {
     const Event = enum { begin, renderer_cleanup, end, callback };
     const State = struct {
