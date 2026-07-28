@@ -213,8 +213,15 @@ pub fn invalidateSurfaceUpdates(self: *IOSurfaceLayer) void {
 /// main-queue ordering clears earlier assignments without synchronously
 /// waiting on AppKit while it may be joining the renderer thread.
 pub fn clearSurface(self: *IOSurfaceLayer) void {
+    const surface: *IOSurface = @ptrCast(self.layer.getProperty(
+        ?*anyopaque,
+        "contents",
+    ) orelse return);
+    surface.retain();
+
     var block = ClearSurfaceBlock.init(.{
         .layer = self.layer.value,
+        .surface = surface,
     }, &clearSurfaceCallback);
 
     const NSThread = objc.getClass("NSThread").?;
@@ -263,6 +270,7 @@ const InvalidateSurfaceUpdatesBlock = objc.Block(struct {
 
 const ClearSurfaceBlock = objc.Block(struct {
     layer: objc.c.id,
+    surface: *IOSurface,
 }, .{}, void);
 
 fn setSurfaceCallback(
@@ -338,6 +346,7 @@ fn invalidateSurfaceUpdatesCallback(
 fn clearSurfaceCallback(
     block: *const ClearSurfaceBlock.Context,
 ) callconv(.c) void {
+    defer block.surface.release();
     const layer = objc.Object.fromId(block.layer);
     layer.setProperty("contents", @as(?*anyopaque, null));
 }
@@ -486,11 +495,55 @@ test "clear surface drops displayed IOSurface without disabling future updates" 
         layer.layer.getProperty(?*anyopaque, "contents") != null,
     );
 
-    layer.clearSurface();
+    surface.retain();
+    var block = ClearSurfaceBlock.init(.{
+        .layer = layer.layer.value,
+        .surface = surface,
+    }, &clearSurfaceCallback);
+    clearSurfaceCallback(&block);
 
     try testing.expectEqual(
         @as(?*anyopaque, null),
         layer.layer.getProperty(?*anyopaque, "contents"),
     );
     try testing.expect(layer.surfaceUpdatesActive());
+}
+
+test "deferred clear preserves a newer IOSurface" {
+    const testing = std.testing;
+
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    var old_surface = try IOSurface.init(.{
+        .width = 1,
+        .height = 1,
+        .pixel_format = .@"32BGRA",
+        .bytes_per_element = 4,
+        .colorspace = null,
+    });
+    defer old_surface.deinit();
+    var new_surface = try IOSurface.init(.{
+        .width = 1,
+        .height = 1,
+        .pixel_format = .@"32BGRA",
+        .bytes_per_element = 4,
+        .colorspace = null,
+    });
+    defer new_surface.deinit();
+
+    layer.setSurfaceSync(old_surface);
+    old_surface.retain();
+    var block = ClearSurfaceBlock.init(.{
+        .layer = layer.layer.value,
+        .surface = old_surface,
+    }, &clearSurfaceCallback);
+
+    layer.setSurfaceSync(new_surface);
+    clearSurfaceCallback(&block);
+
+    const contents = layer.layer.getProperty(?*anyopaque, "contents");
+    try testing.expectEqual(
+        @intFromPtr(new_surface),
+        @intFromPtr(contents.?),
+    );
 }
