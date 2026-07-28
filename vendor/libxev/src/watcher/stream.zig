@@ -136,6 +136,166 @@ pub fn Stream(comptime xev: type, comptime T: type, comptime options: Options) t
     };
 }
 
+test "queued writes retain the head request during transient backpressure" {
+    const FakeXev = struct {
+        const Self = @This();
+
+        pub const dynamic = false;
+        pub const backend = Backend.kqueue;
+
+        pub const Backend = enum {
+            io_uring,
+            epoll,
+            kqueue,
+            wasi_poll,
+            iocp,
+        };
+
+        pub const CallbackAction = enum {
+            disarm,
+            rearm,
+        };
+
+        pub const WriteError = error{
+            BrokenPipe,
+            WouldBlock,
+        };
+
+        pub const WriteBuffer = union(enum) {
+            slice: []const u8,
+            array: struct {
+                array: [16]u8,
+                len: usize,
+            },
+        };
+
+        pub const Result = union(enum) {
+            write: WriteError!usize,
+        };
+
+        pub const Completion = struct {
+            op: union(enum) {
+                write: struct {
+                    fd: i32,
+                    buffer: WriteBuffer,
+                },
+            } = undefined,
+            userdata: ?*anyopaque = null,
+            callback: ?*const fn (
+                ?*anyopaque,
+                *Loop,
+                *Completion,
+                Result,
+            ) CallbackAction = null,
+            flags: struct {
+                threadpool: bool = false,
+                dup: bool = false,
+            } = .{},
+        };
+
+        pub const Loop = struct {
+            added: ?*Completion = null,
+            add_count: usize = 0,
+
+            pub fn add(self: *Loop, completion: *Completion) void {
+                self.added = completion;
+                self.add_count += 1;
+            }
+        };
+
+        pub const WriteRequest = Shared(Self).WriteRequest;
+        pub const WriteQueue = Shared(Self).WriteQueue;
+    };
+
+    const FakeStream = struct {
+        fd: i32,
+
+        fn initFd(fd: i32) @This() {
+            return .{ .fd = fd };
+        }
+
+        fn writeInit(
+            self: @This(),
+            completion: *FakeXev.Completion,
+            buffer: FakeXev.WriteBuffer,
+        ) void {
+            completion.* = .{
+                .op = .{
+                    .write = .{
+                        .fd = self.fd,
+                        .buffer = buffer,
+                    },
+                },
+            };
+        }
+    };
+
+    const CallbackState = struct {
+        calls: usize = 0,
+
+        fn callback(
+            state: ?*@This(),
+            _: *FakeXev.Loop,
+            _: *FakeXev.Completion,
+            _: FakeStream,
+            _: FakeXev.WriteBuffer,
+            result: FakeXev.WriteError!usize,
+        ) FakeXev.CallbackAction {
+            _ = result catch {};
+            state.?.calls += 1;
+            return .disarm;
+        }
+    };
+
+    const Writer = Writeable(
+        FakeXev,
+        FakeStream,
+        .{ .write = .write },
+    );
+
+    var loop: FakeXev.Loop = .{};
+    var write_queue: FakeXev.WriteQueue = .{};
+    var requests: [2]FakeXev.WriteRequest = undefined;
+    var callback_state: CallbackState = .{};
+    const writer: FakeStream = .{ .fd = 1 };
+
+    Writer.queueWrite(
+        writer,
+        &loop,
+        &write_queue,
+        &requests[0],
+        .{ .slice = "first" },
+        CallbackState,
+        &callback_state,
+        CallbackState.callback,
+    );
+    Writer.queueWrite(
+        writer,
+        &loop,
+        &write_queue,
+        &requests[1],
+        .{ .slice = "second" },
+        CallbackState,
+        &callback_state,
+        CallbackState.callback,
+    );
+
+    try std.testing.expectEqual(@as(usize, 1), loop.add_count);
+    try std.testing.expect(write_queue.head == &requests[0]);
+
+    const first_completion = loop.added.?;
+    _ = first_completion.callback.?(
+        first_completion.userdata,
+        &loop,
+        first_completion,
+        .{ .write = error.WouldBlock },
+    );
+
+    try std.testing.expectEqual(@as(usize, 0), callback_state.calls);
+    try std.testing.expect(write_queue.head == &requests[0]);
+    try std.testing.expect(loop.added == &requests[0].completion);
+}
+
 fn Pollable(comptime xev: type, comptime T: type, comptime options: Options) type {
     if (xev.dynamic) {
         // If all candidate backends do not support poll, our dynamic
