@@ -175,7 +175,12 @@ fn disposePresentedTarget(resource: anytype) void {
     // Release renderer ownership without making its IOSurface purgeable;
     // Core Animation's retained reference keeps the pixels valid until
     // the clear callback removes the layer contents.
-    resource.deinit();
+    const Resource = @TypeOf(resource.*);
+    if (comptime @hasDecl(Resource, "releasePresentationOwnership")) {
+        resource.releasePresentationOwnership();
+    } else {
+        resource.deinit();
+    }
 }
 
 pub fn Renderer(comptime GraphicsAPI: type) type {
