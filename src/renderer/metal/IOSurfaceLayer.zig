@@ -20,6 +20,11 @@ var surface_updates_active_sentinel: usize = 0;
 /// The underlying CALayer
 layer: objc.Object,
 
+/// Latest surface scheduled by the renderer. Its retain transfers to a clear
+/// block so the block can identify its assignment without reading mutable
+/// CALayer state from the renderer thread.
+scheduled_surface: ?*IOSurface = null,
+
 pub fn init() !IOSurfaceLayer {
     // The layer returned by `[CALayer layer]` is autoreleased, which means
     // that at the end of the current autorelease pool it will be deallocated
@@ -45,7 +50,26 @@ pub fn init() !IOSurfaceLayer {
 }
 
 pub fn release(self: *IOSurfaceLayer) void {
+    if (self.scheduled_surface) |surface| surface.release();
+    self.scheduled_surface = null;
     self.layer.release();
+}
+
+fn trackScheduledSurface(
+    self: *IOSurfaceLayer,
+    surface: *IOSurface,
+) void {
+    surface.retain();
+    if (self.scheduled_surface) |previous| previous.release();
+    self.scheduled_surface = surface;
+}
+
+/// Transfer the tracked retain to the clear block. A future assignment takes
+/// its own retain and remains distinguishable from this generation.
+fn takeScheduledSurface(self: *IOSurfaceLayer) ?*IOSurface {
+    const surface = self.scheduled_surface;
+    self.scheduled_surface = null;
+    return surface;
 }
 
 /// Detaches this layer from its host if its display callback still belongs to
@@ -128,6 +152,7 @@ pub fn prepareSurfaceWithPresentation(
     surface: *IOSurface,
     presentation: FramePresentation,
 ) PreparedSurfaceUpdate {
+    self.trackScheduledSurface(surface);
     surface.retain();
     return .{
         .layer = self.layer.retain(),
@@ -141,6 +166,7 @@ fn setSurface_(
     surface: *IOSurface,
     presentation: ?FramePresentation,
 ) !void {
+    self.trackScheduledSurface(surface);
     // We retain the surface to make sure it's not GC'd
     // before we can set it as the contents of the layer.
     //
@@ -215,11 +241,7 @@ pub fn invalidateSurfaceUpdates(self: *IOSurfaceLayer) void {
 /// thread. The captured IOSurface guard preserves a newer synchronous frame
 /// if realization races the queued clear.
 pub fn clearSurface(self: *IOSurfaceLayer) void {
-    const surface: *IOSurface = @ptrCast(self.layer.getProperty(
-        ?*anyopaque,
-        "contents",
-    ) orelse return);
-    surface.retain();
+    const surface = self.takeScheduledSurface() orelse return;
 
     var block = ClearSurfaceBlock.init(.{
         .layer = self.layer.value,
@@ -247,6 +269,7 @@ fn surfaceClearRunsInline(is_main_thread: bool) bool {
 ///
 /// Does not ensure this happens on the main thread.
 pub inline fn setSurfaceSync(self: *IOSurfaceLayer, surface: *IOSurface) void {
+    self.trackScheduledSurface(surface);
     self.layer.setProperty("contents", surface);
 }
 

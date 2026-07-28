@@ -1611,15 +1611,24 @@ fn rendererRealizedRetryCallback(
     _: *xev.Completion,
     result: xev.Timer.RunError!void,
 ) xev.CallbackAction {
+    const self = self_ orelse return .disarm;
     _ = result catch |err| switch (err) {
-        error.Canceled => return .disarm,
+        error.Canceled => {
+            _ = self.renderer_realized_retry.fired();
+            return .disarm;
+        },
         else => {
+            // Release the active-timer latch before rearming with the retained
+            // latest value. Otherwise one backend timer error would suppress
+            // every later renderer-realization retry.
+            if (self.renderer_realized_retry.fired()) |value| {
+                self.scheduleRendererRealizedRetry(value);
+            }
             log.warn("error in renderer realization retry timer err={}", .{err});
             return .disarm;
         },
     };
 
-    const self = self_ orelse return .disarm;
     const value = self.renderer_realized_retry.fired() orelse return .disarm;
     self.surface_state_requests.restoreRendererRealizedIfEmpty(value);
     self.wakeup.notify() catch |err| {
@@ -1892,6 +1901,12 @@ test "renderer realization retries coalesce with bounded backoff" {
 
     try testing.expectEqual(@as(?u64, 1_000), retry.failed(true));
     try testing.expectEqual(@as(?bool, true), retry.fired());
+    // A timer backend error consumes the active latch before the callback
+    // reschedules the retained value at the next paced delay.
+    try testing.expectEqual(@as(?u64, 2_000), retry.failed(true));
+    const failed_timer_value = retry.fired().?;
+    try testing.expectEqual(@as(?u64, 4_000), retry.failed(failed_timer_value));
+    _ = retry.fired();
     retry.resolved();
     try testing.expectEqual(@as(?u64, 250), retry.failed(true));
     _ = retry.fired();
