@@ -49,6 +49,16 @@ enum RendererTabVisibility {
     }
 }
 
+enum RendererReclamationRetry {
+    static func shouldRetry(
+        hasSurface: Bool,
+        releaseAccepted: @autoclosure () -> Bool
+    ) -> Bool {
+        guard hasSurface else { return false }
+        return !releaseAccepted()
+    }
+}
+
 /// A base class for windows that can contain Ghostty windows. This base class implements
 /// the bare minimum functionality that every terminal window in Ghostty should implement.
 ///
@@ -1491,7 +1501,10 @@ class BaseTerminalController: NSWindowController,
 
         var needsRetry = false
         for view in surfaceTree where !view.isWindowVisible {
-            if !view.setRendererRealized(false) {
+            if RendererReclamationRetry.shouldRetry(
+                hasSurface: view.surface != nil,
+                releaseAccepted: view.setRendererRealized(false)
+            ) {
                 needsRetry = true
             }
         }
