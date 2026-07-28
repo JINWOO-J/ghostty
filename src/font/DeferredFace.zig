@@ -167,7 +167,8 @@ pub fn familyName(self: DeferredFace, buf: []u8) ![]const u8 {
     return "";
 }
 
-/// Returns the name of this face in the caller-provided buffer.
+/// Returns the name of this face. The returned slice may use the
+/// caller-provided buffer or backend-owned storage.
 pub fn name(self: DeferredFace, buf: []u8) ![]const u8 {
     switch (options.backend) {
         .freetype => {},
