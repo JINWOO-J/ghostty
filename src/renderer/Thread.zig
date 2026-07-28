@@ -509,10 +509,23 @@ const RendererRealizedRetryState = struct {
     const initial_delay_ms = 250;
     const maximum_delay_ms = 4_000;
 
+    const Delivery = struct {
+        value: RendererRealizedRequest,
+        generation: u64,
+    };
+
     mutex: std.Thread.Mutex = .{},
-    value: ?RendererRealizedRequest = null,
+    value: ?Delivery = null,
     scheduled: bool = false,
     delay_ms: u64 = initial_delay_ms,
+    generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    /// Invalidate a claimed retry before publishing newer lock-free lifecycle
+    /// state. The later atomic state store either replaces an already-restored
+    /// retry or is observed by its conditional restoration.
+    fn published(self: *RendererRealizedRetryState) void {
+        _ = self.generation.fetchAdd(1, .acq_rel);
+    }
 
     /// Record a failed value and return the delay for a newly required timer.
     /// An already scheduled timer owns delivery of the coalesced latest value.
@@ -523,7 +536,31 @@ const RendererRealizedRetryState = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        self.value = value;
+        return self.failedLocked(.{
+            .value = value,
+            .generation = self.generation.load(.acquire),
+        });
+    }
+
+    /// Re-arm a timer backend failure only while its claimed lifecycle
+    /// generation is still authoritative.
+    fn failedIfCurrent(
+        self: *RendererRealizedRetryState,
+        delivery: Delivery,
+    ) ?u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (delivery.generation != self.generation.load(.acquire)) return null;
+        return self.failedLocked(delivery);
+    }
+
+    /// Caller holds `mutex`.
+    fn failedLocked(
+        self: *RendererRealizedRetryState,
+        delivery: Delivery,
+    ) ?u64 {
+        self.value = delivery;
         if (self.scheduled) return null;
 
         self.scheduled = true;
@@ -537,23 +574,40 @@ const RendererRealizedRetryState = struct {
     fn supersede(self: *RendererRealizedRetryState) void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        _ = self.generation.fetchAdd(1, .acq_rel);
         self.value = null;
     }
 
     fn resolved(self: *RendererRealizedRetryState) void {
         self.mutex.lock();
         defer self.mutex.unlock();
+        _ = self.generation.fetchAdd(1, .acq_rel);
         self.value = null;
         self.delay_ms = initial_delay_ms;
     }
 
-    fn fired(self: *RendererRealizedRetryState) ?RendererRealizedRequest {
+    fn fired(self: *RendererRealizedRetryState) ?Delivery {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.scheduled = false;
-        const value = self.value;
+        const delivery = self.value orelse return null;
         self.value = null;
-        return value;
+        return delivery;
+    }
+
+    /// Restore a claimed retry only if no newer lifecycle publication or
+    /// successful resolution has invalidated its generation.
+    fn restoreIfCurrent(
+        self: *RendererRealizedRetryState,
+        delivery: Delivery,
+        requests: *SurfaceStateRequests,
+    ) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (delivery.generation != self.generation.load(.acquire)) return false;
+        requests.restoreRendererRealizedIfEmpty(delivery.value);
+        return true;
     }
 };
 
@@ -932,10 +986,12 @@ pub fn publishVisible(self: *Thread, value: bool) void {
 }
 
 pub fn publishRendererRealized(self: *Thread, value: bool) void {
+    self.renderer_realized_retry.published();
     self.surface_state_requests.publishRendererRealized(value);
 }
 
 pub fn publishRendererRebuild(self: *Thread) void {
+    self.renderer_realized_retry.published();
     self.surface_state_requests.publishRendererRebuild();
 }
 
@@ -1693,6 +1749,22 @@ fn scheduleRendererRealizedRetry(
     value: RendererRealizedRequest,
 ) void {
     const delay_ms = self.renderer_realized_retry.failed(value) orelse return;
+    self.scheduleRendererRealizedRetryTimer(delay_ms);
+}
+
+fn scheduleRendererRealizedRetryDelivery(
+    self: *Thread,
+    delivery: RendererRealizedRetryState.Delivery,
+) void {
+    const delay_ms =
+        self.renderer_realized_retry.failedIfCurrent(delivery) orelse return;
+    self.scheduleRendererRealizedRetryTimer(delay_ms);
+}
+
+fn scheduleRendererRealizedRetryTimer(
+    self: *Thread,
+    delay_ms: u64,
+) void {
     if (self.externalDrainActive()) {
         self.renderer_realized_retry_timer_handoff.publish(delay_ms);
         self.wakeup.notify() catch |err| {
@@ -1739,16 +1811,19 @@ fn rendererRealizedRetryCallback(
             // Release the active-timer latch before rearming with the retained
             // latest value. Otherwise one backend timer error would suppress
             // every later renderer-realization retry.
-            if (self.renderer_realized_retry.fired()) |value| {
-                self.scheduleRendererRealizedRetry(value);
+            if (self.renderer_realized_retry.fired()) |delivery| {
+                self.scheduleRendererRealizedRetryDelivery(delivery);
             }
             log.warn("error in renderer realization retry timer err={}", .{err});
             return .disarm;
         },
     };
 
-    const value = self.renderer_realized_retry.fired() orelse return .disarm;
-    self.surface_state_requests.restoreRendererRealizedIfEmpty(value);
+    const delivery = self.renderer_realized_retry.fired() orelse return .disarm;
+    if (!self.renderer_realized_retry.restoreIfCurrent(
+        delivery,
+        &self.surface_state_requests,
+    )) return .disarm;
     self.wakeup.notify() catch |err| {
         log.warn("failed to notify renderer realization retry err={}", .{err});
     };
@@ -2047,27 +2122,27 @@ test "renderer realization retries coalesce with bounded backoff" {
     try testing.expectEqual(@as(?u64, 250), retry.failed(.realize));
     try testing.expectEqual(@as(?u64, null), retry.failed(.unrealize));
     try testing.expectEqual(
-        @as(?RendererRealizedRequest, .unrealize),
-        retry.fired(),
+        RendererRealizedRequest.unrealize,
+        retry.fired().?.value,
     );
 
     try testing.expectEqual(@as(?u64, 500), retry.failed(.realize));
     retry.supersede();
-    try testing.expectEqual(
-        @as(?RendererRealizedRequest, null),
-        retry.fired(),
-    );
+    try testing.expect(retry.fired() == null);
 
     try testing.expectEqual(@as(?u64, 1_000), retry.failed(.realize));
     try testing.expectEqual(
-        @as(?RendererRealizedRequest, .realize),
-        retry.fired(),
+        RendererRealizedRequest.realize,
+        retry.fired().?.value,
     );
     // A timer backend error consumes the active latch before the callback
     // reschedules the retained value at the next paced delay.
     try testing.expectEqual(@as(?u64, 2_000), retry.failed(.realize));
-    const failed_timer_value = retry.fired().?;
-    try testing.expectEqual(@as(?u64, 4_000), retry.failed(failed_timer_value));
+    const failed_timer_delivery = retry.fired().?;
+    try testing.expectEqual(
+        @as(?u64, 4_000),
+        retry.failedIfCurrent(failed_timer_delivery),
+    );
     _ = retry.fired();
     retry.resolved();
     try testing.expectEqual(@as(?u64, 250), retry.failed(.realize));
@@ -2101,7 +2176,7 @@ test "stale external renderer retry cannot override newer publication" {
     _ = retry.failed(.realize);
     const claimed = retry.fired().?;
 
-    retry.supersede();
+    retry.published();
     requests.publishRendererRealized(false);
     const newer = requests.take();
     try std.testing.expectEqual(
@@ -2109,6 +2184,10 @@ test "stale external renderer retry cannot override newer publication" {
         newer.renderer_realized,
     );
 
+    try std.testing.expectEqual(
+        @as(?u64, null),
+        retry.failedIfCurrent(claimed),
+    );
     try std.testing.expect(!retry.restoreIfCurrent(claimed, &requests));
     try std.testing.expectEqual(
         @as(?RendererRealizedRequest, null),
