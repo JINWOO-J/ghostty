@@ -2195,6 +2195,32 @@ test "stale external renderer retry cannot override newer publication" {
     );
 }
 
+test "claiming newer renderer request invalidates retry atomically" {
+    var retry: RendererRealizedRetryState = .{};
+    var requests: SurfaceStateRequests = .{};
+
+    // Request A was claimed and is still being applied when newer request B
+    // publishes. A then fails and samples B's current generation.
+    retry.published();
+    requests.publishRendererRealized(false);
+    _ = retry.failed(.realize);
+    const stale = retry.fired().?;
+
+    // The external queue claims B before the timer callback resumes. Claiming
+    // and invalidation must be one critical section so A cannot restore into
+    // the newly empty atomic slot.
+    const newer = retry.takeSurfaceState(&requests);
+    try std.testing.expectEqual(
+        RendererRealizedRequest.unrealize,
+        newer.renderer_realized,
+    );
+    try std.testing.expect(!retry.restoreIfCurrent(stale, &requests));
+    try std.testing.expectEqual(
+        @as(?RendererRealizedRequest, null),
+        requests.take().renderer_realized,
+    );
+}
+
 test "synchronous presentation is delivered after thread draw cleanup" {
     const Event = enum { begin, renderer_cleanup, end, callback };
     const State = struct {
