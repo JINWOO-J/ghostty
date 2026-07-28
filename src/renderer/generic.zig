@@ -64,6 +64,62 @@ const DrawDamageCommit = struct {
     }
 };
 
+/// Initialize a fixed frame array transactionally. A failed later frame must
+/// release every resource owned by the successfully initialized prefix before
+/// the caller retries swap-chain realization.
+fn initializeFrameStates(
+    frames: anytype,
+    api: anytype,
+    custom_shaders: bool,
+) !void {
+    var initialized: usize = 0;
+    errdefer for (frames[0..initialized]) |*frame| frame.deinit();
+
+    for (frames) |*frame| {
+        frame.* = try @TypeOf(frame.*).init(api, custom_shaders);
+        initialized += 1;
+    }
+}
+
+/// Own the graphics API's partial realization until the replacement renderer
+/// resources commit. Downstream failure rolls the API back to its logically
+/// unrealized state; success forces the cached CPU cells into the fresh swap
+/// chain even when synchronized output suppresses the terminal-state update.
+fn RendererRealization(comptime GraphicsAPI: type) type {
+    return struct {
+        const Realization = @This();
+
+        api: *GraphicsAPI,
+        cached_frame_redraw: *bool,
+        committed: bool = false,
+
+        fn begin(
+            api: *GraphicsAPI,
+            cached_frame_redraw: *bool,
+        ) !Realization {
+            if (@hasDecl(GraphicsAPI, "displayRealized")) {
+                try api.displayRealized();
+            }
+            return .{
+                .api = api,
+                .cached_frame_redraw = cached_frame_redraw,
+            };
+        }
+
+        fn commit(self: *Realization) void {
+            self.cached_frame_redraw.* = true;
+            self.committed = true;
+        }
+
+        fn deinit(self: *Realization) void {
+            if (self.committed) return;
+            if (@hasDecl(GraphicsAPI, "displayRealizedRollback")) {
+                self.api.displayRealizedRollback();
+            }
+        }
+    };
+}
+
 fn advanceShaperCellIndexToX(
     run_offset: usize,
     shaped_cells: []const font.shape.Cell,
@@ -114,6 +170,19 @@ fn advanceShaperCellIndexToX(
 ///
 /// [ Texture ] - An abstraction over a GPU texture.
 ///
+fn disposePresentedTarget(resource: anytype) void {
+    // A queued main-thread layer clear may still composite this target.
+    // Release renderer ownership without making its IOSurface purgeable;
+    // Core Animation's retained reference keeps the pixels valid until
+    // the clear callback removes the layer contents.
+    const Resource = @TypeOf(resource.*);
+    if (comptime @hasDecl(Resource, "releasePresentationOwnership")) {
+        resource.releasePresentationOwnership();
+    } else {
+        resource.deinit();
+    }
+}
+
 pub fn Renderer(comptime GraphicsAPI: type) type {
     return struct {
         const Self = @This();
@@ -128,6 +197,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         const shaderpkg = GraphicsAPI.shaders;
         const Shaders = shaderpkg.Shaders;
+
+        fn disposeOwned(resource: anytype, comptime purge: bool) void {
+            const Resource = @TypeOf(resource.*);
+            if (comptime purge and @hasDecl(Resource, "discard")) {
+                resource.discard();
+            } else {
+                resource.deinit();
+            }
+        }
 
         /// Allocator that can be used
         alloc: std.mem.Allocator,
@@ -311,19 +389,48 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             /// the renderer is deinited after that.
             defunct: bool = false,
 
+            const DrainedFrames = struct {
+                swap_chain: *SwapChain,
+                indices: [buf_count]usize = undefined,
+                count: usize = 0,
+
+                fn dispose(
+                    self: *DrainedFrames,
+                    comptime purge: bool,
+                ) void {
+                    for (self.indices[0..self.count]) |index| {
+                        self.swap_chain.frames[index]
+                            .deinitWithDisposition(purge);
+                    }
+                    self.count = 0;
+                }
+            };
+
             pub fn init(api: GraphicsAPI, custom_shaders: bool) !SwapChain {
                 var result: SwapChain = .{ .frames = undefined };
 
-                // Initialize all of our frame state.
-                for (&result.frames) |*frame| {
-                    frame.* = try FrameState.init(api, custom_shaders);
-                }
+                try initializeFrameStates(
+                    &result.frames,
+                    api,
+                    custom_shaders,
+                );
 
                 return result;
             }
 
             pub fn deinit(self: *SwapChain) void {
-                if (self.defunct) return;
+                var drained = self.drainForDeinit();
+                drained.dispose(false);
+            }
+
+            pub fn discard(self: *SwapChain) void {
+                var drained = self.drainForDeinit();
+                drained.dispose(true);
+            }
+
+            fn drainForDeinit(self: *SwapChain) DrainedFrames {
+                var drained: DrainedFrames = .{ .swap_chain = self };
+                if (self.defunct) return drained;
                 self.defunct = true;
                 self.leases.beginDeinit();
 
@@ -335,19 +442,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // slots still owned by the GPU or host. `defunct` is already
                 // set, so no new acquire races us.
                 if (comptime builtin.os.tag == .ios) {
-                    var acquired: usize = 0;
-                    while (acquired < buf_count) : (acquired += 1) {
+                    while (drained.count < buf_count) {
                         const index = self.leases.takeForDeinit(
                             frame_acquire_timeout_ns,
                         ) catch break;
-                        self.frames[index].deinit();
+                        drained.indices[drained.count] = index;
+                        drained.count += 1;
                     }
                 } else {
                     for (0..buf_count) |_| {
                         const index = self.leases.takeForDeinit(null) catch unreachable;
-                        self.frames[index].deinit();
+                        drained.indices[drained.count] = index;
+                        drained.count += 1;
                     }
                 }
+
+                return drained;
             }
 
             const AcquiredFrame = struct {
@@ -512,14 +622,28 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             pub fn deinit(self: *FrameState) void {
-                self.target.deinit();
-                self.uniforms.deinit();
-                self.cells.deinit();
-                self.cells_bg.deinit();
-                self.grayscale.deinit();
-                self.color.deinit();
-                self.bg_image_buffer.deinit();
-                if (self.custom_shader_state) |*state| state.deinit();
+                self.deinitWithDisposition(false);
+            }
+
+            pub fn discard(self: *FrameState) void {
+                self.deinitWithDisposition(true);
+            }
+
+            fn deinitWithDisposition(
+                self: *FrameState,
+                comptime purge: bool,
+            ) void {
+                // SwapChain only calls this after the frame lease drains.
+                disposePresentedTarget(&self.target);
+                disposeOwned(&self.uniforms, purge);
+                disposeOwned(&self.cells, purge);
+                disposeOwned(&self.cells_bg, purge);
+                disposeOwned(&self.grayscale, purge);
+                disposeOwned(&self.color, purge);
+                disposeOwned(&self.bg_image_buffer, purge);
+                if (self.custom_shader_state) |*state| {
+                    state.deinitWithDisposition(purge);
+                }
             }
 
             pub fn resize(
@@ -601,10 +725,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             pub fn deinit(self: *CustomShaderState) void {
-                self.front_texture.deinit();
-                self.back_texture.deinit();
-                self.sampler.deinit();
-                self.uniforms.deinit();
+                self.deinitWithDisposition(false);
+            }
+
+            pub fn discard(self: *CustomShaderState) void {
+                self.deinitWithDisposition(true);
+            }
+
+            fn deinitWithDisposition(
+                self: *CustomShaderState,
+                comptime purge: bool,
+            ) void {
+                disposeOwned(&self.front_texture, purge);
+                disposeOwned(&self.back_texture, purge);
+                disposeOwned(&self.sampler, purge);
+                disposeOwned(&self.uniforms, purge);
             }
 
             pub fn resize(
@@ -1055,10 +1190,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// reinitialized due to any of the events mentioned in
         /// the doc comment for `displayUnrealized`.
         pub fn displayRealized(self: *Self) !void {
-            // If our API has to do things on realize, let it.
-            if (@hasDecl(GraphicsAPI, "displayRealized")) {
-                self.api.displayRealized();
-            }
+            var realization = try RendererRealization(GraphicsAPI).begin(
+                &self.api,
+                &self.cells_rebuilt,
+            );
+            defer realization.deinit();
 
             // Lock the draw mutex so that we can
             // safely reinitialize our GPU resources.
@@ -1086,6 +1222,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.swap_chain = swap_chain;
             self.reinitialize_shaders = false;
             self.target_config_modified = 1;
+            realization.commit();
         }
 
         /// This is called by the GTK apprt when the surface is being destroyed.
@@ -1097,20 +1234,34 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.api.displayUnrealized();
             }
 
-            // Lock the draw mutex so that we can
-            // safely deinitialize our GPU resources.
-            self.draw_mutex.lock();
-            defer self.draw_mutex.unlock();
-
-            // We deinit our swap chain and shaders.
-            //
-            // This will mark them as defunct so that they
-            // can't be double-freed or used in draw calls.
-            self.swap_chain.deinit();
-            if (@hasDecl(GraphicsAPI, "finishFrameGeneration")) {
-                self.api.finishFrameGeneration();
+            var drained: SwapChain.DrainedFrames = undefined;
+            {
+                // Mark the swap chain defunct and wait for every available
+                // frame lease before releasing the draw lock.
+                self.draw_mutex.lock();
+                defer self.draw_mutex.unlock();
+                drained = self.swap_chain.drainForDeinit();
+                if (@hasDecl(GraphicsAPI, "finishFrameGeneration")) {
+                    self.api.finishFrameGeneration();
+                }
             }
-            self.shaders.deinit(self.alloc);
+
+            // Flush queued compositor assignments after all frame leases drain.
+            // This must run without the draw mutex because a main-thread host
+            // callback may acquire it.
+            if (@hasDecl(GraphicsAPI, "displayUnrealizedAfterDrain")) {
+                self.api.displayUnrealizedAfterDrain();
+            }
+
+            {
+                // No draw can acquire a defunct swap chain. Clear compositor
+                // ownership first, then make only these teardown resources
+                // purgeable before releasing their final renderer references.
+                self.draw_mutex.lock();
+                defer self.draw_mutex.unlock();
+                drained.dispose(true);
+                self.shaders.deinit(self.alloc);
+            }
         }
 
         fn displayLinkCallback(
@@ -3655,11 +3806,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             texture: *Texture,
         ) !void {
             if (atlas.size > texture.width) {
-                // Free our old texture
+                const replacement = try self.api.initAtlasTexture(atlas);
                 texture.*.deinit();
-
-                // Reallocate
-                texture.* = try self.api.initAtlasTexture(atlas);
+                texture.* = replacement;
             }
 
             try texture.replaceRegion(0, 0, atlas.size, atlas.size, atlas.data);
@@ -3701,4 +3850,126 @@ test "prepared frame damage remains retryable until draw commit" {
         damage.commit();
     }
     try std.testing.expect(!cells_rebuilt);
+}
+
+test "renderer teardown releases presented target without purging" {
+    const Resource = struct {
+        released: *usize,
+        deinited: *usize,
+        discarded: *usize,
+
+        fn releasePresentationOwnership(self: @This()) void {
+            self.released.* += 1;
+        }
+
+        fn deinit(self: *@This()) void {
+            self.deinited.* += 1;
+        }
+
+        fn discard(self: *@This()) void {
+            self.discarded.* += 1;
+        }
+    };
+
+    var released: usize = 0;
+    var deinited: usize = 0;
+    var discarded: usize = 0;
+    var target: Resource = .{
+        .released = &released,
+        .deinited = &deinited,
+        .discarded = &discarded,
+    };
+
+    disposePresentedTarget(&target);
+
+    try std.testing.expectEqual(@as(usize, 1), released);
+    try std.testing.expectEqual(@as(usize, 0), deinited);
+    try std.testing.expectEqual(@as(usize, 0), discarded);
+}
+
+test "swap chain initialization cleans its successful prefix on failure" {
+    const testing = std.testing;
+    const State = struct {
+        initialized: usize = 0,
+        deinited: usize = 0,
+        fail_at: usize = 2,
+    };
+    const Frame = struct {
+        state: *State,
+
+        fn init(state: *State, _: bool) !@This() {
+            if (state.initialized == state.fail_at) return error.InitFailed;
+            state.initialized += 1;
+            return .{ .state = state };
+        }
+
+        fn deinit(self: *@This()) void {
+            self.state.deinited += 1;
+        }
+    };
+
+    var state: State = .{};
+    var frames: [3]Frame = undefined;
+    try testing.expectError(
+        error.InitFailed,
+        initializeFrameStates(&frames, &state, false),
+    );
+    try testing.expectEqual(@as(usize, 2), state.initialized);
+    try testing.expectEqual(state.initialized, state.deinited);
+}
+
+test "renderer realization rolls back failure and redraws cached frame on commit" {
+    const testing = std.testing;
+    const MockAPI = struct {
+        realized: usize = 0,
+        rolled_back: usize = 0,
+
+        fn displayRealized(self: *@This()) !void {
+            self.realized += 1;
+        }
+
+        fn displayRealizedRollback(self: *@This()) void {
+            self.rolled_back += 1;
+        }
+    };
+    const Harness = struct {
+        fn failAfterAPI(
+            api: *MockAPI,
+            cached_frame_redraw: *bool,
+        ) !void {
+            var realization = try RendererRealization(MockAPI).begin(
+                api,
+                cached_frame_redraw,
+            );
+            defer realization.deinit();
+            return error.DownstreamFailure;
+        }
+
+        fn succeed(
+            api: *MockAPI,
+            cached_frame_redraw: *bool,
+        ) !void {
+            var realization = try RendererRealization(MockAPI).begin(
+                api,
+                cached_frame_redraw,
+            );
+            defer realization.deinit();
+            realization.commit();
+        }
+    };
+
+    var api: MockAPI = .{};
+    var cached_frame_redraw = false;
+    try testing.expectError(
+        error.DownstreamFailure,
+        Harness.failAfterAPI(&api, &cached_frame_redraw),
+    );
+    try testing.expectEqual(@as(usize, 1), api.realized);
+    try testing.expectEqual(@as(usize, 1), api.rolled_back);
+    try testing.expect(!cached_frame_redraw);
+
+    try Harness.succeed(&api, &cached_frame_redraw);
+    try testing.expectEqual(@as(usize, 2), api.realized);
+    try testing.expectEqual(@as(usize, 1), api.rolled_back);
+    try testing.expect(cached_frame_redraw);
 }

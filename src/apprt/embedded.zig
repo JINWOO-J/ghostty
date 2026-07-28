@@ -4602,26 +4602,28 @@ pub const CAPI = struct {
         /// terminal state alive; the swap chain is rebuilt on re-show.
         ///
         /// Darwin-only by placement: iOS owns occlusion via `renderingSuspended`
-        /// and must not be driven through this path. The message is
-        /// non-idempotent (it must strictly alternate with the swap chain's
-        /// `defunct` state), so the caller (cmux) must only advance its own
-        /// realize/unrealize state when this returns `true`. The push is
-        /// `.instant` (non-blocking): this runs on the caller's main actor and
-        /// must never stall the UI waiting on the renderer thread to drain. When
-        /// the mailbox is full the push drops and returns `false`; cmux keeps its
-        /// mirror state unchanged and retries on its next reclamation pass, so a
-        /// drop is harmless rather than tripping `displayRealized`'s
-        /// `assert(swap_chain.defunct)`. On re-show the mailbox is normally empty,
-        /// so the realize enqueues immediately and the surface is never presented
-        /// against a defunct swap chain.
+        /// and must not be driven through this path. The request is idempotent
+        /// latest-value state rather than ordered mailbox work. Publishing never
+        /// blocks or drops when the renderer mailbox is full, and the renderer
+        /// retries a failed GPU recreation without requiring the caller to mirror
+        /// delivery state. The return value remains for source compatibility and
+        /// means the request was accepted.
         export fn ghostty_surface_set_renderer_realized(ptr: *Surface, realized: bool) bool {
             const surface = &ptr.core_surface;
-            const enqueued = surface.renderer_thread.mailbox.push(
-                .{ .display_realized = realized },
-                .{ .instant = {} },
-            ) != 0;
+            surface.renderer_thread.publishRendererRealized(realized);
             surface.renderer_thread.wakeup.notify() catch {};
-            return enqueued;
+            return true;
+        }
+
+        /// Force one unrealize/realize transaction on the renderer thread.
+        /// Unlike two latest-value boolean publications, this cannot lose the
+        /// unrealize step when a surface becomes presentable before the renderer
+        /// consumes its earlier state.
+        export fn ghostty_surface_rebuild_renderer(ptr: *Surface) bool {
+            const surface = &ptr.core_surface;
+            surface.renderer_thread.publishRendererRebuild();
+            surface.renderer_thread.wakeup.notify() catch {};
+            return true;
         }
 
         /// This returns a CTFontRef that should be used for quicklook
