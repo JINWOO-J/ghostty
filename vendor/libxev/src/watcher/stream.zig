@@ -1049,7 +1049,7 @@ pub fn Writeable(comptime xev: type, comptime T: type, comptime options: Options
                                 req_inner.full_write_buffer,
                             );
                             break :retry null;
-                        } else |err| switch (err) {
+                        } else |err| switch (@as(anyerror, err)) {
                             error.WouldBlock => break :retry cb_res.buf,
                             else => break :retry null,
                         }
