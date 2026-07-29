@@ -822,6 +822,42 @@ test "custom shader compiler fallback is not retained" {
     }) == null);
 }
 
+test "custom shader compiler fallback backs off across renderer restores" {
+    const testing = std.testing;
+    const device_ptr = mtl.MTLCreateSystemDefaultDevice() orelse {
+        return error.SkipZigTest;
+    };
+    const device = objc.Object.fromId(device_ptr);
+    defer device.release();
+    defer clearSharedCacheForTesting();
+
+    const invalid_source: [:0]const u8 = "not valid metal";
+    shared_shader_build_count.store(0, .monotonic);
+
+    var first = try Shaders.init(
+        testing.allocator,
+        device,
+        &.{invalid_source},
+        .bgra8unorm,
+    );
+    try testing.expectEqual(@as(usize, 0), first.post_pipelines.len);
+    first.deinit(testing.allocator);
+
+    var restored = try Shaders.init(
+        testing.allocator,
+        device,
+        &.{invalid_source},
+        .bgra8unorm,
+    );
+    defer restored.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), restored.post_pipelines.len);
+
+    try testing.expectEqual(
+        @as(usize, 1),
+        shared_shader_build_count.load(.monotonic),
+    );
+}
+
 test "custom shader compiler fallback retries while in use" {
     const testing = std.testing;
     const device_ptr = mtl.MTLCreateSystemDefaultDevice() orelse {
