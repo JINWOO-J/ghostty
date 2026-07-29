@@ -987,7 +987,7 @@ test "custom shader compiler fallback backs off across renderer restores" {
     );
 }
 
-test "custom shader compiler backoff begins when renderer becomes idle" {
+test "custom shader compiler backoff begins when compilation fails" {
     const testing = std.testing;
     const device_ptr = mtl.MTLCreateSystemDefaultDevice() orelse {
         return error.SkipZigTest;
@@ -1005,33 +1005,9 @@ test "custom shader compiler backoff begins when renderer becomes idle" {
         &.{invalid_source},
         .bgra8unorm,
     );
+    defer first.deinit(testing.allocator);
 
-    // The retry window must not run while the fallback is still live.
-    {
-        shared_shader_mutex.lockUncancelable(global.io());
-        defer shared_shader_mutex.unlock(global.io());
-
-        var found = false;
-        for (shared_shader_entries.items) |entry| {
-            if (!entry.key.eql(.{
-                .device = @intFromPtr(device.value),
-                .pixel_format = .bgra8unorm,
-                .post_shaders = &.{invalid_source},
-            })) continue;
-
-            switch (entry.retention) {
-                .failed_custom => |retry_after| {
-                    try testing.expectEqual(null, retry_after);
-                    found = true;
-                },
-                .persistent, .recent_custom => {},
-            }
-        }
-        try testing.expect(found);
-    }
-    first.deinit(testing.allocator);
-
-    // Releasing the last renderer starts the retry window.
+    // Retry policy belongs to the compile attempt, not renderer lifetime.
     {
         shared_shader_mutex.lockUncancelable(global.io());
         defer shared_shader_mutex.unlock(global.io());
@@ -1047,6 +1023,55 @@ test "custom shader compiler backoff begins when renderer becomes idle" {
             switch (entry.retention) {
                 .failed_custom => |retry_after| {
                     try testing.expect(retry_after != null);
+                    found = true;
+                },
+                .persistent, .recent_custom => {},
+            }
+        }
+        try testing.expect(found);
+    }
+
+    const retry_after_before: ?std.Io.Timestamp = before: {
+        shared_shader_mutex.lockUncancelable(global.io());
+        defer shared_shader_mutex.unlock(global.io());
+
+        for (shared_shader_entries.items) |entry| {
+            if (!entry.key.eql(.{
+                .device = @intFromPtr(device.value),
+                .pixel_format = .bgra8unorm,
+                .post_shaders = &.{invalid_source},
+            })) continue;
+
+            break :before switch (entry.retention) {
+                .failed_custom => |retry_after| retry_after,
+                .persistent, .recent_custom => null,
+            };
+        }
+        break :before null;
+    };
+    try testing.expect(retry_after_before != null);
+
+    first.deinit(testing.allocator);
+
+    // Releasing the renderer must not move the compile-attempt deadline.
+    {
+        shared_shader_mutex.lockUncancelable(global.io());
+        defer shared_shader_mutex.unlock(global.io());
+
+        var found = false;
+        for (shared_shader_entries.items) |entry| {
+            if (!entry.key.eql(.{
+                .device = @intFromPtr(device.value),
+                .pixel_format = .bgra8unorm,
+                .post_shaders = &.{invalid_source},
+            })) continue;
+
+            switch (entry.retention) {
+                .failed_custom => |retry_after| {
+                    try testing.expectEqualDeep(
+                        retry_after_before,
+                        retry_after,
+                    );
                     found = true;
                 },
                 .persistent, .recent_custom => {},
@@ -1167,7 +1192,7 @@ test "edited custom shader retries during compiler failure backoff" {
     );
 }
 
-test "custom shader compiler fallback retries while in use" {
+test "custom shader compiler fallback backs off while in use" {
     const testing = std.testing;
     const device_ptr = mtl.MTLCreateSystemDefaultDevice() orelse {
         return error.SkipZigTest;
@@ -1196,12 +1221,12 @@ test "custom shader compiler fallback retries while in use" {
     defer retry.deinit(testing.allocator);
 
     try testing.expectEqual(
-        @as(usize, 2),
+        @as(usize, 1),
         shared_shader_build_count.load(.monotonic),
     );
 }
 
-test "custom shader compiler fallback retries with live and idle failures" {
+test "custom shader compiler fallback backs off with live and idle consumers" {
     const testing = std.testing;
     const device_ptr = mtl.MTLCreateSystemDefaultDevice() orelse {
         return error.SkipZigTest;
@@ -1237,7 +1262,74 @@ test "custom shader compiler fallback retries with live and idle failures" {
     defer third.deinit(testing.allocator);
 
     try testing.expectEqual(
-        @as(usize, 3),
+        @as(usize, 1),
+        shared_shader_build_count.load(.monotonic),
+    );
+}
+
+test "custom shader compiler retries once after expiry with live fallback" {
+    const testing = std.testing;
+    const device_ptr = mtl.MTLCreateSystemDefaultDevice() orelse {
+        return error.SkipZigTest;
+    };
+    const device = objc.Object.fromId(device_ptr);
+    defer device.release();
+    defer clearSharedCacheForTesting();
+
+    const invalid_source: [:0]const u8 = "not valid metal";
+    const key: SharedShadersKey = .{
+        .device = @intFromPtr(device.value),
+        .pixel_format = .bgra8unorm,
+        .post_shaders = &.{invalid_source},
+    };
+    shared_shader_build_count.store(0, .monotonic);
+
+    var first = try Shaders.init(
+        testing.allocator,
+        device,
+        &.{invalid_source},
+        .bgra8unorm,
+    );
+    defer first.deinit(testing.allocator);
+
+    {
+        shared_shader_mutex.lockUncancelable(global.io());
+        defer shared_shader_mutex.unlock(global.io());
+
+        var found = false;
+        for (shared_shader_entries.items) |entry| {
+            if (!entry.key.eql(key)) continue;
+            switch (entry.retention) {
+                .failed_custom => {
+                    entry.retention = .{
+                        .failed_custom = .now(global.io(), .awake),
+                    };
+                    found = true;
+                },
+                .persistent, .recent_custom => {},
+            }
+        }
+        try testing.expect(found);
+    }
+
+    var retry = try Shaders.init(
+        testing.allocator,
+        device,
+        &.{invalid_source},
+        .bgra8unorm,
+    );
+    defer retry.deinit(testing.allocator);
+
+    var coalesced = try Shaders.init(
+        testing.allocator,
+        device,
+        &.{invalid_source},
+        .bgra8unorm,
+    );
+    defer coalesced.deinit(testing.allocator);
+
+    try testing.expectEqual(
+        @as(usize, 2),
         shared_shader_build_count.load(.monotonic),
     );
 }
