@@ -2189,6 +2189,23 @@ test "renderer realization retries coalesce with bounded backoff" {
     );
 }
 
+test "resolved renderer realization retry resets an active deadline" {
+    const testing = std.testing;
+
+    var retry: RendererRealizedRetryState = .{};
+    retry.delay_ms = RendererRealizedRetryState.maximum_delay_ms;
+    try testing.expectEqual(
+        @as(?u64, RendererRealizedRetryState.maximum_delay_ms),
+        retry.failed(.realize),
+    );
+
+    // A successful hide can resolve the failed restore before its old timer
+    // fires. The next visible restore failure must start a fresh backoff rather
+    // than inheriting the remainder of the obsolete maximum deadline.
+    retry.resolved();
+    try testing.expectEqual(@as(?u64, 250), retry.failed(.realize));
+}
+
 test "external renderer retry timer is handed to loop owner once" {
     var handoff: RendererRealizedRetryTimerHandoff = .{};
 
