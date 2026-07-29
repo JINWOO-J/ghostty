@@ -950,7 +950,7 @@ fn initLibrary(device: objc.Object) !objc.Object {
             &err,
         },
     );
-    try checkError(err);
+    try checkError(err, .err);
 
     const end = try std.time.Instant.now();
     log.debug("shader library loaded time={}us", .{end.since(start) / std.time.ns_per_us});
@@ -1020,7 +1020,9 @@ fn initPostPipeline(
             objc.sel("newLibraryWithSource:options:error:"),
             .{ source, @as(?*anyopaque, null), &err },
         );
-        try checkError(err);
+        // Invalid user post-shader source is recoverable: Ghostty falls back
+        // to the standard renderer and retries on the next initialization.
+        try checkError(err, .warn);
         errdefer post_library.msgSend(void, objc.sel("release"), .{});
 
         break :library post_library;
@@ -1042,13 +1044,17 @@ fn initPostPipeline(
     });
 }
 
-fn checkError(err_: ?*anyopaque) !void {
+fn checkError(err_: ?*anyopaque, comptime level: std.log.Level) !void {
     const nserr = objc.Object.fromId(err_ orelse return);
     const str = @as(
         *macos.foundation.String,
         @ptrCast(nserr.getProperty(?*anyopaque, "localizedDescription").?),
     );
 
-    log.err("metal error={s}", .{str.cstringPtr(.ascii).?});
+    switch (level) {
+        .err => log.err("metal error={s}", .{str.cstringPtr(.ascii).?}),
+        .warn => log.warn("metal error={s}", .{str.cstringPtr(.ascii).?}),
+        else => @compileError("Metal failures must log as errors or warnings"),
+    }
     return error.MetalFailed;
 }
