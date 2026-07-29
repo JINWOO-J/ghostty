@@ -372,7 +372,16 @@ pub fn needsConfirmQuit(self: *const App) bool {
 
 /// Drain the mailbox.
 fn drainMailbox(self: *App, rt_app: *apprt.App) !void {
-    while (self.mailbox.pop()) |message| {
+    // Process only the messages present at the start of this app turn.
+    // Producers can refill the queue as we pop, so draining until a transient
+    // empty state can monopolize a runtime's main thread indefinitely.
+    // Retain a later tick explicitly because runtime wakeups may coalesce with
+    // the turn currently being handled.
+    var remaining = self.mailbox.count();
+    defer if (self.mailbox.count() > 0) rt_app.wakeup();
+
+    while (remaining > 0) : (remaining -= 1) {
+        const message = self.mailbox.pop() orelse break;
         if (comptime std.log.logEnabled(.debug, .app)) {
             switch (message) {
                 // these tend to be way too verbose for normal debugging
