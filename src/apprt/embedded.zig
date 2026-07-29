@@ -4968,3 +4968,71 @@ test "render presentation callback setter is per surface" {
         parent.render_presented_userdata,
     );
 }
+
+test "font size action callback preserves resolved action events" {
+    const Observation = struct {
+        calls: usize = 0,
+        kind: CoreSurface.FontSizeActionKind = .reset,
+        previous_points: f32 = 0,
+        current_points: f32 = 0,
+        previous_adjusted: bool = false,
+        current_adjusted: bool = false,
+    };
+    const Callbacks = struct {
+        fn fontSizeAction(
+            userdata: ?*anyopaque,
+            kind: CoreSurface.FontSizeActionKind,
+            previous_points: f32,
+            current_points: f32,
+            previous_adjusted: bool,
+            current_adjusted: bool,
+        ) callconv(.c) void {
+            const observation: *Observation =
+                @ptrCast(@alignCast(userdata.?));
+            observation.* = .{
+                .calls = observation.calls + 1,
+                .kind = kind,
+                .previous_points = previous_points,
+                .current_points = current_points,
+                .previous_adjusted = previous_adjusted,
+                .current_adjusted = current_adjusted,
+            };
+        }
+    };
+
+    var observation: Observation = .{};
+    var surface: Surface = undefined;
+    surface.font_size_action_cb = null;
+    surface.font_size_action_userdata = null;
+
+    try std.testing.expect(
+        CAPI.ghostty_surface_set_font_size_action_callback(
+            &surface,
+            Callbacks.fontSizeAction,
+            &observation,
+        ),
+    );
+    surface.fontSizeActionDidPerform(.{
+        .kind = .set,
+        .previous_points = 12,
+        .current_points = 255,
+        .previous_adjusted = false,
+        .current_adjusted = true,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), observation.calls);
+    try std.testing.expectEqual(
+        CoreSurface.FontSizeActionKind.set,
+        observation.kind,
+    );
+    try std.testing.expectEqual(
+        @as(f32, 12),
+        observation.previous_points,
+    );
+    try std.testing.expectEqual(
+        @as(f32, 255),
+        observation.current_points,
+    );
+    try std.testing.expect(!observation.previous_adjusted);
+    try std.testing.expect(observation.current_adjusted);
+}
