@@ -3,6 +3,7 @@ import Testing
 
 struct RendererTabSelectionTests {
     private final class ObservationToken {}
+    private final class ObservationGroup {}
 
     @Test func standaloneWindowIsSelected() {
         #expect(RendererTabSelection.classify(
@@ -125,6 +126,33 @@ struct RendererTabSelectionTests {
         #expect(RendererTabObservationPlan.shouldObserve(
             controller: firstSurvivor,
             controllers: controllers
+        ))
+    }
+
+    @Test func staleMembershipCallbackKeepsNewGroupObservation() {
+        let originalOwner = ObservationToken()
+        let oldGroupSurvivor = ObservationToken()
+        let oldGroup = ObservationGroup()
+        let newGroup = ObservationGroup()
+
+        #expect(!RendererTabObservationPlan.shouldInvalidateCurrentObservation(
+            observedGroup: newGroup,
+            callbackGroup: oldGroup,
+            controller: originalOwner,
+            controllers: [oldGroupSurvivor]
+        ))
+    }
+
+    @Test func currentMembershipCallbackHandsObservationToFirstSurvivor() {
+        let originalOwner = ObservationToken()
+        let oldGroupSurvivor = ObservationToken()
+        let oldGroup = ObservationGroup()
+
+        #expect(RendererTabObservationPlan.shouldInvalidateCurrentObservation(
+            observedGroup: oldGroup,
+            callbackGroup: oldGroup,
+            controller: originalOwner,
+            controllers: [oldGroupSurvivor]
         ))
     }
 }
