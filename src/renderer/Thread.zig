@@ -4,7 +4,8 @@ pub const Thread = @This();
 
 const std = @import("std");
 const builtin = @import("builtin");
-const xev = @import("../global.zig").xev;
+const global = @import("../global.zig");
+const xev = global.xev;
 const crash = @import("../crash/main.zig");
 const internal_os = @import("../os/main.zig");
 const rendererpkg = @import("../renderer.zig");
@@ -322,7 +323,7 @@ const ExternalRedrawDelivery = struct {
         phase: Phase,
     };
 
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
     next_generation: u64 = 0,
     active: ?Request = null,
     wake_behind_active: bool = false,
@@ -331,8 +332,8 @@ const ExternalRedrawDelivery = struct {
     /// enqueue failed, because the resulting frame covers both old and new
     /// terminal state. Wakes behind a queued host action remain coalesced.
     fn request(self: *ExternalRedrawDelivery) ?u64 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(global.io());
+        defer self.mutex.unlock(global.io());
 
         if (self.active) |*active| {
             if (active.phase == .enqueue_failed) {
@@ -352,8 +353,8 @@ const ExternalRedrawDelivery = struct {
         self: *ExternalRedrawDelivery,
         generation: u64,
     ) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(global.io());
+        defer self.mutex.unlock(global.io());
 
         if (self.active) |*active| {
             if (active.generation == generation) {
@@ -365,8 +366,8 @@ const ExternalRedrawDelivery = struct {
     /// Claim only a ticket whose own enqueue failed. A capacity callback for
     /// one surface cannot duplicate a queued ticket for another surface.
     fn retryFailedEnqueue(self: *ExternalRedrawDelivery) ?u64 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(global.io());
+        defer self.mutex.unlock(global.io());
 
         if (self.active) |*active| {
             if (active.phase == .enqueue_failed) {
@@ -387,8 +388,8 @@ const ExternalRedrawDelivery = struct {
     ) bool {
         if (accepted) return false;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(global.io());
+        defer self.mutex.unlock(global.io());
 
         const active = self.active orelse return false;
         if (active.generation != generation) return false;
@@ -403,8 +404,8 @@ const ExternalRedrawDelivery = struct {
     /// section. A concurrent later wake either lands before the reset and is
     /// covered, or lands after it and receives a new ticket.
     fn renderStarted(self: *ExternalRedrawDelivery) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(global.io());
+        defer self.mutex.unlock(global.io());
         self.active = null;
         self.wake_behind_active = false;
     }
@@ -514,7 +515,7 @@ const RendererRealizedRetryState = struct {
         generation: u64,
     };
 
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
     value: ?Delivery = null,
     scheduled: bool = false,
     delay_ms: u64 = initial_delay_ms,
@@ -533,8 +534,8 @@ const RendererRealizedRetryState = struct {
         self: *RendererRealizedRetryState,
         value: RendererRealizedRequest,
     ) ?u64 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(global.io());
+        defer self.mutex.unlock(global.io());
 
         return self.failedLocked(.{
             .value = value,
@@ -548,8 +549,8 @@ const RendererRealizedRetryState = struct {
         self: *RendererRealizedRetryState,
         delivery: Delivery,
     ) ?u64 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(global.io());
+        defer self.mutex.unlock(global.io());
 
         if (delivery.generation != self.generation.load(.acquire)) return null;
         return self.failedLocked(delivery);
@@ -572,8 +573,8 @@ const RendererRealizedRetryState = struct {
     /// A newer lifecycle publication supersedes the retry value. The timer may
     /// remain armed and becomes a no-op unless another failure coalesces into it.
     fn supersede(self: *RendererRealizedRetryState) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(global.io());
+        defer self.mutex.unlock(global.io());
         _ = self.generation.fetchAdd(1, .acq_rel);
         self.value = null;
     }
@@ -585,8 +586,8 @@ const RendererRealizedRetryState = struct {
         self: *RendererRealizedRetryState,
         requests: *SurfaceStateRequests,
     ) SurfaceStateRequests.Update {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(global.io());
+        defer self.mutex.unlock(global.io());
 
         const update = requests.take();
         if (update.renderer_realized != null) {
@@ -597,16 +598,16 @@ const RendererRealizedRetryState = struct {
     }
 
     fn resolved(self: *RendererRealizedRetryState) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(global.io());
+        defer self.mutex.unlock(global.io());
         _ = self.generation.fetchAdd(1, .acq_rel);
         self.value = null;
         self.delay_ms = initial_delay_ms;
     }
 
     fn fired(self: *RendererRealizedRetryState) ?Delivery {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(global.io());
+        defer self.mutex.unlock(global.io());
         self.scheduled = false;
         const delivery = self.value orelse return null;
         self.value = null;
@@ -620,8 +621,8 @@ const RendererRealizedRetryState = struct {
         delivery: Delivery,
         requests: *SurfaceStateRequests,
     ) bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(global.io());
+        defer self.mutex.unlock(global.io());
 
         if (delivery.generation != self.generation.load(.acquire)) return false;
         requests.restoreRendererRealizedIfEmpty(delivery.value);
@@ -682,7 +683,7 @@ stop_c: xev.Completion = .{},
 /// Set after the stop watcher is armed. Embedded callers can destroy a
 /// surface immediately after creation, so Surface.init must not return while
 /// a stop notification could still be lost during thread startup.
-started: std.Thread.ResetEvent = .{},
+started: std.Io.Event = .unset,
 
 /// One-shot timer and coalesced state for fallible Metal realization retries.
 /// This repurposes the renderer's otherwise unused legacy render timer, so the
@@ -1061,7 +1062,7 @@ pub fn externalRenderActionCompleted(
 fn enterExternalDrainMode(self: *Thread) void {
     if (comptime builtin.os.tag != .ios) return;
     if (!self.external_drain.load(.seq_cst)) {
-        self.cursor_blink_epoch_ms = std.time.milliTimestamp();
+        self.cursor_blink_epoch_ms = std.Io.Timestamp.now(global.io(), .awake).toMilliseconds();
         self.flags.cursor_blink_visible = true;
         self.external_drain.store(true, .seq_cst);
     }
@@ -1073,7 +1074,7 @@ fn externalDrainActive(self: *const Thread) bool {
 }
 
 fn hasPendingRendererWork(self: *const Thread) bool {
-    return self.mailbox.count() > 0 or
+    return self.mailbox.count(global.io()) > 0 or
         self.surface_state_requests.hasPending();
 }
 
@@ -1124,7 +1125,7 @@ fn scheduleRendererContinuationIfNeeded(self: *Thread) void {
 
 fn resetExternalCursorBlink(self: *Thread) void {
     self.flags.cursor_blink_visible = true;
-    self.cursor_blink_epoch_ms = std.time.milliTimestamp();
+    self.cursor_blink_epoch_ms = std.Io.Timestamp.now(global.io(), .awake).toMilliseconds();
 }
 
 fn effectiveCursorBlinkVisible(self: *Thread) bool {
@@ -1134,7 +1135,7 @@ fn effectiveCursorBlinkVisible(self: *Thread) bool {
     const epoch = self.cursor_blink_epoch_ms;
     if (epoch <= 0) return true;
 
-    const now = std.time.milliTimestamp();
+    const now = std.Io.Timestamp.now(global.io(), .awake).toMilliseconds();
     const raw_elapsed = now - epoch;
     const elapsed: u64 = if (raw_elapsed > 0) @intCast(raw_elapsed) else 0;
     const interval = cursorBlinkInterval();
@@ -1174,7 +1175,7 @@ fn threadMain_(self: *Thread) !void {
     // Arm stop before any fallible renderer setup. Surface.init waits for
     // this signal in embedded builds, making an immediate free deterministic.
     self.stop.wait(&self.loop, &self.stop_c, Thread, self, stopCallback);
-    self.started.set();
+    self.started.set(global.io());
 
     // Run our loop start/end callbacks if the renderer cares.
     const has_loop = @hasDecl(rendererpkg.Renderer, "loopEnter");
@@ -1311,10 +1312,10 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
     // empty state lets sustained terminal output monopolize the renderer loop,
     // delaying lifecycle state below and the render that follows this drain.
     // A snapshot gives both bounded latency while preserving FIFO ordering.
-    var remaining = self.mailbox.count();
+    var remaining = self.mailbox.count(global.io());
 
     while (remaining > 0) : (remaining -= 1) {
-        const message = self.mailbox.pop() orelse break;
+        const message = self.mailbox.pop(global.io()) orelse break;
         log.debug("mailbox message={}", .{message});
         switch (message) {
             .crash => @panic("crash request, crashing intentionally"),
@@ -1441,7 +1442,7 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
     }
 
     const wake_pending =
-        self.mailbox.count() > 0 or self.surface_state_requests.hasPending();
+        self.mailbox.count(global.io()) > 0 or self.surface_state_requests.hasPending();
     if (external_drain) return .{ .wake_pending = wake_pending };
 
     // Hidden wakeups leave terminal dirty flags untouched. Rebuild exactly
@@ -1692,7 +1693,7 @@ fn wakeupCallback(
     const drain_result = t.drainMailbox() catch |err| fallback: {
         log.err("error draining mailbox err={}", .{err});
         break :fallback MailboxDrainResult{
-            .wake_pending = t.mailbox.count() > 0 or
+            .wake_pending = t.mailbox.count(global.io()) > 0 or
                 t.surface_state_requests.hasPending(),
         };
     };
@@ -1708,7 +1709,7 @@ fn wakeupCallback(
     // turn. Recheck after rendering so work published during the render is
     // included rather than relying on its possibly coalesced notification.
     const wake_pending = drain_result.wake_pending or
-        t.mailbox.count() > 0 or t.surface_state_requests.hasPending();
+        t.mailbox.count(global.io()) > 0 or t.surface_state_requests.hasPending();
     if (wake_pending) {
         t.wakeup.notify() catch |err| {
             log.warn("failed to continue pending renderer work err={}", .{err});
@@ -2044,13 +2045,18 @@ test "surface lifecycle state bypasses a full renderer mailbox and keeps latest 
 
     for (0..64) |_| {
         try std.testing.expect(mailbox.push(
+            global.io(),
             .{ .visible = false },
             .{ .instant = {} },
         ) != 0);
     }
     try std.testing.expectEqual(
         @as(Mailbox.Size, 0),
-        mailbox.push(.{ .visible = false }, .{ .instant = {} }),
+        mailbox.push(
+            global.io(),
+            .{ .visible = false },
+            .{ .instant = {} },
+        ),
     );
 
     var state: SurfaceStateRequests = .{};
@@ -2072,7 +2078,11 @@ test "surface lifecycle state bypasses a full renderer mailbox and keeps latest 
     try std.testing.expectEqual(@as(u32, 42), update.display_id);
     try std.testing.expectEqual(
         @as(Mailbox.Size, 0),
-        mailbox.push(.{ .visible = false }, .{ .instant = {} }),
+        mailbox.push(
+            global.io(),
+            .{ .visible = false },
+            .{ .instant = {} },
+        ),
     );
 }
 
@@ -2959,7 +2969,7 @@ const Compression = struct {
         // frame without changing terminal contents and must not starve this
         // timer indefinitely.
         if (thread.state.mutex.tryLock()) {
-            defer thread.state.mutex.unlock();
+            defer thread.state.mutex.unlock(global.io());
             const activity = thread.state.terminal.compressionActivity();
             if (self.activity == activity) return;
             self.activity = activity;
@@ -3018,7 +3028,7 @@ const Compression = struct {
 
         const state = thread.state;
         if (!state.mutex.tryLock()) return idle_interval;
-        defer state.mutex.unlock();
+        defer state.mutex.unlock(global.io());
 
         const activity = state.terminal.compressionActivity();
         if (self.activity != activity) {
