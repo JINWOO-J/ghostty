@@ -568,6 +568,22 @@ typedef void (*ghostty_pty_tee_cb)(void* userdata,
 // main thread. Synchronous backends deliver on the rendering caller's thread.
 typedef void (*ghostty_render_presented_cb)(void*, uint64_t);
 
+// cmux fork: semantic font binding actions emitted after the native mutation
+// succeeds. The callback runs synchronously on the surface's GUI thread.
+typedef enum {
+  GHOSTTY_FONT_SIZE_ACTION_INCREASE = 0,
+  GHOSTTY_FONT_SIZE_ACTION_DECREASE = 1,
+  GHOSTTY_FONT_SIZE_ACTION_RESET = 2,
+  GHOSTTY_FONT_SIZE_ACTION_SET = 3,
+} ghostty_font_size_action_e;
+typedef void (*ghostty_font_size_action_cb)(
+    void* userdata,
+    ghostty_font_size_action_e action,
+    float previous_points,
+    float current_points,
+    bool previous_adjusted,
+    bool current_adjusted);
+
 // Content-free renderer activity events emitted only when a surface installs
 // ghostty_renderer_event_cb. Begin/end pairs run on the renderer thread.
 typedef enum {
@@ -1359,6 +1375,14 @@ GHOSTTY_API void ghostty_surface_render_now(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_set_render_presented_callback(
     ghostty_surface_t,
     ghostty_render_presented_cb,
+    void* userdata);
+// cmux fork: install a per-surface callback for successfully performed font
+// binding actions. Call once after construction. The callback is synchronous
+// on the GUI thread, is not inherited by child surfaces, and its userdata must
+// remain valid until ghostty_surface_free returns.
+GHOSTTY_API bool ghostty_surface_set_font_size_action_callback(
+    ghostty_surface_t,
+    ghostty_font_size_action_cb,
     void* userdata);
 // cmux fork: submit a forced render associated with `token`. When successful,
 // the installed callback fires after the backend presents the exact rendered
