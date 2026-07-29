@@ -322,7 +322,7 @@ fn initShared(
 
 fn findSharedLocked(key: SharedShadersKey) ?*SharedShaders {
     for (shared_shader_entries.items) |entry| {
-        if (entry.key.eql(key)) return entry;
+        if (entry.retain_idle and entry.key.eql(key)) return entry;
     }
     return null;
 }
@@ -344,9 +344,9 @@ fn releaseShared(entry: *SharedShaders) void {
     entry.references -= 1;
     if (entry.references > 0) return;
 
-    // A custom compiler failure falls back to the standard renderer. Do not
-    // retain that fallback under the custom source key, so a later restore can
-    // retry compilation instead of pinning a transient failure.
+    // A custom compiler failure still uses shared ownership so it is always
+    // released with the allocator that built it. It is excluded from lookups,
+    // and removed as soon as its renderer releases it.
     if (!entry.retain_idle) {
         removeSharedLocked(entry);
         return;
@@ -859,8 +859,6 @@ test "custom shader compiler fallback retries while in use" {
         @as(usize, 2),
         shared_shader_build_count.load(.monotonic),
     );
-    try testing.expect(first.shared == null);
-    try testing.expect(retry.shared == null);
 }
 
 /// This is a single parameter for the terminal cell shader.

@@ -66,6 +66,22 @@ enum RendererTabObservationPlan {
     ) -> Bool {
         controllers.first === controller
     }
+
+    static func shouldInvalidateCurrentObservation<
+        Group: AnyObject,
+        Controller: AnyObject
+    >(
+        observedGroup: Group?,
+        callbackGroup: Group,
+        controller: Controller,
+        controllers: [Controller]
+    ) -> Bool {
+        guard observedGroup === callbackGroup else { return false }
+        return !shouldObserve(
+            controller: controller,
+            controllers: controllers
+        )
+    }
 }
 
 /// A base class for windows that can contain Ghostty windows. This base class implements
@@ -1477,37 +1493,43 @@ class BaseTerminalController: NSWindowController,
         rendererTabSelectionObservation = tabGroup.observe(
             \.selectedWindow,
              options: [.new]
-        ) { [weak self] _, _ in
-            Task { @MainActor [weak self] in
-                self?.rendererTabGroupDidChange()
+        ) { [weak self, weak tabGroup] _, _ in
+            Task { @MainActor [weak self, weak tabGroup] in
+                guard let tabGroup else { return }
+                self?.rendererTabGroupDidChange(tabGroup)
             }
         }
         rendererTabOverviewObservation = tabGroup.observe(
             \.isOverviewVisible,
              options: [.new]
-        ) { [weak self] _, _ in
-            Task { @MainActor [weak self] in
-                self?.rendererTabGroupDidChange()
+        ) { [weak self, weak tabGroup] _, _ in
+            Task { @MainActor [weak self, weak tabGroup] in
+                guard let tabGroup else { return }
+                self?.rendererTabGroupDidChange(tabGroup)
             }
         }
         rendererTabWindowsObservation = tabGroup.observe(
             \.windows,
              options: [.new]
-        ) { [weak self] _, _ in
-            Task { @MainActor [weak self] in
-                self?.rendererTabGroupDidChange()
+        ) { [weak self, weak tabGroup] _, _ in
+            Task { @MainActor [weak self, weak tabGroup] in
+                guard let tabGroup else { return }
+                self?.rendererTabGroupDidChange(tabGroup)
             }
         }
     }
 
-    private func rendererTabGroupDidChange() {
-        guard let tabGroup = observedRendererTabGroup else { return }
+    private func rendererTabGroupDidChange(_ tabGroup: NSWindowTabGroup) {
         let controllers = Self.rendererControllers(for: tabGroup)
         let remainsInGroup = controllers.contains { $0 === self }
 
         // A membership callback is delivered through the old owner's token.
-        // Release that token before electing the first surviving controller.
-        if !RendererTabObservationPlan.shouldObserve(
+        // Release it before electing a survivor only if this is still the
+        // observed group. A queued callback from an old group must not clear a
+        // newer group's observation.
+        if RendererTabObservationPlan.shouldInvalidateCurrentObservation(
+            observedGroup: observedRendererTabGroup,
+            callbackGroup: tabGroup,
             controller: self,
             controllers: controllers
         ) {
