@@ -847,6 +847,78 @@ fn testAction(_: *apprt.App, _: apprt.Target.C, _: apprt.Action.C) callconv(.c) 
     return true;
 }
 
+test "app mailbox drain bounds a producer-refilled turn" {
+    if (comptime !@hasField(apprt.App, "opts")) return error.SkipZigTest;
+
+    const Context = struct {
+        app: *App,
+        action_calls: usize = 0,
+        refills_remaining: usize = 4,
+        wakeups: usize = 0,
+
+        fn action(
+            rt_app: *apprt.App,
+            _: apprt.Target.C,
+            _: apprt.Action.C,
+        ) callconv(.c) bool {
+            const self: *@This() = @ptrCast(@alignCast(
+                rt_app.opts.userdata.?,
+            ));
+            self.action_calls += 1;
+            if (self.refills_remaining > 0) {
+                self.refills_remaining -= 1;
+                const queued = self.app.mailbox.push(.open_config, .instant);
+                std.debug.assert(queued > 0);
+            }
+            return true;
+        }
+
+        fn wakeup(userdata: ?*anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(userdata.?));
+            self.wakeups += 1;
+        }
+    };
+
+    var app: App = undefined;
+    try app.init(std.testing.allocator);
+    defer {
+        app.surfaces.deinit(std.testing.allocator);
+        app.font_grid_set.deinit();
+    }
+
+    var context: Context = .{ .app = &app };
+    var rt_app: apprt.App = undefined;
+    rt_app.core_app = &app;
+    rt_app.opts = undefined;
+    rt_app.opts.userdata = &context;
+    rt_app.opts.action = Context.action;
+    rt_app.opts.wakeup = Context.wakeup;
+
+    try std.testing.expectEqual(
+        @as(Mailbox.Queue.Size, 1),
+        app.mailbox.push(.open_config, .instant),
+    );
+    try std.testing.expectEqual(
+        @as(Mailbox.Queue.Size, 2),
+        app.mailbox.push(.open_config, .instant),
+    );
+
+    try app.tick(&rt_app);
+    try std.testing.expectEqual(@as(usize, 2), context.action_calls);
+    try std.testing.expectEqual(@as(Mailbox.Queue.Size, 2), app.mailbox.count());
+    try std.testing.expectEqual(@as(usize, 1), context.wakeups);
+
+    try app.tick(&rt_app);
+    try std.testing.expectEqual(@as(usize, 4), context.action_calls);
+    try std.testing.expectEqual(@as(Mailbox.Queue.Size, 2), app.mailbox.count());
+    try std.testing.expectEqual(@as(usize, 2), context.wakeups);
+
+    try app.tick(&rt_app);
+    try std.testing.expectEqual(@as(usize, 6), context.action_calls);
+    try std.testing.expectEqual(@as(Mailbox.Queue.Size, 0), app.mailbox.count());
+    try std.testing.expectEqual(@as(usize, 2), context.wakeups);
+}
+
 test "external redraw rejects allocator-reused surface address" {
     if (comptime !@hasField(apprt.App, "opts")) return error.SkipZigTest;
     if (comptime !@hasField(apprt.Surface, "core_surface")) return error.SkipZigTest;
