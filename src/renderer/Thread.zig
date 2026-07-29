@@ -2326,10 +2326,7 @@ test "stale external renderer retry cannot override newer publication" {
         newer.renderer_realized,
     );
 
-    try std.testing.expectEqual(
-        @as(?u64, null),
-        retry.failedIfCurrent(claimed),
-    );
+    try std.testing.expect(retry.failedIfCurrent(claimed) == null);
     try std.testing.expect(!retry.restoreIfCurrent(claimed, &requests));
     try std.testing.expectEqual(
         @as(?RendererRealizedRequest, null),
