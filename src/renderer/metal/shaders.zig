@@ -363,7 +363,7 @@ fn findSharedLocked(
                 std.debug.assert(retry_after != null);
                 idle_failure = entry;
             },
-            .persistent, .recent_custom => unreachable,
+            .persistent, .recent_custom => continue,
         }
     }
     return idle_failure;
