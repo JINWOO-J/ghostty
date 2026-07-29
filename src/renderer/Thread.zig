@@ -602,6 +602,10 @@ const RendererRealizedRetryState = struct {
         defer self.mutex.unlock(global.io());
         _ = self.generation.fetchAdd(1, .acq_rel);
         self.value = null;
+        // The loop-owned timer may still be armed, but it no longer owns a
+        // retry deadline. A fresh failure starts at the initial delay and
+        // resets that stale timer through xev.
+        self.scheduled = false;
         self.delay_ms = initial_delay_ms;
     }
 
@@ -638,8 +642,10 @@ const RendererRealizedRetryTimerHandoff = struct {
 
     fn publish(self: *RendererRealizedRetryTimerHandoff, delay_ms: u64) void {
         std.debug.assert(delay_ms > 0);
-        const previous = self.delay_ms.swap(delay_ms, .acq_rel);
-        std.debug.assert(previous == 0);
+        // External rendering is serialized, while the loop owner consumes
+        // this atomically. A fresh post-resolution failure must replace an
+        // obsolete pending handoff instead of inheriting its long backoff.
+        self.delay_ms.store(delay_ms, .release);
     }
 
     fn take(self: *RendererRealizedRetryTimerHandoff) ?u64 {
@@ -690,6 +696,7 @@ started: std.Io.Event = .unset,
 /// recovery path does not add another xev handle to every terminal surface.
 renderer_realized_retry_h: xev.Timer,
 renderer_realized_retry_c: xev.Completion = .{},
+renderer_realized_retry_reset_c: xev.Completion = .{},
 renderer_realized_retry: RendererRealizedRetryState = .{},
 renderer_realized_retry_timer_handoff: RendererRealizedRetryTimerHandoff = .{},
 
@@ -1805,9 +1812,10 @@ fn armPendingRendererRealizedRetryTimer(self: *Thread) void {
 }
 
 fn armRendererRealizedRetryTimer(self: *Thread, delay_ms: u64) void {
-    self.renderer_realized_retry_h.run(
+    self.renderer_realized_retry_h.reset(
         &self.loop,
         &self.renderer_realized_retry_c,
+        &self.renderer_realized_retry_reset_c,
         delay_ms,
         Thread,
         self,
@@ -1824,7 +1832,9 @@ fn rendererRealizedRetryCallback(
     const self = self_ orelse return .disarm;
     _ = result catch |err| switch (err) {
         error.Canceled => {
-            _ = self.renderer_realized_retry.fired();
+            // `Timer.reset` cancels the previous deadline before arming the
+            // replacement. The replacement still owns the retained value and
+            // active latch, so this callback must not consume either.
             return .disarm;
         },
         else => {
