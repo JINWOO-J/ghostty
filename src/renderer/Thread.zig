@@ -2209,6 +2209,9 @@ test "resolved renderer realization retry resets an active deadline" {
 test "external renderer retry timer is handed to loop owner once" {
     var handoff: RendererRealizedRetryTimerHandoff = .{};
 
+    // A fresh failure can replace an obsolete backoff before the loop owner
+    // consumes its wake. Preserve the latest deadline without a duplicate arm.
+    handoff.publish(4_000);
     handoff.publish(250);
 
     try std.testing.expectEqual(@as(?u64, 250), handoff.take());
