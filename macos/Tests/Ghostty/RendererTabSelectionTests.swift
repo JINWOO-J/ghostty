@@ -2,6 +2,9 @@ import Testing
 @testable import Ghostty
 
 struct RendererTabSelectionTests {
+    private final class ObservationToken {}
+    private final class ObservationGroup {}
+
     @Test func standaloneWindowIsSelected() {
         #expect(RendererTabSelection.classify(
             hasTabGroup: false,
@@ -95,5 +98,61 @@ struct RendererTabSelectionTests {
 
         #expect(!needsRetry)
         #expect(releaseAttempts == 0)
+    }
+
+    @Test func tabGroupElectsOneRendererObservationOwner() {
+        let controllers = (0..<100).map { _ in ObservationToken() }
+        let observers = controllers.filter {
+            RendererTabObservationPlan.shouldObserve(
+                controller: $0,
+                controllers: controllers
+            )
+        }
+
+        #expect(observers.count == 1)
+        #expect(observers.first === controllers.first)
+    }
+
+    @Test func tabGroupMembershipChangeElectsFirstSurvivor() {
+        var controllers = (0..<3).map { _ in ObservationToken() }
+        let originalOwner = controllers[0]
+        let firstSurvivor = controllers[1]
+
+        controllers.removeFirst()
+        #expect(!RendererTabObservationPlan.shouldObserve(
+            controller: originalOwner,
+            controllers: controllers
+        ))
+        #expect(RendererTabObservationPlan.shouldObserve(
+            controller: firstSurvivor,
+            controllers: controllers
+        ))
+    }
+
+    @Test func staleMembershipCallbackKeepsNewGroupObservation() {
+        let originalOwner = ObservationToken()
+        let oldGroupSurvivor = ObservationToken()
+        let oldGroup = ObservationGroup()
+        let newGroup = ObservationGroup()
+
+        #expect(!RendererTabObservationPlan.shouldInvalidateCurrentObservation(
+            observedGroup: newGroup,
+            callbackGroup: oldGroup,
+            controller: originalOwner,
+            controllers: [oldGroupSurvivor]
+        ))
+    }
+
+    @Test func currentMembershipCallbackHandsObservationToFirstSurvivor() {
+        let originalOwner = ObservationToken()
+        let oldGroupSurvivor = ObservationToken()
+        let oldGroup = ObservationGroup()
+
+        #expect(RendererTabObservationPlan.shouldInvalidateCurrentObservation(
+            observedGroup: oldGroup,
+            callbackGroup: oldGroup,
+            controller: originalOwner,
+            controllers: [oldGroupSurvivor]
+        ))
     }
 }

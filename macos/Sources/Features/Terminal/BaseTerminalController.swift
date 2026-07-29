@@ -59,6 +59,31 @@ enum RendererReclamationRetry {
     }
 }
 
+enum RendererTabObservationPlan {
+    static func shouldObserve<Controller: AnyObject>(
+        controller: Controller,
+        controllers: [Controller]
+    ) -> Bool {
+        controllers.first === controller
+    }
+
+    static func shouldInvalidateCurrentObservation<
+        Group: AnyObject,
+        Controller: AnyObject
+    >(
+        observedGroup: Group?,
+        callbackGroup: Group,
+        controller: Controller,
+        controllers: [Controller]
+    ) -> Bool {
+        guard observedGroup === callbackGroup else { return false }
+        return !shouldObserve(
+            controller: controller,
+            controllers: controllers
+        )
+    }
+}
+
 /// A base class for windows that can contain Ghostty windows. This base class implements
 /// the bare minimum functionality that every terminal window in Ghostty should implement.
 ///
@@ -135,6 +160,7 @@ class BaseTerminalController: NSWindowController,
     private weak var observedRendererTabGroup: NSWindowTabGroup?
     private var rendererTabSelectionObservation: NSKeyValueObservation?
     private var rendererTabOverviewObservation: NSKeyValueObservation?
+    private var rendererTabWindowsObservation: NSKeyValueObservation?
 
     /// The previous frame information from the window
     private var savedFrame: SavedFrame?
@@ -290,6 +316,7 @@ class BaseTerminalController: NSWindowController,
         rendererReclamationTimer?.invalidate()
         rendererTabSelectionObservation?.invalidate()
         rendererTabOverviewObservation?.invalidate()
+        rendererTabWindowsObservation?.invalidate()
         NotificationCenter.default.removeObserver(self)
         undoManager?.removeAllActions(withTarget: self)
         if let eventMonitor {
@@ -1306,13 +1333,32 @@ class BaseTerminalController: NSWindowController,
     func windowWillClose(_ notification: Notification) {
         guard let window else { return }
 
+        let closingRendererTabGroup = observedRendererTabGroup ?? window.tabGroup
         rendererReclamationTimer?.invalidate()
         rendererReclamationTimer = nil
         rendererTabSelectionObservation?.invalidate()
         rendererTabSelectionObservation = nil
         rendererTabOverviewObservation?.invalidate()
         rendererTabOverviewObservation = nil
+        rendererTabWindowsObservation?.invalidate()
+        rendererTabWindowsObservation = nil
         observedRendererTabGroup = nil
+
+        if let closingRendererTabGroup {
+            DispatchQueue.main.async { [weak self, weak closingRendererTabGroup] in
+                guard let closingRendererTabGroup else { return }
+                let survivors = BaseTerminalController.rendererControllers(
+                    for: closingRendererTabGroup
+                ).filter { controller in
+                    guard let self else { return true }
+                    return controller !== self
+                }
+                BaseTerminalController.syncRendererVisibility(
+                    for: closingRendererTabGroup,
+                    controllers: survivors
+                )
+            }
+        }
 
         // Emit a final bell-state transition so any observers can clear state
         // without separately tracking NSWindow lifecycle events.
@@ -1373,17 +1419,47 @@ class BaseTerminalController: NSWindowController,
             return
         }
 
-        let windows = window.tabGroup?.windows ?? [window]
-        let controllers = windows.compactMap {
-            $0.windowController as? BaseTerminalController
-        }
-        if controllers.isEmpty {
+        guard let tabGroup = window.tabGroup else {
+            syncRendererTabSelectionObservation(tabGroup: nil)
             syncSurfaceTreeOcclusionState()
             return
         }
 
+        Self.syncRendererVisibility(for: tabGroup)
+    }
+
+    private static func syncRendererVisibility(
+        for tabGroup: NSWindowTabGroup
+    ) {
+        syncRendererVisibility(
+            for: tabGroup,
+            controllers: rendererControllers(for: tabGroup)
+        )
+    }
+
+    private static func rendererControllers(
+        for tabGroup: NSWindowTabGroup
+    ) -> [BaseTerminalController] {
+        tabGroup.windows.compactMap {
+            $0.windowController as? BaseTerminalController
+        }
+    }
+
+    private static func syncRendererVisibility(
+        for tabGroup: NSWindowTabGroup,
+        controllers: [BaseTerminalController]
+    ) {
+        guard !controllers.isEmpty else { return }
+
+        // One group owns one KVO observer set. Installing the same observers
+        // on every controller turns each selection callback into N group walks.
         for controller in controllers {
-            controller.syncRendererTabSelectionObservation()
+            controller.syncRendererTabSelectionObservation(
+                tabGroup: RendererTabObservationPlan.shouldObserve(
+                    controller: controller,
+                    controllers: controllers
+                ) ? tabGroup : nil
+            )
         }
 
         // Publish every deselection before realizing the selected tab. This
@@ -1400,32 +1476,72 @@ class BaseTerminalController: NSWindowController,
 
     /// Observe native tab selection and overview directly. Key/main-window
     /// callbacks do not cover tab-bar clicks or Show All Tabs transitions.
-    private func syncRendererTabSelectionObservation() {
-        let tabGroup = window?.tabGroup
+    private func syncRendererTabSelectionObservation(
+        tabGroup: NSWindowTabGroup?
+    ) {
         guard observedRendererTabGroup !== tabGroup else { return }
 
         rendererTabSelectionObservation?.invalidate()
         rendererTabSelectionObservation = nil
         rendererTabOverviewObservation?.invalidate()
         rendererTabOverviewObservation = nil
+        rendererTabWindowsObservation?.invalidate()
+        rendererTabWindowsObservation = nil
         observedRendererTabGroup = tabGroup
 
         guard let tabGroup else { return }
         rendererTabSelectionObservation = tabGroup.observe(
             \.selectedWindow,
              options: [.new]
-        ) { [weak self] _, _ in
-            Task { @MainActor [weak self] in
-                self?.syncRendererVisibilityForWindowGroup()
+        ) { [weak self, weak tabGroup] _, _ in
+            Task { @MainActor [weak self, weak tabGroup] in
+                guard let tabGroup else { return }
+                self?.rendererTabGroupDidChange(tabGroup)
             }
         }
         rendererTabOverviewObservation = tabGroup.observe(
             \.isOverviewVisible,
              options: [.new]
-        ) { [weak self] _, _ in
-            Task { @MainActor [weak self] in
-                self?.syncRendererVisibilityForWindowGroup()
+        ) { [weak self, weak tabGroup] _, _ in
+            Task { @MainActor [weak self, weak tabGroup] in
+                guard let tabGroup else { return }
+                self?.rendererTabGroupDidChange(tabGroup)
             }
+        }
+        rendererTabWindowsObservation = tabGroup.observe(
+            \.windows,
+             options: [.new]
+        ) { [weak self, weak tabGroup] _, _ in
+            Task { @MainActor [weak self, weak tabGroup] in
+                guard let tabGroup else { return }
+                self?.rendererTabGroupDidChange(tabGroup)
+            }
+        }
+    }
+
+    private func rendererTabGroupDidChange(_ tabGroup: NSWindowTabGroup) {
+        let controllers = Self.rendererControllers(for: tabGroup)
+        let remainsInGroup = controllers.contains { $0 === self }
+
+        // A membership callback is delivered through the old owner's token.
+        // Release it before electing a survivor only if this is still the
+        // observed group. A queued callback from an old group must not clear a
+        // newer group's observation.
+        if RendererTabObservationPlan.shouldInvalidateCurrentObservation(
+            observedGroup: observedRendererTabGroup,
+            callbackGroup: tabGroup,
+            controller: self,
+            controllers: controllers
+        ) {
+            syncRendererTabSelectionObservation(tabGroup: nil)
+        }
+
+        Self.syncRendererVisibility(
+            for: tabGroup,
+            controllers: controllers
+        )
+        if !remainsInGroup {
+            syncRendererVisibilityForWindowGroup()
         }
     }
 
