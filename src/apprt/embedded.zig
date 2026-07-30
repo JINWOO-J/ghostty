@@ -662,6 +662,14 @@ pub const IoWriteCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv
 pub const PtyTeeCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
 pub const RendererEventCallback = renderer.InstrumentationCallback;
 pub const RenderPresentedCallback = *const fn (?*anyopaque, u64) callconv(.c) void;
+pub const FontSizeActionCallback = *const fn (
+    ?*anyopaque,
+    CoreSurface.FontSizeActionKind,
+    f32,
+    f32,
+    bool,
+    bool,
+) callconv(.c) void;
 
 const SurfaceActionLifetime = struct {
     const ReleasePauseForTesting = struct {
@@ -837,6 +845,10 @@ pub const Surface = struct {
     // the public by-value Options ABI.
     render_presented_cb: ?RenderPresentedCallback = null,
     render_presented_userdata: ?*anyopaque = null,
+    // Binding callbacks run on the GUI thread. These fields belong to this
+    // exact embedded surface and are never inherited by child surfaces.
+    font_size_action_cb: ?FontSizeActionCallback = null,
+    font_size_action_userdata: ?*anyopaque = null,
 
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
@@ -1052,6 +1064,21 @@ pub const Surface = struct {
             font_size.points = opts.font_size;
             try self.core_surface.setFontSize(font_size);
         }
+    }
+
+    pub fn fontSizeActionDidPerform(
+        self: *Surface,
+        event: CoreSurface.FontSizeActionEvent,
+    ) void {
+        const callback = self.font_size_action_cb orelse return;
+        callback(
+            self.font_size_action_userdata,
+            event.kind,
+            event.previous_points,
+            event.current_points,
+            event.previous_adjusted,
+            event.current_adjusted,
+        );
     }
 
     /// Applies an optional embedder cap without ever raising the user's
@@ -3080,6 +3107,22 @@ pub const CAPI = struct {
         return true;
     }
 
+    /// Install a callback for resolved font binding actions on this surface.
+    /// Registration is one-shot and the embedder keeps userdata alive until
+    /// surface destruction returns.
+    export fn ghostty_surface_set_font_size_action_callback(
+        surface: *Surface,
+        callback: ?FontSizeActionCallback,
+        userdata: ?*anyopaque,
+    ) bool {
+        const registered_callback = callback orelse return false;
+        if (surface.font_size_action_cb != null) return false;
+
+        surface.font_size_action_cb = registered_callback;
+        surface.font_size_action_userdata = userdata;
+        return true;
+    }
+
     /// Force a render whose exact layer presentation is acknowledged with the
     /// caller-provided token.
     export fn ghostty_surface_render_now_with_token(surface: *Surface, token: u64) void {
@@ -4951,4 +4994,72 @@ test "render presentation callback setter is per surface" {
         @as(?*anyopaque, &parent_userdata),
         parent.render_presented_userdata,
     );
+}
+
+test "font size action callback preserves resolved action events" {
+    const Observation = struct {
+        calls: usize = 0,
+        kind: CoreSurface.FontSizeActionKind = .reset,
+        previous_points: f32 = 0,
+        current_points: f32 = 0,
+        previous_adjusted: bool = false,
+        current_adjusted: bool = false,
+    };
+    const Callbacks = struct {
+        fn fontSizeAction(
+            userdata: ?*anyopaque,
+            kind: CoreSurface.FontSizeActionKind,
+            previous_points: f32,
+            current_points: f32,
+            previous_adjusted: bool,
+            current_adjusted: bool,
+        ) callconv(.c) void {
+            const observation: *Observation =
+                @ptrCast(@alignCast(userdata.?));
+            observation.* = .{
+                .calls = observation.calls + 1,
+                .kind = kind,
+                .previous_points = previous_points,
+                .current_points = current_points,
+                .previous_adjusted = previous_adjusted,
+                .current_adjusted = current_adjusted,
+            };
+        }
+    };
+
+    var observation: Observation = .{};
+    var surface: Surface = undefined;
+    surface.font_size_action_cb = null;
+    surface.font_size_action_userdata = null;
+
+    try std.testing.expect(
+        CAPI.ghostty_surface_set_font_size_action_callback(
+            &surface,
+            Callbacks.fontSizeAction,
+            &observation,
+        ),
+    );
+    surface.fontSizeActionDidPerform(.{
+        .kind = .set,
+        .previous_points = 12,
+        .current_points = 255,
+        .previous_adjusted = false,
+        .current_adjusted = true,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), observation.calls);
+    try std.testing.expectEqual(
+        CoreSurface.FontSizeActionKind.set,
+        observation.kind,
+    );
+    try std.testing.expectEqual(
+        @as(f32, 12),
+        observation.previous_points,
+    );
+    try std.testing.expectEqual(
+        @as(f32, 255),
+        observation.current_points,
+    );
+    try std.testing.expect(!observation.previous_adjusted);
+    try std.testing.expect(observation.current_adjusted);
 }
