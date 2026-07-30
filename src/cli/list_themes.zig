@@ -630,6 +630,11 @@ const Preview = struct {
         };
 
         var loop: vaxis.Loop(Event) = .init(global.io(), &self.tty, &self.vx);
+        // vaxis 0.6 moved the reader task and the SIGWINCH handler out of
+        // Loop.init into start/installResizeHandler. Without them nothing ever
+        // pushes to the event queue and pollEvent below blocks forever.
+        try loop.start();
+
         const writer = self.tty.writer();
 
         try self.vx.enterAltScreen(writer);
@@ -640,6 +645,8 @@ const Preview = struct {
         if (self.cmux == null) {
             try self.vx.queryTerminal(writer, .fromSeconds(1));
         }
+        // Only needed when the terminal does not report resizes in band.
+        if (!self.vx.state.in_band_resize) try loop.installResizeHandler();
         try self.vx.setMouseMode(writer, true);
         if (self.cmux == null and self.vx.caps.color_scheme_updates)
             try self.vx.subscribeToColorSchemeUpdates(writer);
