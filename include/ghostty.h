@@ -1378,8 +1378,9 @@ GHOSTTY_API bool ghostty_surface_set_render_presented_callback(
     void* userdata);
 // cmux fork: install a per-surface callback for successfully performed font
 // binding actions. Call once after construction. The callback is synchronous
-// on the GUI thread, is not inherited by child surfaces, and its userdata must
-// remain valid until ghostty_surface_free returns.
+// on the GUI thread, must not destroy or otherwise reenter the surface, is not
+// inherited by child surfaces, and its userdata must remain valid until
+// ghostty_surface_free returns.
 GHOSTTY_API bool ghostty_surface_set_font_size_action_callback(
     ghostty_surface_t,
     ghostty_font_size_action_cb,
