@@ -14477,6 +14477,48 @@ test "Terminal: semantic prompt" {
     }
 }
 
+test "Terminal: scalar output overwrite clears semantic prompt row mark" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 20, .rows = 5 });
+    defer t.deinit(alloc);
+
+    try t.semanticPrompt(.init(.prompt_start));
+    for ("$ claude") |c| try t.print(c);
+    try t.semanticPrompt(.init(.end_input_start_output));
+
+    t.carriageReturn();
+    for ("Claude Code") |c| try t.print(c);
+
+    const list_cell = t.screens.active.pages.getCell(.{ .active = .{
+        .x = 0,
+        .y = 0,
+    } }).?;
+    try testing.expectEqual(.output, list_cell.cell.semantic_content);
+    try testing.expectEqual(.none, list_cell.row.semantic_prompt);
+}
+
+test "Terminal: batched output overwrite clears semantic prompt row mark" {
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .cols = 20, .rows = 5 });
+    defer t.deinit(alloc);
+
+    try t.semanticPrompt(.init(.prompt_start));
+    try t.printSlice(&.{ '$', ' ', 'c', 'l', 'a', 'u', 'd', 'e' });
+    try t.semanticPrompt(.init(.end_input_start_output));
+
+    t.carriageReturn();
+    try t.printSlice(&.{ 'C', 'l', 'a', 'u', 'd', 'e', ' ', 'C', 'o', 'd', 'e' });
+
+    const list_cell = t.screens.active.pages.getCell(.{ .active = .{
+        .x = 0,
+        .y = 0,
+    } }).?;
+    try testing.expectEqual(.output, list_cell.cell.semantic_content);
+    try testing.expectEqual(.none, list_cell.row.semantic_prompt);
+}
+
 test "Terminal: semantic prompt continuations" {
     const alloc = testing.allocator;
     const io_impl = testing.io;
