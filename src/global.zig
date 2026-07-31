@@ -261,6 +261,21 @@ pub fn init(opts: InitOpts) !void {
     // As early as possible, initialize our resource limits.
     self.rlimits = .init();
 
+    // We need to make sure the process locale is set properly. Locale
+    // affects a lot of behaviors in a shell.
+    //
+    // We need to re-sync the environment after this completes.
+    //
+    // This MUST happen before crash.init below: ensureLocale mutates the
+    // process environment (setenv can realloc the environ array, freeing
+    // the block our environ snapshot points at), and crash.init spawns the
+    // sentry-init thread. Spawning that thread first left a concurrent
+    // environ reader alive across the realloc, which crashed iOS with a
+    // SIGSEGV in the sentry-init thread during the first ghostty_init of a
+    // session (cmux INTERNAL builds 20260730090940 and 20260730213932).
+    try internal_os.ensureLocale();
+    syncEnviron();
+
     // Initialize our crash reporting.
     crash.init(self.alloc) catch |err| {
         std.log.warn(
@@ -277,13 +292,6 @@ pub fn init(opts: InitOpts) !void {
     // ))) |uuid| {
     //     std.log.warn("uuid={s}", .{uuid.string()});
     // } else std.log.warn("failed to capture event", .{});
-
-    // We need to make sure the process locale is set properly. Locale
-    // affects a lot of behaviors in a shell.
-    //
-    // We need to re-sync the environment after this completes.
-    try internal_os.ensureLocale();
-    syncEnviron();
 
     // Initialize glslang for shader compilation
     try glslang.init();
