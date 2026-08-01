@@ -63,3 +63,28 @@ test {
     try testing.expect(log.typeEnabled(.fault));
     log.log(testing.allocator, .default, "hello {d}", .{12});
 }
+
+test "disabled log skips formatting" {
+    const testing = std.testing;
+
+    const FormattingProbe = struct {
+        formatted: *bool,
+
+        pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            self.formatted.* = true;
+            try writer.writeAll("formatted");
+        }
+    };
+
+    var formatted = false;
+    const disabled: *Log = @ptrCast(&c._os_log_disabled);
+    try testing.expect(!disabled.typeEnabled(.debug));
+
+    disabled.log(
+        testing.allocator,
+        .debug,
+        "{f}",
+        .{FormattingProbe{ .formatted = &formatted }},
+    );
+    try testing.expect(!formatted);
+}
