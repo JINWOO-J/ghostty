@@ -22,3 +22,6 @@ rt_surface: *apprt.Surface,
 
 /// The renderer thread.
 thread: *renderer.Thread,
+
+/// The CoreGraphics display containing the surface, when known.
+macos_display_id: u32 = 0,

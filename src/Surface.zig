@@ -562,6 +562,10 @@ pub fn init(
         .surface_mailbox = .{ .surface = self, .app = app_mailbox },
         .rt_surface = rt_surface,
         .thread = &self.renderer_thread,
+        .macos_display_id = switch (rt_surface.platform) {
+            .macos => |v| v.display_id,
+            .ios => 0,
+        },
     });
     errdefer renderer_impl.deinit();
 

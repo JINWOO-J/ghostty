@@ -349,6 +349,9 @@ pub const Platform = union(PlatformTag) {
     pub const MacOS = if (builtin.target.os.tag.isDarwin()) struct {
         /// The view to render the surface on.
         nsview: objc.Object,
+
+        /// The CoreGraphics display containing the view, when known.
+        display_id: u32,
     } else void;
 
     pub const IOS = if (builtin.target.os.tag.isDarwin()) struct {
@@ -361,6 +364,7 @@ pub const Platform = union(PlatformTag) {
     pub const C = extern union {
         macos: extern struct {
             nsview: ?*anyopaque,
+            display_id: u32,
         },
 
         ios: extern struct {
@@ -376,7 +380,10 @@ pub const Platform = union(PlatformTag) {
                 const config = c_platform.macos;
                 const nsview = objc.Object.fromId(config.nsview orelse
                     break :macos error.NSViewMustBeSet);
-                break :macos .{ .macos = .{ .nsview = nsview } };
+                break :macos .{ .macos = .{
+                    .nsview = nsview,
+                    .display_id = config.display_id,
+                } };
             } else error.UnsupportedPlatform,
 
             .ios => if (IOS != void) ios: {

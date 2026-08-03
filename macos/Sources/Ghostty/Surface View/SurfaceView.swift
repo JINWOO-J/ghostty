@@ -696,10 +696,12 @@ extension Ghostty {
             config.userdata = Unmanaged.passUnretained(view).toOpaque()
 #if os(macOS)
             config.platform_tag = GHOSTTY_PLATFORM_MACOS
+            let screen = view.window?.screen ?? NSScreen.main
             config.platform = ghostty_platform_u(macos: ghostty_platform_macos_s(
-                nsview: Unmanaged.passUnretained(view).toOpaque()
+                nsview: Unmanaged.passUnretained(view).toOpaque(),
+                display_id: screen?.displayID ?? 0
             ))
-            config.scale_factor = NSScreen.main!.backingScaleFactor
+            config.scale_factor = Double(screen?.backingScaleFactor ?? 1)
 #elseif os(iOS)
             config.platform_tag = GHOSTTY_PLATFORM_IOS
             config.platform = ghostty_platform_u(ios: ghostty_platform_ios_s(
