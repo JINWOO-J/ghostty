@@ -3,6 +3,8 @@ const termio = @import("../termio.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
 
+// cmux fork: a minimal backend for libghostty embedders that own the PTY or
+// remote session. Delete when upstream exposes equivalent manual surface IO.
 pub const WriteCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void;
 
 pub const Config = struct {
@@ -94,13 +96,13 @@ pub const ThreadData = struct {
 
 test "manual queueWrite linefeed conversion" {
     const testing = std.testing;
-    var out = std.ArrayList(u8).init(testing.allocator);
-    defer out.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
 
     const cb = struct {
         fn write(ud: ?*anyopaque, ptr: [*]const u8, len: usize) callconv(.c) void {
             const list: *std.ArrayList(u8) = @ptrCast(@alignCast(ud.?));
-            _ = list.appendSlice(ptr[0..len]) catch {};
+            _ = list.appendSlice(testing.allocator, ptr[0..len]) catch {};
         }
     }.write;
 
@@ -110,4 +112,39 @@ test "manual queueWrite linefeed conversion" {
     var td: termio.Termio.ThreadData = undefined;
     try manual.queueWrite(testing.allocator, &td, "a\rb", true);
     try testing.expectEqualStrings("a\r\nb", out.items);
+}
+
+test "manual queueWrite preserves encoded user input" {
+    const testing = std.testing;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+
+    const cb = struct {
+        fn write(ud: ?*anyopaque, ptr: [*]const u8, len: usize) callconv(.c) void {
+            const list: *std.ArrayList(u8) = @ptrCast(@alignCast(ud.?));
+            _ = list.appendSlice(testing.allocator, ptr[0..len]) catch {};
+        }
+    }.write;
+
+    var manual = try Manual.init(testing.allocator, .{ .write_cb = cb, .write_userdata = &out });
+    defer manual.deinit();
+
+    var td: termio.Termio.ThreadData = undefined;
+    const inputs = [_][]const u8{
+        // Keyboard, committed UTF-8 text, SGR mouse, and bracketed paste all
+        // share this backend path after their surface-level encoding.
+        "\x1b[1;5A",
+        "\xce\xbb",
+        "\x1b[<0;10;5M",
+        "\x1b[200~hello\x1b[201~",
+    };
+    for (inputs) |input| {
+        try manual.queueWrite(testing.allocator, &td, input, false);
+    }
+
+    try testing.expectEqualSlices(
+        u8,
+        "\x1b[1;5A\xce\xbb\x1b[<0;10;5M\x1b[200~hello\x1b[201~",
+        out.items,
+    );
 }

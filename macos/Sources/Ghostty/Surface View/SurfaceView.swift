@@ -1,6 +1,7 @@
 import SwiftUI
 import UserNotifications
 import GhosttyKit
+import System
 
 extension Ghostty {
     /// Render a terminal for the active app in the environment.
@@ -46,9 +47,6 @@ extension Ghostty {
 
         // Maintain whether our window has focus (is key) or not
         @State private var windowFocus: Bool = true
-
-        // True if we're hovering over the left URL view, so we can show it on the right.
-        @State private var isHoveringURLLeft: Bool = false
 
         #if canImport(AppKit)
         // Observe SecureInput to detect when its enabled
@@ -133,51 +131,22 @@ extension Ghostty {
                     keyTables: surfaceView.keyTables,
                     keySequence: surfaceView.keySequence
                 )
+                .zIndex(1)
 #endif
 
-                // If we have a URL from hovering a link, we show that.
-                if let url = surfaceView.hoverUrl {
-                    let padding: CGFloat = 5
-                    let cornerRadius: CGFloat = 9
-                    ZStack {
-                        HStack {
-                            Spacer()
-                            VStack(alignment: .leading) {
-                                Spacer()
+                VStack(spacing: 0) {
+                    // If we have a URL from hovering a link, we show that.
+                    if let url = surfaceView.hoverUrl {
+                        URLHoverBanner(url: url)
+                    }
 
-                                Text(verbatim: url)
-                                    .padding(.init(top: padding, leading: padding, bottom: padding, trailing: padding))
-                                    .background(
-                                        UnevenRoundedRectangle(cornerRadii: .init(topLeading: cornerRadius))
-                                            .fill(.background)
-                                    )
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
-                                    .opacity(isHoveringURLLeft ? 1 : 0)
-                            }
-                        }
-
-                        HStack {
-                            VStack(alignment: .leading) {
-                                Spacer()
-
-                                Text(verbatim: url)
-                                    .padding(.init(top: padding, leading: padding, bottom: padding, trailing: padding))
-                                    .background(
-                                        UnevenRoundedRectangle(cornerRadii: .init(topTrailing: cornerRadius))
-                                            .fill(.background)
-                                    )
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
-                                    .opacity(isHoveringURLLeft ? 0 : 1)
-                                    .onHover(perform: { hovering in
-                                        isHoveringURLLeft = hovering
-                                    })
-                            }
-                            Spacer()
-                        }
+                    // Show a bar to indicate a child process has exited.
+                    if let msg = surfaceView.childExitedMessage {
+                        ChildExitedMessageBar(msg: msg)
+                            .font(.system(size: min(surfaceView.cellSize.height * 0.8, 30)))
                     }
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
 
                 #if canImport(AppKit)
                 // If we have secure input enabled and we're the focused surface and window
@@ -196,10 +165,7 @@ extension Ghostty {
                         surfaceView: surfaceView,
                         searchState: searchState,
                         onClose: {
-#if canImport(AppKit)
-                            Ghostty.moveFocus(to: surfaceView)
-#endif
-                            surfaceView.searchState = nil
+                            surfaceView.endSearch()
                         }
                     )
                 }
@@ -242,7 +208,6 @@ extension Ghostty {
                 SurfaceGrabHandle(surfaceView: surfaceView)
                 #endif
             }
-
         }
     }
 
@@ -412,7 +377,11 @@ extension Ghostty {
         var body: some View {
             GeometryReader { geo in
                 HStack(spacing: 4) {
-                    TextField("Search", text: $searchState.needle)
+                    BackportSelectionTextField(
+                        "Search",
+                        text: $searchState.needle,
+                        selection: $searchState.needleSelection
+                    )
                     .textFieldStyle(.plain)
                     .frame(width: 180)
                     .padding(.leading, 8)
@@ -436,6 +405,21 @@ extension Ghostty {
                                 .padding(.trailing, 8)
                         }
                     }
+                    .onChange(of: searchState.needle) { _ in
+                        searchState.writePasteboardNeedle()
+                    }
+                    .onReceive(
+                        NotificationCenter.default.publisher(
+                            for: OSApplication.didBecomeActiveNotification
+                        )
+                    ) { _ in
+                        // When the app becomes active, we want to check for external changes
+                        // to our synced needle.
+                        searchState.readPasteboardNeedle()
+                    }
+                    .onSubmit {
+                        _ = surfaceView.navigateSearchToNext()
+                    }
 #if canImport(AppKit)
                     .onExitCommand {
                         if searchState.needle.isEmpty {
@@ -448,10 +432,9 @@ extension Ghostty {
                     .backport.onKeyPress(.return) { modifiers in
                         if modifiers.contains(.shift) {
                             _ = surfaceView.navigateSearchToPrevious()
-                        } else {
-                            _ = surfaceView.navigateSearchToNext()
+                            return .handled
                         }
-                        return .handled
+                        return .ignored
                     }
 
                     Button(action: {
@@ -647,8 +630,13 @@ extension Ghostty {
         /// Explicit font size to use in points
         var fontSize: Float32?
 
-        /// Explicit working directory to set
-        var workingDirectory: String?
+        /// Explicit working directory. This is normalized on assignment to
+        /// remove any redundant and trailing path separators.
+        var workingDirectory: String? {
+            get { normalizedWorkingDirectory }
+            set { normalizedWorkingDirectory = newValue.map { FilePath($0).string } }
+        }
+        private var normalizedWorkingDirectory: String?
 
         /// Explicit command to set
         var command: String?
@@ -1267,43 +1255,5 @@ extension FocusedValues {
 
     struct FocusedGhosttySurfaceCellSize: FocusedValueKey {
         typealias Value = OSSize
-    }
-}
-
-// MARK: Search State
-
-extension Ghostty.SurfaceView {
-    class SearchState: ObservableObject {
-        @Published var needle: String = ""
-        @Published var selected: UInt?
-        @Published var total: UInt?
-
-        init(from startSearch: Ghostty.Action.StartSearch) {
-            self.needle = startSearch.needle ?? ""
-        }
-    }
-
-    func navigateSearchToNext() -> Bool {
-        guard let surface = self.surface else { return false }
-        let action = "navigate_search:next"
-        if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-#if canImport(AppKit)
-            AppDelegate.logger.warning("action failed action=\(action)")
-#endif
-            return false
-        }
-        return true
-    }
-
-    func navigateSearchToPrevious() -> Bool {
-        guard let surface = self.surface else { return false }
-        let action = "navigate_search:previous"
-        if !ghostty_surface_binding_action(surface, action, UInt(action.lengthOfBytes(using: .utf8))) {
-#if canImport(AppKit)
-            AppDelegate.logger.warning("action failed action=\(action)")
-#endif
-            return false
-        }
-        return true
     }
 }

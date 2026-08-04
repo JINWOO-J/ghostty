@@ -101,45 +101,31 @@ pub const ModeState = struct {
 /// be used directly but rather through the ModeState struct.
 pub const ModePacked = packed_struct: {
     const StructField = std.builtin.Type.StructField;
-    var fields: [entries.len]StructField = undefined;
-    for (entries, 0..) |entry, i| {
-        fields[i] = .{
-            .name = entry.name,
-            .type = bool,
-            .default_value_ptr = &entry.default,
-            .is_comptime = false,
-            .alignment = 0,
-        };
+    var names: [entries.len][]const u8 = undefined;
+    var types = [_]type{bool} ** entries.len;
+    var attrs: [entries.len]StructField.Attributes = undefined;
+
+    for (entries, &names, &attrs) |entry, *name, *attr| {
+        name.* = entry.name;
+        attr.* = .{ .default_value_ptr = &entry.default };
     }
 
-    break :packed_struct @Type(.{ .@"struct" = .{
-        .layout = .@"packed",
-        .fields = &fields,
-        .decls = &.{},
-        .is_tuple = false,
-    } });
+    break :packed_struct @Struct(.@"packed", null, &names, &types, &attrs);
 };
 
 /// An enum(u16) of the available modes. See entries for available values.
 pub const Mode = mode_enum: {
-    const EnumField = std.builtin.Type.EnumField;
-    var fields: [entries.len]EnumField = undefined;
-    for (entries, 0..) |entry, i| {
-        fields[i] = .{
-            .name = entry.name,
-            .value = @as(ModeTag.Backing, @bitCast(ModeTag{
-                .value = entry.value,
-                .ansi = entry.ansi,
-            })),
-        };
+    var names: [entries.len][]const u8 = undefined;
+    var values: [entries.len]ModeTag.Backing = undefined;
+    for (entries, &names, &values) |entry, *name, *value| {
+        name.* = entry.name;
+        value.* = @bitCast(ModeTag{
+            .value = entry.value,
+            .ansi = entry.ansi,
+        });
     }
 
-    break :mode_enum @Type(.{ .@"enum" = .{
-        .tag_type = ModeTag.Backing,
-        .fields = &fields,
-        .decls = &.{},
-        .is_exhaustive = true,
-    } });
+    break :mode_enum @Enum(ModeTag.Backing, .exhaustive, &names, &values);
 };
 
 /// The tag type for our enum is a u16 but we use a packed struct
@@ -270,6 +256,11 @@ const entries: []const ModeEntry = &.{
     .{ .name = "reverse_wrap", .value = 45 },
     .{ .name = "alt_screen_legacy", .value = 47 },
     .{ .name = "keypad_keys", .value = 66 },
+    // DEC Backarrow Key Mode (DECBKM)
+    // See https://vt100.net/dec/ek-vt3xx-tp-002.pdf page 170
+    // If `false` (the default), `backspace` emits 0x7f
+    // If `true`, `backspace` emits 0x08
+    .{ .name = "backarrow_key_mode", .value = 67 },
     .{ .name = "enable_left_and_right_margin", .value = 69 },
     .{ .name = "mouse_event_normal", .value = 1000 },
     .{ .name = "mouse_event_button", .value = 1002 },

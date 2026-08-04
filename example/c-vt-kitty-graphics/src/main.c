@@ -125,6 +125,17 @@ int main() {
   }
   printf("\nKitty graphics storage is available.\n");
 
+  /*
+   * The storage-wide generation changes on every image/placement
+   * mutation. Renderers can compare it against the value from the
+   * previous frame: if unchanged, placement iteration and image
+   * staleness checks can be skipped entirely.
+   */
+  uint64_t generation = 0;
+  ghostty_kitty_graphics_get(graphics, GHOSTTY_KITTY_GRAPHICS_DATA_GENERATION,
+                             &generation);
+  printf("Storage generation: %llu\n", (unsigned long long)generation);
+
   /* Iterate placements to find the image ID. */
   GhosttyKittyGraphicsPlacementIterator iter = NULL;
   if (ghostty_kitty_graphics_placement_iterator_new(NULL, &iter) != GHOSTTY_SUCCESS) {
@@ -145,14 +156,15 @@ int main() {
     bool is_virtual = false;
     int32_t z = 0;
 
-    ghostty_kitty_graphics_placement_get(iter,
-        GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IMAGE_ID, &image_id);
-    ghostty_kitty_graphics_placement_get(iter,
-        GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_PLACEMENT_ID, &placement_id);
-    ghostty_kitty_graphics_placement_get(iter,
-        GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IS_VIRTUAL, &is_virtual);
-    ghostty_kitty_graphics_placement_get(iter,
-        GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_Z, &z);
+    ghostty_kitty_graphics_placement_get_multi(iter, 4,
+        (GhosttyKittyGraphicsPlacementData[]){
+            GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IMAGE_ID,
+            GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_PLACEMENT_ID,
+            GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IS_VIRTUAL,
+            GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_Z,
+        },
+        (void*[]){ &image_id, &placement_id, &is_virtual, &z },
+        NULL);
 
     printf("  placement #%d: image_id=%u placement_id=%u virtual=%s z=%d\n",
            placement_count, image_id, placement_id,
@@ -169,15 +181,30 @@ int main() {
     uint32_t width = 0, height = 0, number = 0;
     GhosttyKittyImageFormat format = 0;
     size_t data_len = 0;
+    uint64_t image_generation = 0;
 
-    ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_NUMBER, &number);
-    ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_WIDTH, &width);
-    ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_HEIGHT, &height);
-    ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_FORMAT, &format);
-    ghostty_kitty_graphics_image_get(image, GHOSTTY_KITTY_IMAGE_DATA_DATA_LEN, &data_len);
+    /*
+     * The per-image generation changes on every add/replace of this
+     * image ID, so it detects retransmissions even when the size and
+     * format are unchanged. Texture caches should key staleness on it.
+     */
+    ghostty_kitty_graphics_image_get_multi(image, 6,
+        (GhosttyKittyGraphicsImageData[]){
+            GHOSTTY_KITTY_IMAGE_DATA_NUMBER,
+            GHOSTTY_KITTY_IMAGE_DATA_WIDTH,
+            GHOSTTY_KITTY_IMAGE_DATA_HEIGHT,
+            GHOSTTY_KITTY_IMAGE_DATA_FORMAT,
+            GHOSTTY_KITTY_IMAGE_DATA_DATA_LEN,
+            GHOSTTY_KITTY_IMAGE_DATA_GENERATION,
+        },
+        (void*[]){ &number, &width, &height, &format, &data_len,
+                   &image_generation },
+        NULL);
 
-    printf("    image: number=%u size=%ux%u format=%d data_len=%zu\n",
-           number, width, height, format, data_len);
+    printf("    image: number=%u size=%ux%u format=%d data_len=%zu "
+           "generation=%llu\n",
+           number, width, height, format, data_len,
+           (unsigned long long)image_generation);
 
     /* Compute the rendered pixel size and grid size. */
     uint32_t px_w = 0, px_h = 0, cols = 0, rows = 0;
