@@ -147,6 +147,25 @@ pub export fn ghostty_init(argc: usize, argv: [*][*:0]u8) c_int {
     return 0;
 }
 
+/// Re-read the process environment.
+///
+/// `ghostty_init` records where the environment block lives, and libc moves
+/// that block whenever `setenv` adds a name that was not already there.
+/// An embedder that writes to the environment after `ghostty_init` therefore
+/// leaves every later `global.environMap()` reading an address that no longer
+/// holds the environment — XDG path resolution among them.
+///
+/// The GTK apprt calls `global.syncEnviron` itself for this reason. The
+/// embedded apprt cannot: the writes happen in the host application, which
+/// until now had no way to say so. This is that way.
+///
+/// Must be called after `ghostty_init`, from the thread that made the change,
+/// with no other ghostty call in flight — the global environment has no
+/// concurrency control.
+pub export fn ghostty_sync_environ() void {
+    global.syncEnviron();
+}
+
 /// Runs an action if it is specified. If there is no action this returns
 /// false. If there is an action then this doesn't return.
 pub export fn ghostty_cli_try_action() void {
