@@ -1043,10 +1043,10 @@ const Subprocess = struct {
                     const f = struct {
                         fn callback(cmd: *Command) ?u8 {
                             const sp = cmd.getData(Subprocess) orelse unreachable;
-                            sp.childPreExec() catch |err| log.err(
-                                "error initializing child: {}",
-                                .{err},
-                            );
+                            sp.childPreExec() catch |err| {
+                                log.err("error initializing child: {}", .{err});
+                                return 1;
+                            };
                             return null;
                         }
                     };
@@ -1120,9 +1120,10 @@ const Subprocess = struct {
         self.process = null;
     }
 
-    /// Stop the subprocess. This is safe to call anytime. This will wait
-    /// for the subprocess to register that it has been signalled, but not
-    /// for it to terminate, so it will not block.
+    /// Stop the subprocess. This is safe to call anytime. This call is
+    /// synchronous. The POSIX fork/exec path polls only for a bounded period
+    /// while terminating the process group; other platforms use separate
+    /// cleanup paths with their own waiting behavior.
     /// This does not close the pty.
     pub fn stop(self: *Subprocess) void {
         switch (self.process orelse return) {
@@ -1130,7 +1131,7 @@ const Subprocess = struct {
                 // Note: this will also wait for the command to exit, so
                 // DO NOT call cmd.wait
                 killCommand(cmd) catch |err|
-                    log.err("error sending SIGHUP to command, may hang: {}", .{err});
+                    log.err("error terminating command: {}", .{err});
             },
 
             .flatpak => |*cmd| if (comptime build_config.flatpak) {
@@ -1167,9 +1168,10 @@ const Subprocess = struct {
         }
     }
 
-    /// Kill the underlying subprocess. This sends a SIGHUP to the child
-    /// process. This also waits for the command to exit and will return the
-    /// exit code.
+    /// Kill the underlying subprocess. On POSIX this gives the process group
+    /// a bounded SIGHUP grace period, then uses SIGKILL for another bounded
+    /// period. A slow SIGHUP handler may therefore be interrupted so surface
+    /// teardown cannot wait forever.
     fn killCommand(command: *Command) !void {
         if (command.pid) |pid| {
             switch (builtin.os.tag) {
@@ -1187,64 +1189,151 @@ const Subprocess = struct {
     }
 
     fn killPid(pid: c.pid_t) !void {
-        return killPidWithGrace(pid, 100);
+        return killPidWithOptions(pid, .{});
     }
 
-    /// Stop a process group without allowing a SIGHUP-resistant child to
-    /// wedge surface teardown forever. Each attempt is followed by a 10 ms
-    /// reap interval, so the production grace period is approximately one
-    /// second before escalating the whole group to SIGKILL.
-    fn killPidWithGrace(pid: c.pid_t, graceful_attempts: usize) !void {
-        const pgid = getpgid(pid) orelse {
+    const KillPidOptions = struct {
+        group_lookup_attempts: usize = 100,
+        graceful_attempts: usize = 100,
+        force_attempts: usize = 100,
+    };
+
+    /// Stop a process group without allowing child setup or signal handling
+    /// to wedge surface teardown forever. Each attempt is followed by a 10 ms
+    /// reap interval, so the default lookup, grace, and force periods are each
+    /// bounded to approximately one second.
+    fn killPidWithOptions(pid: c.pid_t, options: KillPidOptions) !void {
+        const pgid = getpgid(pid, options.group_lookup_attempts) orelse {
             // Darwin no longer exposes a process group for an exited child,
             // even while its wait status is still pending. The process
             // watcher normally owns reaping, but teardown can win that race.
-            _ = try reapExitedChild(pid);
-            return;
+            if (try reapExitedChild(pid)) return;
+
+            // The child may still share our process group if its pre-exec
+            // setup stalled. Never signal that group; fall back to the direct
+            // PID with the same bounded grace and force periods.
+            return killDirectPid(pid, options);
         };
 
         // It is possible to send a killpg between the time that
         // our child process calls setsid but before or simultaneous
         // to calling execve. In this case, the direct child dies
-        // but grandchildren survive. To work around this, we loop
-        // and repeatedly kill the process group until all
-        // descendents are well and truly dead. We will not rest
-        // until the entire family tree is obliterated.
-        var attempts: usize = 0;
-        while (true) : (attempts += 1) {
-            const signal = if (attempts < graceful_attempts) c.SIGHUP else c.SIGKILL;
-            if (attempts == graceful_attempts) {
-                log.warn("process group ignored SIGHUP, escalating pgid={}", .{pgid});
-            }
+        // but same-group descendants survive. Continue probing until killpg
+        // reports ESRCH or the bounded force period expires, even if the
+        // direct child has already been reaped. Descendants that move to a
+        // different process group are outside this cleanup.
+        switch (try signalProcessGroup(
+            pid,
+            pgid,
+            c.SIGHUP,
+            options.graceful_attempts,
+            false,
+        )) {
+            .gone => return,
+            .child_moved => return killDirectPid(pid, options),
+            .deadline => {},
+        }
 
-            switch (posix.errno(c.killpg(pgid, signal))) {
-                .SUCCESS => log.debug("process group signaled pgid={} signal={}", .{ pgid, signal }),
-                .SRCH => {
-                    // The child may have exited between getpgid and killpg.
-                    // Consume its wait status if the process watcher has not.
-                    _ = try reapExitedChild(pid);
-                    return;
-                },
-                else => |err| killpg: {
-                    if ((comptime builtin.target.os.tag.isDarwin()) and
-                        err == .PERM)
-                    {
-                        log.debug("killpg failed with EPERM, expected on Darwin and ignoring", .{});
-                        break :killpg;
-                    }
+        log.warn("process group ignored SIGHUP, escalating pgid={}", .{pgid});
+        switch (try signalProcessGroup(
+            pid,
+            pgid,
+            c.SIGKILL,
+            options.force_attempts,
+            true,
+        )) {
+            .gone => return,
+            .child_moved => return killDirectPid(pid, options),
+            .deadline => {},
+        }
 
+        _ = try reapExitedChild(pid);
+        log.warn(
+            "process group did not exit before teardown deadline pgid={} pid={}",
+            .{ pgid, pid },
+        );
+    }
+
+    const GroupSignalResult = enum { gone, child_moved, deadline };
+
+    /// Signal a process group once, then poll it for at most `attempts`
+    /// intervals. Sending destructive signals only once reduces the window in
+    /// which a recycled numeric process-group ID could target unrelated work.
+    fn signalProcessGroup(
+        pid: c.pid_t,
+        pgid: c.pid_t,
+        signal: c_int,
+        attempts: usize,
+        reap_during_observation: bool,
+    ) !GroupSignalResult {
+        switch (posix.errno(c.killpg(pgid, signal))) {
+            .SUCCESS => log.debug("process group signaled pgid={} signal={}", .{ pgid, signal }),
+            .SRCH => return if (try reapExitedChild(pid)) .gone else .child_moved,
+            else => |err| {
+                if ((comptime builtin.target.os.tag.isDarwin()) and err == .PERM) {
+                    log.warn("killpg denied on Darwin pgid={} signal={}", .{ pgid, signal });
+                } else {
                     log.warn("error killing process group pgid={} err={}", .{ pgid, err });
                     return error.KillFailed;
+                }
+            },
+        }
+
+        for (0..attempts) |_| {
+            // Keep the direct child waitable through the grace period so its
+            // PID continues to reserve the process-group ID until the final
+            // destructive signal. After SIGKILL has been sent, opportunistic
+            // reaping is safe because the remaining probes use signal 0 only.
+            if (reap_during_observation) _ = try reapExitedChild(pid);
+
+            switch (posix.errno(c.killpg(pgid, 0))) {
+                .SUCCESS => {},
+                .SRCH => return if (try reapExitedChild(pid)) .gone else .child_moved,
+                else => |err| {
+                    if (!((comptime builtin.target.os.tag.isDarwin()) and err == .PERM)) {
+                        log.warn("error probing process group pgid={} err={}", .{ pgid, err });
+                        return error.KillFailed;
+                    }
                 },
             }
 
-            // See Command.zig wait for why we specify WNOHANG.
-            // The gist is that it lets us detect when children
-            // are still alive without blocking so that we can
-            // kill them again.
-            if (try reapExitedChild(pid)) break;
             try std.Io.sleep(global.io(), .fromMilliseconds(10), .awake);
         }
+
+        return .deadline;
+    }
+
+    /// Bounded safe fallback for a child that never left our process group.
+    /// Signaling the group in this state would kill Ghostty itself.
+    fn killDirectPid(pid: c.pid_t, options: KillPidOptions) !void {
+        if (try signalDirectPid(pid, c.SIGHUP, options.graceful_attempts)) return;
+
+        log.warn("child ignored SIGHUP, escalating pid={}", .{pid});
+        if (try signalDirectPid(pid, c.SIGKILL, options.force_attempts)) return;
+
+        _ = try reapExitedChild(pid);
+        log.warn("child did not exit before teardown deadline pid={}", .{pid});
+    }
+
+    fn signalDirectPid(pid: c.pid_t, signal: c_int, attempts: usize) !bool {
+        switch (posix.errno(c.kill(pid, signal))) {
+            .SUCCESS => log.debug("process signaled pid={} signal={}", .{ pid, signal }),
+            .SRCH => {
+                _ = try reapExitedChild(pid);
+                return true;
+            },
+            else => |err| {
+                log.warn("error killing process pid={} err={}", .{ pid, err });
+                return error.KillFailed;
+            },
+        }
+
+        for (0..attempts) |_| {
+            if (try reapExitedChild(pid)) return true;
+            try std.Io.sleep(global.io(), .fromMilliseconds(10), .awake);
+        }
+
+        return false;
     }
 
     /// Reap the child if it has exited without racing the process watcher.
@@ -1272,19 +1361,16 @@ const Subprocess = struct {
         }
     }
 
-    fn getpgid(pid: c.pid_t) ?c.pid_t {
+    fn getpgid(pid: c.pid_t, attempts: usize) ?c.pid_t {
         // Get our process group ID. Before the child pid calls setsid
         // the pgid will be ours because we forked it. Its possible that
         // we may be calling this before setsid if we are killing a surface
         // VERY quickly after starting it.
         const my_pgid = c.getpgid(0);
 
-        // We loop while pgid == my_pgid. The expectation if we have a valid
-        // pid is that setsid will eventually be called because it is the
-        // FIRST thing the child process does and as far as I can tell,
-        // setsid cannot fail. I'm sure that's not true, but I'd rather
-        // have a bug reported than defensively program against it now.
-        while (true) {
+        // Wait only for a bounded period. Child pre-exec setup can fail or
+        // stall; in that case the caller must avoid signaling our group.
+        for (0..attempts) |_| {
             const pgid = c.getpgid(pid);
             if (pgid == my_pgid) {
                 log.warn("pgid is our own, retrying", .{});
@@ -1306,8 +1392,16 @@ const Subprocess = struct {
                 }
             }
 
+            if (pgid != pid) {
+                log.warn("child has unexpected process group pid={} pgid={}", .{ pid, pgid });
+                return null;
+            }
+
             return pgid;
         }
+
+        log.warn("child did not leave our process group before deadline pid={}", .{pid});
+        return null;
     }
 
     /// Kill the underlying process started via Flatpak host command.
@@ -2122,7 +2216,61 @@ test "subprocess stop reaps an already-exited child on Darwin" {
     try testing.expectEqual(posix.E.CHILD, wait_err);
 }
 
-test "subprocess stop escalates when child ignores SIGHUP" {
+fn testReadAllWithDeadline(fd: posix.fd_t, buf: []u8) !void {
+    var offset: usize = 0;
+    for (0..500) |_| {
+        if (offset == buf.len) return;
+        const result = posix.system.read(fd, buf[offset..].ptr, buf.len - offset);
+        switch (posix.errno(result)) {
+            .SUCCESS => {
+                if (result == 0) return error.EndOfStream;
+                offset += @intCast(result);
+            },
+            .INTR => continue,
+            .AGAIN => try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake),
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+
+    return error.Timeout;
+}
+
+fn testExpectPipeEOFWithDeadline(fd: posix.fd_t) !void {
+    var byte: [1]u8 = undefined;
+    for (0..500) |_| {
+        const result = posix.system.read(fd, &byte, 1);
+        switch (posix.errno(result)) {
+            .SUCCESS => if (result == 0) return else return error.UnexpectedData,
+            .INTR => continue,
+            .AGAIN => try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake),
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+
+    return error.Timeout;
+}
+
+fn testWriteAllRetryInterrupt(fd: posix.fd_t, buf: []const u8) !void {
+    var offset: usize = 0;
+    while (offset < buf.len) {
+        const result = posix.system.write(fd, buf[offset..].ptr, buf.len - offset);
+        switch (posix.errno(result)) {
+            .SUCCESS => offset += @intCast(result),
+            .INTR => continue,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+}
+
+const TestHupProbe = struct {
+    var write_fd: posix.fd_t = -1;
+
+    fn handler(_: posix.SIG) callconv(.c) void {
+        if (write_fd >= 0) _ = posix.system.write(write_fd, "h", 1);
+    }
+};
+
+test "subprocess stop gracefully signals then kills the complete process group" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 
     const testing = std.testing;
@@ -2130,6 +2278,105 @@ test "subprocess stop escalates when child ignores SIGHUP" {
     const ready_pipe = try compat_fd.pipe2(.{ .CLOEXEC = true });
     defer compat_fd.close(ready_pipe[0]);
     defer compat_fd.close(ready_pipe[1]);
+    try testing.expect(ReadThread.setNonblock(ready_pipe[0]));
+    const hup_pipe = try compat_fd.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
+    defer compat_fd.close(hup_pipe[0]);
+    defer compat_fd.close(hup_pipe[1]);
+    const death_pipe = try compat_fd.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
+    defer compat_fd.close(death_pipe[0]);
+    var parent_death_writer_open = true;
+    defer if (parent_death_writer_open) compat_fd.close(death_pipe[1]);
+
+    const pid: posix.pid_t = pid: {
+        const rc = posix.system.fork();
+        switch (posix.errno(rc)) {
+            .SUCCESS => break :pid @intCast(rc),
+            .AGAIN, .NOMEM => return error.SystemResources,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    };
+    if (pid == 0) {
+        if (c.setsid() < 0) {
+            testWriteAllRetryInterrupt(ready_pipe[1], "e") catch {};
+            c._exit(2);
+        }
+        testWriteAllRetryInterrupt(ready_pipe[1], "s") catch c._exit(3);
+
+        // The direct child exits on SIGHUP while its descendant records the
+        // graceful signal and stays alive until the SIGKILL phase.
+        var default_action: posix.Sigaction = .{
+            .handler = .{ .handler = posix.SIG.DFL },
+            .mask = posix.sigemptyset(),
+            .flags = 0,
+        };
+        posix.sigaction(posix.SIG.HUP, &default_action, null);
+
+        const helper_rc = posix.system.fork();
+        if (posix.errno(helper_rc) != .SUCCESS) {
+            testWriteAllRetryInterrupt(ready_pipe[1], "f") catch {};
+            c._exit(4);
+        }
+        const helper_pid: c.pid_t = @intCast(helper_rc);
+        if (helper_pid == 0) {
+            TestHupProbe.write_fd = hup_pipe[1];
+            var action: posix.Sigaction = .{
+                .handler = .{ .handler = TestHupProbe.handler },
+                .mask = posix.sigemptyset(),
+                .flags = 0,
+            };
+            posix.sigaction(posix.SIG.HUP, &action, null);
+            testWriteAllRetryInterrupt(ready_pipe[1], "r") catch c._exit(5);
+            while (true) _ = c.pause();
+        }
+
+        compat_fd.close(death_pipe[1]);
+        while (true) _ = c.pause();
+    }
+    compat_fd.close(death_pipe[1]);
+    parent_death_writer_open = false;
+
+    var cleanup_needed = true;
+    var group_ready = false;
+    defer if (cleanup_needed) {
+        if (group_ready) _ = c.killpg(pid, c.SIGKILL) else _ = c.kill(pid, c.SIGKILL);
+        var status: c_int = 0;
+        _ = std.c.waitpid(pid, &status, 0);
+    };
+
+    var child_state: [1]u8 = undefined;
+    try testReadAllWithDeadline(ready_pipe[0], &child_state);
+    try testing.expectEqual(@as(u8, 's'), child_state[0]);
+    group_ready = true;
+    try testReadAllWithDeadline(ready_pipe[0], &child_state);
+    try testing.expectEqual(@as(u8, 'r'), child_state[0]);
+
+    const started = std.Io.Timestamp.now(testing.io, .awake);
+    try Subprocess.killPid(pid);
+    const elapsed_ms = started.untilNow(testing.io, .awake).toMilliseconds();
+    try testing.expect(elapsed_ms < 5_000);
+
+    var hup_seen: [1]u8 = undefined;
+    try testReadAllWithDeadline(hup_pipe[0], &hup_seen);
+    try testing.expectEqual(@as(u8, 'h'), hup_seen[0]);
+    try testExpectPipeEOFWithDeadline(death_pipe[0]);
+
+    var status: c_int = 0;
+    const wait_result = std.c.waitpid(pid, &status, std.c.W.NOHANG);
+    const wait_err = posix.errno(wait_result);
+    try testing.expectEqual(@as(c.pid_t, -1), wait_result);
+    try testing.expectEqual(posix.E.CHILD, wait_err);
+    cleanup_needed = false;
+}
+
+test "subprocess stop bounds process-group discovery and direct fallback" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const c = Subprocess.c;
+    const ready_pipe = try compat_fd.pipe2(.{ .CLOEXEC = true });
+    defer compat_fd.close(ready_pipe[0]);
+    defer compat_fd.close(ready_pipe[1]);
+    try testing.expect(ReadThread.setNonblock(ready_pipe[0]));
 
     const pid: posix.pid_t = pid: {
         const rc = posix.system.fork();
@@ -2146,33 +2393,47 @@ test "subprocess stop escalates when child ignores SIGHUP" {
             .flags = 0,
         };
         posix.sigaction(posix.SIG.HUP, &action, null);
-        _ = c.setsid();
-        _ = posix.system.write(ready_pipe[1], "r", 1);
+        testWriteAllRetryInterrupt(ready_pipe[1], "r") catch c._exit(2);
         while (true) _ = c.pause();
     }
 
-    var reaped = false;
-    defer if (!reaped) {
+    var cleanup_needed = true;
+    defer if (cleanup_needed) {
         _ = c.kill(pid, c.SIGKILL);
         var status: c_int = 0;
         _ = std.c.waitpid(pid, &status, 0);
     };
 
     var ready: [1]u8 = undefined;
-    try testing.expectEqual(@as(isize, 1), posix.system.read(ready_pipe[0], &ready, 1));
+    try testReadAllWithDeadline(ready_pipe[0], &ready);
+    try testing.expectEqual(@as(u8, 'r'), ready[0]);
 
-    // Keep the test fast while exercising the same escalation path as the
-    // one-second production grace period.
-    try Subprocess.killPidWithGrace(pid, 2);
+    const started = std.Io.Timestamp.now(testing.io, .awake);
+    const options: Subprocess.KillPidOptions = .{
+        .group_lookup_attempts = 2,
+        .graceful_attempts = 2,
+        .force_attempts = 10,
+    };
+    try testing.expectEqual(@as(?c.pid_t, null), Subprocess.getpgid(
+        pid,
+        options.group_lookup_attempts,
+    ));
+    // Exercise the actual orchestration without risking a test regression
+    // signaling the runner's process group: zero lookup attempts forces the
+    // same bounded direct-child fallback after the lookup behavior above has
+    // been verified independently.
+    var fallback_options = options;
+    fallback_options.group_lookup_attempts = 0;
+    try Subprocess.killPidWithOptions(pid, fallback_options);
+    const elapsed_ms = started.untilNow(testing.io, .awake).toMilliseconds();
+    try testing.expect(elapsed_ms < 2_000);
 
     var status: c_int = 0;
     const wait_result = std.c.waitpid(pid, &status, std.c.W.NOHANG);
     const wait_err = posix.errno(wait_result);
-    reaped = wait_result == pid or
-        (wait_result < 0 and wait_err == .CHILD);
-
     try testing.expectEqual(@as(c.pid_t, -1), wait_result);
     try testing.expectEqual(posix.E.CHILD, wait_err);
+    cleanup_needed = false;
 }
 
 /// Builds the argv array for the process we should exec for the
