@@ -1187,6 +1187,14 @@ const Subprocess = struct {
     }
 
     fn killPid(pid: c.pid_t) !void {
+        return killPidWithGrace(pid, 100);
+    }
+
+    /// Stop a process group without allowing a SIGHUP-resistant child to
+    /// wedge surface teardown forever. Each attempt is followed by a 10 ms
+    /// reap interval, so the production grace period is approximately one
+    /// second before escalating the whole group to SIGKILL.
+    fn killPidWithGrace(pid: c.pid_t, graceful_attempts: usize) !void {
         const pgid = getpgid(pid) orelse {
             // Darwin no longer exposes a process group for an exited child,
             // even while its wait status is still pending. The process
@@ -1202,9 +1210,15 @@ const Subprocess = struct {
         // and repeatedly kill the process group until all
         // descendents are well and truly dead. We will not rest
         // until the entire family tree is obliterated.
-        while (true) {
-            switch (posix.errno(c.killpg(pgid, c.SIGHUP))) {
-                .SUCCESS => log.debug("process group killed pgid={}", .{pgid}),
+        var attempts: usize = 0;
+        while (true) : (attempts += 1) {
+            const signal = if (attempts < graceful_attempts) c.SIGHUP else c.SIGKILL;
+            if (attempts == graceful_attempts) {
+                log.warn("process group ignored SIGHUP, escalating pgid={}", .{pgid});
+            }
+
+            switch (posix.errno(c.killpg(pgid, signal))) {
+                .SUCCESS => log.debug("process group signaled pgid={} signal={}", .{ pgid, signal }),
                 .SRCH => {
                     // The child may have exited between getpgid and killpg.
                     // Consume its wait status if the process watcher has not.
@@ -2097,6 +2111,59 @@ test "subprocess stop reaps an already-exited child on Darwin" {
     try testing.expect(exited);
 
     try Subprocess.killPid(pid);
+
+    var status: c_int = 0;
+    const wait_result = std.c.waitpid(pid, &status, std.c.W.NOHANG);
+    const wait_err = posix.errno(wait_result);
+    reaped = wait_result == pid or
+        (wait_result < 0 and wait_err == .CHILD);
+
+    try testing.expectEqual(@as(c.pid_t, -1), wait_result);
+    try testing.expectEqual(posix.E.CHILD, wait_err);
+}
+
+test "subprocess stop escalates when child ignores SIGHUP" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const c = Subprocess.c;
+    const ready_pipe = try compat_fd.pipe2(.{ .CLOEXEC = true });
+    defer compat_fd.close(ready_pipe[0]);
+    defer compat_fd.close(ready_pipe[1]);
+
+    const pid: posix.pid_t = pid: {
+        const rc = posix.system.fork();
+        switch (posix.errno(rc)) {
+            .SUCCESS => break :pid @intCast(rc),
+            .AGAIN, .NOMEM => return error.SystemResources,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    };
+    if (pid == 0) {
+        var action: posix.Sigaction = .{
+            .handler = .{ .handler = posix.SIG.IGN },
+            .mask = posix.sigemptyset(),
+            .flags = 0,
+        };
+        posix.sigaction(posix.SIG.HUP, &action, null);
+        _ = c.setsid();
+        _ = posix.system.write(ready_pipe[1], "r", 1);
+        while (true) _ = c.pause();
+    }
+
+    var reaped = false;
+    defer if (!reaped) {
+        _ = c.kill(pid, c.SIGKILL);
+        var status: c_int = 0;
+        _ = std.c.waitpid(pid, &status, 0);
+    };
+
+    var ready: [1]u8 = undefined;
+    try testing.expectEqual(@as(isize, 1), posix.system.read(ready_pipe[0], &ready, 1));
+
+    // Keep the test fast while exercising the same escalation path as the
+    // one-second production grace period.
+    try Subprocess.killPidWithGrace(pid, 2);
 
     var status: c_int = 0;
     const wait_result = std.c.waitpid(pid, &status, std.c.W.NOHANG);
