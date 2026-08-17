@@ -1193,15 +1193,15 @@ const Subprocess = struct {
     }
 
     const KillPidOptions = struct {
-        group_lookup_attempts: usize = 100,
-        graceful_attempts: usize = 100,
-        force_attempts: usize = 100,
+        group_lookup_attempts: usize = 20,
+        graceful_attempts: usize = 20,
+        force_attempts: usize = 20,
     };
 
     /// Stop a process group without allowing child setup or signal handling
     /// to wedge surface teardown forever. Each attempt is followed by a 10 ms
     /// reap interval, so the default lookup, grace, and force periods are each
-    /// bounded to approximately one second.
+    /// bounded to approximately 200 ms.
     fn killPidWithOptions(pid: c.pid_t, options: KillPidOptions) !void {
         const pgid = getpgid(pid, options.group_lookup_attempts) orelse {
             // Darwin no longer exposes a process group for an exited child,
@@ -2366,6 +2366,13 @@ test "subprocess stop gracefully signals then kills the complete process group" 
     try testing.expectEqual(@as(c.pid_t, -1), wait_result);
     try testing.expectEqual(posix.E.CHILD, wait_err);
     cleanup_needed = false;
+}
+
+test "subprocess stop default deadlines fit the embedder response budget" {
+    const options: Subprocess.KillPidOptions = .{};
+    try std.testing.expectEqual(@as(usize, 20), options.group_lookup_attempts);
+    try std.testing.expectEqual(@as(usize, 20), options.graceful_attempts);
+    try std.testing.expectEqual(@as(usize, 20), options.force_attempts);
 }
 
 test "subprocess stop bounds process-group discovery and direct fallback" {
