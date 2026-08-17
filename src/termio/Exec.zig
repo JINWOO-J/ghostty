@@ -1192,16 +1192,28 @@ const Subprocess = struct {
         return killPidWithOptions(pid, .{});
     }
 
+    /// The three periods are deliberately asymmetric; keep them that way.
+    ///
+    /// `graceful_attempts` and `force_attempts` are short because they run on
+    /// every close and an embedder blocks its UI thread for their duration.
+    ///
+    /// `group_lookup_attempts` is long because it costs nothing on a normal
+    /// close — `getpgid` returns on its first call once the child has called
+    /// `setsid`, and only sleeps while the child still shares our group. What
+    /// it buys is correctness: when this period expires, cleanup can only
+    /// signal the direct child, and same-group descendants survive. Trading a
+    /// rare pre-exec stall for leaked descendants is the wrong direction.
     const KillPidOptions = struct {
-        group_lookup_attempts: usize = 20,
+        group_lookup_attempts: usize = 100,
         graceful_attempts: usize = 20,
         force_attempts: usize = 20,
     };
 
     /// Stop a process group without allowing child setup or signal handling
     /// to wedge surface teardown forever. Each attempt is followed by a 10 ms
-    /// reap interval, so the default lookup, grace, and force periods are each
-    /// bounded to approximately 200 ms.
+    /// reap interval, so the default grace and force periods are each bounded
+    /// to approximately 200 ms, and the group-discovery period — which a
+    /// normal close never enters — to approximately one second.
     fn killPidWithOptions(pid: c.pid_t, options: KillPidOptions) !void {
         const pgid = getpgid(pid, options.group_lookup_attempts) orelse {
             // Darwin no longer exposes a process group for an exited child,
@@ -2368,11 +2380,18 @@ test "subprocess stop gracefully signals then kills the complete process group" 
     cleanup_needed = false;
 }
 
-test "subprocess stop default deadlines fit the embedder response budget" {
+// Guards the asymmetry documented on `KillPidOptions`, not any embedder's
+// response budget — this fork does not know what that budget is. The point of
+// the assertions is that a future edit cannot quietly unify the three periods
+// in either direction: shortening discovery leaks descendants, lengthening
+// grace or force blocks an embedder's UI thread.
+test "subprocess stop keeps discovery long and shutdown short" {
     const options: Subprocess.KillPidOptions = .{};
-    try std.testing.expectEqual(@as(usize, 20), options.group_lookup_attempts);
+    try std.testing.expectEqual(@as(usize, 100), options.group_lookup_attempts);
     try std.testing.expectEqual(@as(usize, 20), options.graceful_attempts);
     try std.testing.expectEqual(@as(usize, 20), options.force_attempts);
+    try std.testing.expect(options.group_lookup_attempts > options.graceful_attempts);
+    try std.testing.expect(options.group_lookup_attempts > options.force_attempts);
 }
 
 test "subprocess stop bounds process-group discovery and direct fallback" {
