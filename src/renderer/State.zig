@@ -28,6 +28,11 @@ inspector: ?*Inspector = null,
 /// is always invoked under this struct's mutex and MUST be non-blocking.
 pty_tap: ?PtyTap = null,
 
+/// Raw PTY byte tap paired with the processed-output boundary immediately
+/// after the chunk. The callback is invoked under this struct's mutex after
+/// the terminal has consumed the bytes and MUST be non-blocking.
+pty_tap_with_output_sequence: ?PtyTapWithOutputSequence = null,
+
 /// Dead key state. This will render the current dead key preedit text
 /// over the cursor. This currently only ever renders a single codepoint.
 /// Preedit can in theory be multiple codepoints long but that is left as
@@ -112,6 +117,11 @@ pub fn yieldToDemand(self: *State, io: std.Io) void {
 /// C-callable callback type for the PTY data tap (peer federation).
 pub const PtyTap = struct {
     cb: *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void,
+    userdata: ?*anyopaque,
+};
+
+pub const PtyTapWithOutputSequence = struct {
+    cb: *const fn (?*anyopaque, ?[*]const u8, usize, u64) callconv(.c) void,
     userdata: ?*anyopaque,
 };
 

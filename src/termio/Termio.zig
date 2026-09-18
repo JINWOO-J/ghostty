@@ -852,6 +852,9 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
     processOutputAndAdvanceLocked(self, buf);
+    if (self.renderer_state.pty_tap_with_output_sequence) |tap| {
+        tap.cb(tap.userdata, buf.ptr, buf.len, self.processed_output_bytes);
+    }
 }
 
 /// Apply output and publish its byte position as one renderer-mutex critical

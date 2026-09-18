@@ -4785,6 +4785,28 @@ export fn ghostty_surface_clear_pty_data_callback(surface: *Surface) void {
     surface.core_surface.renderer_state.pty_tap = null;
 }
 
+export fn ghostty_surface_set_pty_data_callback_with_output_sequence(
+    surface: *Surface,
+    cb: *const fn (?*anyopaque, ?[*]const u8, usize, u64) callconv(.c) void,
+    userdata: ?*anyopaque,
+) void {
+    surface.core_surface.renderer_state.mutex.lockUncancelable(global.io());
+    defer surface.core_surface.renderer_state.mutex.unlock(global.io());
+    surface.core_surface.renderer_state.pty_tap_with_output_sequence = .{
+        .cb = cb,
+        .userdata = userdata,
+    };
+    cb(userdata, null, 0, surface.core_surface.io.processed_output_bytes);
+}
+
+export fn ghostty_surface_clear_pty_data_callback_with_output_sequence(
+    surface: *Surface,
+) void {
+    surface.core_surface.renderer_state.mutex.lockUncancelable(global.io());
+    defer surface.core_surface.renderer_state.mutex.unlock(global.io());
+    surface.core_surface.renderer_state.pty_tap_with_output_sequence = null;
+}
+
 test "output sequence publishes only with successful VT tail snapshot" {
     var next_sequence: u64 = 99;
     try std.testing.expect(!CAPI.publishOutputSnapshotSequenceLocked(
