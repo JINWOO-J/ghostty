@@ -1236,13 +1236,29 @@ pub const StreamHandler = struct {
                 self.surfaceMessageWriter(.{ .stop_command = code });
             },
 
+            // A shell prompt never reads mouse reports. A full-screen
+            // program that died without sending its DECRST — a dropped ssh,
+            // a killed TUI — leaves mouse tracking on, and from then on every
+            // scroll or mouse move writes an escape sequence onto the prompt
+            // line as text. A prompt marker is the one moment the terminal
+            // knows no such program is running, so the modes it left behind
+            // are cleared here.
+            .prompt_start, .fresh_line_new_prompt => {
+                if (self.terminal.flags.mouse_event != .none) {
+                    self.terminal.flags.mouse_event = .none;
+                    self.terminal.modes.set(.mouse_event_x10, false);
+                    self.terminal.modes.set(.mouse_event_normal, false);
+                    self.terminal.modes.set(.mouse_event_button, false);
+                    self.terminal.modes.set(.mouse_event_any, false);
+                    try self.setMouseShape(.text);
+                }
+            },
+
             // Handled by Terminal, no special handling by us
             .end_prompt_start_input,
             .end_prompt_start_input_terminate_eol,
             .fresh_line,
-            .fresh_line_new_prompt,
             .new_command,
-            .prompt_start,
             => {},
         }
 
