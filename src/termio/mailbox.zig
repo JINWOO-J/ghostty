@@ -8,6 +8,31 @@ const BlockingQueue = @import("../datastruct/main.zig").BlockingQueue;
 
 const log = std.log.scoped(.io_writer);
 
+/// How long a producer waits for mailbox space before its message is dropped.
+///
+/// A consumer can stop draining while its producers keep running. Surface
+/// teardown joins the IO thread that owns this queue from inside
+/// `Exec.threadExit`, and the app thread joins that same IO thread while it is
+/// itself the only drainer of the app mailbox, so an unbounded wait here waits
+/// on a thread that is waiting on us. One such wait froze a release build for
+/// 69 hours. The budget is deliberately generous: dropping a keystroke or VT
+/// reply that a live-but-busy consumer would still have drained is worse than
+/// a slow pane close.
+pub const push_timeout_ns: u64 = 2 * std.time.ns_per_s;
+
+/// Free the memory a dropped message owns. Mirrors how the IO thread
+/// releases each variant after it handles it.
+fn discard(msg: termio.Message) void {
+    switch (msg) {
+        .change_config => |v| {
+            v.ptr.deinit();
+            v.alloc.destroy(v.ptr);
+        },
+        .write_alloc => |v| v.alloc.free(v.data),
+        else => {},
+    }
+}
+
 /// A queue used for storing messages that is periodically drained.
 /// Typically used by a multi-threaded application. The capacity is
 /// hardcoded to a value that empirically has made sense for Ghostty usage
@@ -90,7 +115,12 @@ pub const Mailbox = union(enum) {
                 // here.
                 if (mutex) |m| m.unlock(global.io());
                 defer if (mutex) |m| m.lockUncancelable(global.io());
-                _ = mb.queue.push(global.io(), msg, .{ .forever = {} });
+                if (mb.queue.push(global.io(), msg, .{
+                    .ns = push_timeout_ns,
+                }) == 0) {
+                    log.warn("mailbox full past the push timeout, dropping message", .{});
+                    discard(msg);
+                }
             },
         }
     }

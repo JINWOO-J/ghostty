@@ -81,6 +81,16 @@ test "terminal response suppression drops every parser reply class" {
     ));
 }
 
+/// Free the memory a dropped surface message owns.
+fn discardSurfaceMessage(msg: apprt.surface.Message) void {
+    switch (msg) {
+        .clipboard_write => |v| v.req.deinit(),
+        .pwd_change => |v| v.pwd.deinit(),
+        .tmux_control => |v| v.data.deinit(),
+        else => {},
+    }
+}
+
 /// This is used as the handler for the terminal.Stream type. This is
 /// stateful and is expected to live for the entire lifetime of the terminal.
 /// It is NOT VALID to stop a stream handler, create a new one, and use that
@@ -190,7 +200,15 @@ pub const StreamHandler = struct {
         if (self.surface_mailbox.push(msg, .{ .instant = {} }) == 0) {
             self.renderer_state.mutex.unlock(global.io());
             defer self.renderer_state.mutex.lockUncancelable(global.io());
-            _ = self.surface_mailbox.push(msg, .{ .forever = {} });
+            // The app thread is this mailbox's only drainer and it joins this
+            // surface's IO thread during teardown, so an unbounded wait here
+            // deadlocks both sides. See `termio.mailbox.push_timeout_ns`.
+            if (self.surface_mailbox.push(msg, .{
+                .ns = termio.mailbox.push_timeout_ns,
+            }) == 0) {
+                log.warn("surface mailbox full past the push timeout, dropping message", .{});
+                discardSurfaceMessage(msg);
+            }
         }
     }
 
