@@ -146,6 +146,19 @@ pub fn BlockingQueue(
             return self.len;
         }
 
+        /// Wake every producer parked on a full queue so its push fails
+        /// instead of waiting for a consumer that stopped draining.
+        ///
+        /// A `.forever` push does not loop after a wakeup: it rechecks `full`
+        /// once and returns 0. A broadcast is therefore enough to release every
+        /// waiter, and it leaves no sticky state on a queue that other surfaces
+        /// still share.
+        pub fn wakeWaiters(self: *Self, io: std.Io) void {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            if (self.not_full_waiters > 0) self.cond_not_full.broadcast(io);
+        }
+
         /// Pop a value from the queue without blocking.
         pub fn pop(self: *Self, io: std.Io) ?T {
             self.mutex.lockUncancelable(io);
@@ -218,6 +231,51 @@ pub fn BlockingQueue(
             return self.len == bounds;
         }
     };
+}
+
+test "wakeWaiters releases a producer parked on a full queue" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    const Q = BlockingQueue(u64, 2);
+    const q = try Q.create(alloc);
+    defer q.destroy(alloc);
+
+    try testing.expectEqual(@as(Q.Size, 1), q.push(io, 1, .{ .instant = {} }));
+    try testing.expectEqual(@as(Q.Size, 2), q.push(io, 2, .{ .instant = {} }));
+    try testing.expectEqual(@as(Q.Size, 0), q.push(io, 3, .{ .instant = {} }));
+
+    const Ctx = struct {
+        q: *Q,
+        io: std.Io,
+        result: Q.Size = std.math.maxInt(Q.Size),
+
+        fn run(self: *@This()) void {
+            self.result = self.q.push(self.io, 4, .{ .forever = {} });
+        }
+    };
+    var ctx: Ctx = .{ .q = q, .io = io };
+    const thread = try std.Thread.spawn(.{}, Ctx.run, .{&ctx});
+
+    // Wait for the producer to park. Surface teardown wakes waiters it cannot
+    // serve, so a parked producer must fail its push rather than wait.
+    var parked = false;
+    for (0..2000) |_| {
+        q.mutex.lockUncancelable(io);
+        const waiters = q.not_full_waiters;
+        q.mutex.unlock(io);
+        if (waiters > 0) {
+            parked = true;
+            break;
+        }
+        std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
+    }
+    try testing.expect(parked);
+
+    q.wakeWaiters(io);
+    thread.join();
+    try testing.expectEqual(@as(Q.Size, 0), ctx.result);
 }
 
 test "basic push and pop" {

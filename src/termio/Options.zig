@@ -1,5 +1,6 @@
 //! The options that are used to configure a terminal IO implementation.
 
+const std = @import("std");
 const xev = @import("../global.zig").xev;
 const apprt = @import("../apprt.zig");
 const renderer = @import("../renderer.zig");
@@ -43,6 +44,10 @@ renderer_mailbox: *renderer.Thread.Mailbox,
 
 /// The mailbox for sending the surface messages.
 surface_mailbox: apprt.surface.Mailbox,
+
+/// Set by the owning surface while it tears down. Producers on the IO thread
+/// read it to drop messages instead of waiting on stopped consumers.
+tearing_down: *std.atomic.Value(bool),
 
 /// Optional PTY-output tee installed before the IO thread starts.
 pty_tee_cb: ?termio.Termio.PtyTeeCallback = null,

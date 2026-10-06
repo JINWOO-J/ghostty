@@ -128,6 +128,11 @@ pressed_key: ?input.KeyEvent = null,
 last_binding_trigger: u64 = 0,
 
 /// The terminal IO handler.
+/// Set while `deinit` runs. Producers on the IO thread read it through
+/// `termio.Options.tearing_down` and drop messages instead of waiting on the
+/// consumers that `deinit` stops.
+tearing_down: std.atomic.Value(bool) = .init(false),
+
 io: termio.Termio,
 io_thread: termio.Thread,
 io_thr: std.Thread,
@@ -944,6 +949,7 @@ pub fn init(
             .renderer_wakeup = render_thread.wakeup,
             .renderer_mailbox = render_thread.mailbox,
             .surface_mailbox = .{ .surface = self, .app = app_mailbox },
+            .tearing_down = &self.tearing_down,
             .pty_tee_cb = if (comptime @hasDecl(apprt.runtime.Surface, "ptyTeeCallback"))
                 rt_surface.ptyTeeCallback()
             else
@@ -1074,6 +1080,16 @@ pub fn init(
 }
 
 pub fn deinit(self: *Surface) void {
+    // This function stops the consumers of every mailbox the IO thread writes
+    // to, so first tell those producers to drop instead of wait, then release
+    // anyone already parked on a full queue. Without this the app thread waits
+    // in `io_thr.join()` while the IO thread's parse stage waits for app
+    // mailbox space that only the app thread can free.
+    self.tearing_down.store(true, .release);
+    self.app.mailbox.wakeWaiters(global.io());
+    self.renderer_thread.mailbox.wakeWaiters(global.io());
+    self.io.mailbox.wakeWaiters();
+
     // Stop search thread
     if (self.search) |*s| s.deinit();
 

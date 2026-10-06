@@ -112,6 +112,10 @@ pub const StreamHandler = struct {
     /// The mailbox for notifying the renderer of things.
     renderer_mailbox: *renderer.Thread.Mailbox,
 
+    /// Set while the surface tears down. Teardown stops the consumers of the
+    /// mailboxes below, so a push must then drop instead of wait.
+    tearing_down: *std.atomic.Value(bool),
+
     /// A handle to wake up the renderer. This hints to the renderer that
     /// a repaint should happen.
     renderer_wakeup: xev.Async,
@@ -198,15 +202,18 @@ pub const StreamHandler = struct {
         // See messageWriter which has similar logic and explains why
         // we may have to do this.
         if (self.surface_mailbox.push(msg, .{ .instant = {} }) == 0) {
+            // The app thread is this mailbox's only drainer and it joins this
+            // surface's IO thread inside `Surface.deinit`, so waiting here waits
+            // on the thread that is waiting on us. Waiting per message is just
+            // as fatal: a torn-down surface can still hold thousands of queued
+            // title changes, so any budget multiplies by that count.
+            if (self.tearing_down.load(.acquire)) {
+                discardSurfaceMessage(msg);
+                return;
+            }
             self.renderer_state.mutex.unlock(global.io());
             defer self.renderer_state.mutex.lockUncancelable(global.io());
-            // The app thread is this mailbox's only drainer and it joins this
-            // surface's IO thread during teardown, so an unbounded wait here
-            // deadlocks both sides. See `termio.mailbox.push_timeout_ns`.
-            if (self.surface_mailbox.push(msg, .{
-                .ns = termio.mailbox.push_timeout_ns,
-            }) == 0) {
-                log.warn("surface mailbox full past the push timeout, dropping message", .{});
+            if (self.surface_mailbox.push(msg, .{ .forever = {} }) == 0) {
                 discardSurfaceMessage(msg);
             }
         }
@@ -215,6 +222,12 @@ pub const StreamHandler = struct {
     inline fn messageWriter(self: *StreamHandler, msg: termio.Message) void {
         if (suppressTerminalResponse(self.suppress_terminal_responses, msg))
             return;
+        // The IO thread drains this mailbox and `Exec.threadExit` joins this
+        // thread from there, so during teardown nobody is left to make space.
+        if (self.tearing_down.load(.acquire)) {
+            if (!self.termio_mailbox.sendInstant(msg)) termio.mailbox.discard(msg);
+            return;
+        }
         self.termio_mailbox.send(msg, self.renderer_state.mutex);
         self.termio_messaged = true;
     }

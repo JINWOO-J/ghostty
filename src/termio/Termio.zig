@@ -348,6 +348,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .renderer_state = opts.renderer_state,
         .renderer_wakeup = opts.renderer_wakeup,
         .renderer_mailbox = opts.renderer_mailbox,
+        .tearing_down = opts.tearing_down,
         .size = &self.size,
         .terminal = &self.terminal,
         .osc_color_report_format = opts.config.osc_color_report_format,
