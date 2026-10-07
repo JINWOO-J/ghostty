@@ -279,24 +279,18 @@ pub fn deinit(self: *Metal) void {
 }
 
 pub fn prepareDeinit(self: *Metal) void {
-    switch (comptime builtin.os.tag) {
-        .ios => {
-            const layer = switch (self.presenter) {
-                .layer => |*value| value,
-                .external, .external_leased => return,
-            };
-            const renderer: *align(1) Renderer = @fieldParentPtr("api", self);
-            layer.detachFromHostIfDisplayCallbackOwned(
-                @ptrCast(&displayCallback),
-                @ptrCast(renderer),
-            );
-        },
-
-        else => switch (self.presenter) {
-            .layer => |*layer| layer.invalidateSurfaceUpdates(),
-            .external, .external_leased => {},
-        },
-    }
+    const layer = switch (self.presenter) {
+        .layer => |*value| value,
+        .external, .external_leased => return,
+    };
+    // The host view can keep this layer alive after the renderer is freed, and
+    // a later Core Animation commit would call `display` with a dangling
+    // renderer pointer.
+    const renderer: *align(1) Renderer = @fieldParentPtr("api", self);
+    layer.detachFromHostIfDisplayCallbackOwned(
+        @ptrCast(&displayCallback),
+        @ptrCast(renderer),
+    );
 }
 
 /// Called after the swap chain had a bounded opportunity to drain. From this

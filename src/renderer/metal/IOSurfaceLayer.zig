@@ -3,6 +3,7 @@
 const IOSurfaceLayer = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const objc = @import("objc");
 const macos = @import("macos");
@@ -119,6 +120,9 @@ pub fn release(self: *IOSurfaceLayer) void {
 /// the provided owner. This must run synchronously with the main queue because
 /// Core Animation may call `display` from a main-thread transaction while the
 /// renderer is being destroyed on another thread.
+///
+/// On macOS this layer is the NSView's hosted root layer, so the view keeps it
+/// in the tree and only the renderer-owned bindings are cleared.
 pub fn detachFromHostIfDisplayCallbackOwned(
     self: *IOSurfaceLayer,
     display_cb: DisplayCallback,
@@ -421,6 +425,7 @@ fn detachFromHostCallback(
 
     layer.setInstanceVariable("display_cb", .{ .value = null });
     layer.setInstanceVariable("display_ctx", .{ .value = null });
+    if (comptime builtin.os.tag == .macos) return;
     layer.setProperty("contents", @as(?*anyopaque, null));
     layer.msgSend(void, objc.sel("removeFromSuperlayer"), .{});
 }
@@ -665,4 +670,27 @@ test "deferred clear uses the last committed surface generation" {
     generations.commit(replacement);
     try testing.expect(!generations.shouldClear(rejected));
     try testing.expect(!generations.shouldCommit(committed));
+}
+
+test "teardown detach clears only the owner's display binding" {
+    const testing = std.testing;
+
+    const Owner = struct {
+        fn display(_: ?*anyopaque) align(8) void {}
+    };
+    var owner: u8 = 0;
+    var other: u8 = 0;
+
+    var layer = try IOSurfaceLayer.init();
+    defer layer.release();
+    layer.setDisplayCallback(@ptrCast(&Owner.display), &owner);
+
+    // A detach from a renderer that no longer owns the binding leaves it bound.
+    layer.detachFromHostIfDisplayCallbackOwned(@ptrCast(&Owner.display), &other);
+    try testing.expect(layer.layer.getInstanceVariable("display_ctx").value != null);
+    try testing.expect(!layer.surfaceUpdatesActive());
+
+    layer.detachFromHostIfDisplayCallbackOwned(@ptrCast(&Owner.display), &owner);
+    try testing.expect(layer.layer.getInstanceVariable("display_cb").value == null);
+    try testing.expect(layer.layer.getInstanceVariable("display_ctx").value == null);
 }
