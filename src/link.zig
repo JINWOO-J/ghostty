@@ -1016,7 +1016,6 @@ pub fn resolveAtFiltered(
     mouse_mods: ?input.Mods,
     filter: ?Filter,
 ) !?Resolved(Cell) {
-    _ = filter;
     var occupied: std.AutoHashMapUnmanaged(Cell, void) = .empty;
     defer occupied.deinit(alloc);
     var cells: std.ArrayList(Cell) = .empty;
@@ -1060,10 +1059,16 @@ pub fn resolveAtFiltered(
                     try occupied.put(alloc, cell, {});
                     owns_target = owns_target or std.meta.eql(cell, prepared.target);
                 }
-                if (owns_target) return .{
+                if (!owns_target) continue;
+                const value = candidate.string[range.start..range.end];
+                if (filter) |f| switch (link.highlight) {
+                    .always, .always_mods => {},
+                    .hover, .hover_mods => if (!f.accepts(value)) return null,
+                };
+                return .{
                     .matcher_index = matcher_index,
                     .action = link.action,
-                    .value = candidate.string[range.start..range.end],
+                    .value = value,
                     .cells = try alloc.dupe(Cell, cells.items),
                 };
             }
