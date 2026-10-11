@@ -2054,14 +2054,16 @@ fn mouseRefreshLinks(
             mouse_pin,
             mouse_mods,
         );
+        const link_filter = self.renderer_state.link_filter;
         for (0..2) |attempt| {
             self.renderer_state.mutex.unlock(global.io());
-            const resolved_result = linkpkg.resolveAt(
+            const resolved_result = linkpkg.resolveAtFiltered(
                 terminal.Pin,
                 alloc,
                 prepared,
                 self.config.links,
                 mouse_mods,
+                link_filter,
             );
             self.renderer_state.mutex.lockUncancelable(global.io());
 
@@ -6461,6 +6463,18 @@ test "link snapshot validation retries once and detects exact changes" {
 /// Returns the link at the given cursor position, if any.
 ///
 /// Requires the renderer mutex is held.
+/// Installs the embedder's link filter, or with null removes it
+/// (`ghostty_surface_set_link_filter`). The renderer reads it on its next frame.
+pub fn setLinkFilter(self: *Surface, filter: ?rendererpkg.LinkFilter) void {
+    {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        self.renderer_state.link_filter = filter;
+        self.renderer_state.terminal.screens.active.dirty.hyperlink_hover = true;
+    }
+    self.queueRender() catch |err| log.warn("error queueing render after link filter change err={}", .{err});
+}
+
 fn linkAtPos(
     self: *Surface,
     pos: apprt.CursorPos,
@@ -6493,6 +6507,7 @@ fn linkAtPos(
         self.config.links,
         mouse_pin,
         mouse_mods,
+        self.renderer_state.link_filter,
     );
 }
 
@@ -6525,6 +6540,7 @@ fn linkAtScreenPinWithOsc8(
     links: []const DerivedConfig.Link,
     mouse_pin: terminal.Pin,
     mouse_mods: input.Mods,
+    filter: ?linkpkg.Filter,
 ) !?Link {
     if (mouse_mods.equal(input.ctrlOrSuper(.{}))) {
         if (osc8URI(mouse_pin)) |uri| return .{
@@ -6533,7 +6549,7 @@ fn linkAtScreenPinWithOsc8(
             .value = try alloc.dupeZ(u8, uri),
         };
     }
-    return try linkAtScreenPin(alloc, screen, links, mouse_pin, mouse_mods);
+    return try linkAtScreenPinFiltered(alloc, screen, links, mouse_pin, mouse_mods, filter);
 }
 
 /// Detects a configured link at a terminal pin without requiring a full
@@ -6545,6 +6561,18 @@ fn linkAtScreenPin(
     links: []const DerivedConfig.Link,
     mouse_pin: terminal.Pin,
     mouse_mods: ?input.Mods,
+) !?Link {
+    return linkAtScreenPinFiltered(alloc, screen, links, mouse_pin, mouse_mods, null);
+}
+
+/// `linkAtScreenPin`, where a link the embedder's filter rejects is no link.
+fn linkAtScreenPinFiltered(
+    alloc: Allocator,
+    screen: *terminal.Screen,
+    links: []const DerivedConfig.Link,
+    mouse_pin: terminal.Pin,
+    mouse_mods: ?input.Mods,
+    filter: ?linkpkg.Filter,
 ) !?Link {
     if (links.len == 0) return null;
     var arena = ArenaAllocator.init(alloc);
@@ -6558,12 +6586,13 @@ fn linkAtScreenPin(
         mouse_pin,
         mouse_mods,
     );
-    const resolved = (try linkpkg.resolveAt(
+    const resolved = (try linkpkg.resolveAtFiltered(
         terminal.Pin,
         arena_alloc,
         prepared,
         links,
         mouse_mods,
+        filter,
     )) orelse return null;
 
     const value = try alloc.dupeZ(u8, resolved.value);
@@ -10009,6 +10038,7 @@ test "Surface: OSC 8 owns an overlapping regex link target" {
         derived.links,
         pin,
         input.ctrlOrSuper(.{}),
+        null,
     )) orelse return error.TestExpectedEqual;
     defer link.deinit(alloc);
     try testing.expectEqual(input.Link.Action._open_osc8, std.meta.activeTag(link.action));
