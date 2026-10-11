@@ -1432,6 +1432,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 links: terminal.RenderState.CellSet,
                 regex_always: link.PreparedAlways,
                 regex_hover: ?link.PreparedHover,
+                link_filter: ?renderer.LinkFilter,
                 mouse: renderer.State.Mouse,
                 preedit: ?renderer.State.Preedit,
                 scrollbar: terminal.Scrollbar,
@@ -1595,6 +1596,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .links = links,
                     .regex_always = regex_always,
                     .regex_hover = regex_hover,
+                    .link_filter = state.link_filter,
                     .mouse = state.mouse,
                     .preedit = preedit,
                     .scrollbar = scrollbar,
@@ -1624,6 +1626,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 &critical.links,
                 prepared,
                 critical.mouse.mods,
+                critical.link_filter,
             ) catch |err| {
                 log.warn("error resolving regex hover link err={}", .{err});
             };

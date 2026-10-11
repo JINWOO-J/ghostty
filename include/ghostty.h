@@ -1268,6 +1268,16 @@ typedef struct {
   ghostty_action_u action;
 } ghostty_action_s;
 
+// Whether `len` bytes of `text` (not NUL-terminated), a regex link under the
+// pointer, are a link. False: no hover underline, no pointer change, no
+// mouse-over-link and no open. OSC 8 links and always-highlighted links are
+// not asked. Called on the renderer thread and on the app thread, sometimes
+// with the terminal lock held, so it answers from what it already knows and
+// never calls into Ghostty; to change an answer, the embedder sends the
+// pointer position again (ghostty_surface_mouse_pos) or refreshes.
+typedef bool (*ghostty_surface_link_filter_cb)(void* userdata,
+                                               const char* text,
+                                               uintptr_t len);
 typedef void (*ghostty_runtime_wakeup_cb)(void*);
 typedef bool (*ghostty_runtime_read_clipboard_cb)(void*,
                                                   ghostty_clipboard_e,
@@ -1479,6 +1489,12 @@ GHOSTTY_API bool ghostty_surface_request_render_with_token(ghostty_surface_t,
 GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
 GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
 GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
+// Installs the link filter for this surface; a NULL callback removes it.
+// userdata must stay valid until the filter is removed or
+// ghostty_surface_free returns.
+GHOSTTY_API void ghostty_surface_set_link_filter(ghostty_surface_t,
+                                                 ghostty_surface_link_filter_cb,
+                                                 void* userdata);
 GHOSTTY_API void ghostty_surface_set_size(ghostty_surface_t, uint32_t, uint32_t);
 // cmux fork: reserve extra drawable pixels above and below the padded grid
 // for render-only scrollback overscan (the iOS scroll-edge-effect bands
