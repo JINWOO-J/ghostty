@@ -34,6 +34,31 @@ fn suppressTerminalResponse(enabled: bool, msg: termio.Message) bool {
     }
 }
 
+fn suppressTerminalResponseForState(
+    configured: bool,
+    kitty_replay_tracking: bool,
+    msg: termio.Message,
+) bool {
+    return suppressTerminalResponse(configured or kitty_replay_tracking, msg);
+}
+
+fn discardTermioMessage(msg: termio.Message) void {
+    switch (msg) {
+        .write_alloc => |req| req.alloc.free(req.data),
+        else => {},
+    }
+}
+
+fn discardSurfaceMessage(msg: apprt.surface.Message) void {
+    switch (msg) {
+        .clipboard_write => |value| value.req.deinit(),
+        .pwd_change => |value| value.pwd.deinit(),
+        .program_status => |value| value.deinit(),
+        .tmux_control => |value| value.data.deinit(),
+        else => {},
+    }
+}
+
 test "terminal response suppression drops every parser reply class" {
     const testing = std.testing;
 
@@ -81,14 +106,12 @@ test "terminal response suppression drops every parser reply class" {
     ));
 }
 
-/// Free the memory a dropped surface message owns.
-fn discardSurfaceMessage(msg: apprt.surface.Message) void {
-    switch (msg) {
-        .clipboard_write => |v| v.req.deinit(),
-        .pwd_change => |v| v.pwd.deinit(),
-        .tmux_control => |v| v.data.deinit(),
-        else => {},
-    }
+test "kitty replay suppresses protocol responses on normal surfaces" {
+    const testing = std.testing;
+    const reply: termio.Message = .{ .write_stable = "\x1b_Gi=1;OK\x1b\\" };
+
+    try testing.expect(suppressTerminalResponseForState(false, true, reply));
+    try testing.expect(!suppressTerminalResponseForState(false, false, reply));
 }
 
 /// This is used as the handler for the terminal.Stream type. This is
@@ -116,9 +139,10 @@ pub const StreamHandler = struct {
     /// mailboxes below, so a push must then drop instead of wait.
     tearing_down: *std.atomic.Value(bool),
 
-    /// A handle to wake up the renderer. This hints to the renderer that
-    /// a repaint should happen.
-    renderer_wakeup: xev.Async,
+    /// The renderer thread's own wakeup handle (see `Options.renderer_wakeup`
+    /// for why it is a pointer). This hints to the renderer that a repaint
+    /// should happen.
+    renderer_wakeup: *xev.Async,
 
     /// The response to use for ENQ requests. The memory is owned by
     /// whoever owns StreamHandler.
@@ -159,6 +183,11 @@ pub const StreamHandler = struct {
     /// This is set to true when we've seen a title escape sequence. We use
     /// this to determine if we need to default the window title.
     seen_title: bool = false,
+
+    /// A surface replay needs Kitty command failures even when q=2 suppresses
+    /// their protocol responses.
+    kitty_replay_tracking: bool = false,
+    kitty_replay_failed: bool = false,
 
     pub const Stream = terminal.Stream(StreamHandler);
 
@@ -211,6 +240,11 @@ pub const StreamHandler = struct {
                 discardSurfaceMessage(msg);
                 return;
             }
+            if (self.kitty_replay_tracking) {
+                self.kitty_replay_failed = true;
+                discardSurfaceMessage(msg);
+                return;
+            }
             self.renderer_state.mutex.unlock(global.io());
             defer self.renderer_state.mutex.lockUncancelable(global.io());
             if (self.surface_mailbox.push(msg, .{ .forever = {} }) == 0) {
@@ -220,8 +254,21 @@ pub const StreamHandler = struct {
     }
 
     inline fn messageWriter(self: *StreamHandler, msg: termio.Message) void {
-        if (suppressTerminalResponse(self.suppress_terminal_responses, msg))
+        if (suppressTerminalResponseForState(
+            self.suppress_terminal_responses,
+            self.kitty_replay_tracking,
+            msg,
+        ))
             return;
+        if (self.kitty_replay_tracking) {
+            if (self.termio_mailbox.sendInstant(msg)) {
+                self.termio_messaged = true;
+            } else {
+                self.kitty_replay_failed = true;
+                discardTermioMessage(msg);
+            }
+            return;
+        }
         // The IO thread drains this mailbox and `Exec.threadExit` joins this
         // thread from there, so during teardown nobody is left to make space.
         if (self.tearing_down.load(.acquire)) {
@@ -244,6 +291,12 @@ pub const StreamHandler = struct {
 
         // Try instant first. If it works then we can return.
         if (self.renderer_mailbox.push(msg, .{ .instant = {} }) > 0) {
+            return;
+        }
+        if (self.kitty_replay_tracking) {
+            self.kitty_replay_failed = true;
+            self.renderer_wakeup.notify() catch {};
+            msg.deinit();
             return;
         }
 
@@ -288,6 +341,7 @@ pub const StreamHandler = struct {
         value: Stream.Action.Value(action),
     ) void {
         self.vtFallible(action, value) catch |err| {
+            self.failKittyReplayIfTracking();
             log.warn("error handling VT action action={} err={}", .{ action, err });
         };
     }
@@ -442,6 +496,7 @@ pub const StreamHandler = struct {
             .report_pwd => try self.reportPwd(value.url),
             .show_desktop_notification => try self.showDesktopNotification(value.title, value.body),
             .progress_report => self.progressReport(value),
+            .program_status => self.programStatus(value),
             .start_hyperlink => try self.startHyperlink(value.uri, value.id),
             .clipboard_contents => try self.clipboardContents(value.kind, value.data),
             .semantic_prompt => try self.semanticPrompt(value),
@@ -716,13 +771,27 @@ pub const StreamHandler = struct {
     }
 
     pub fn apcEnd(self: *StreamHandler) !void {
-        var cmd = self.apc.end() orelse return;
+        var cmd = self.apc.end() orelse {
+            if (self.kitty_replay_tracking and self.apc.takeKittyError()) {
+                self.kitty_replay_failed = true;
+            }
+            return;
+        };
+        _ = self.apc.takeKittyError();
         defer cmd.deinit(self.alloc);
 
         // log.warn("APC command: {}", .{cmd});
         switch (cmd) {
             .kitty => |*kitty_cmd| {
-                if (self.terminal.kittyGraphics(global.io(), self.alloc, kitty_cmd)) |resp| {
+                const result = self.terminal.kittyGraphicsTracked(
+                    global.io(),
+                    self.alloc,
+                    kitty_cmd,
+                );
+                if (self.kitty_replay_tracking and !result.succeeded) {
+                    self.kitty_replay_failed = true;
+                }
+                if (result.response) |resp| {
                     var buf: [1024]u8 = undefined;
                     var writer: std.Io.Writer = .fixed(&buf);
                     try resp.encode(&writer);
@@ -751,6 +820,29 @@ pub const StreamHandler = struct {
                 }
             },
         }
+    }
+
+    pub fn beginKittyReplayTracking(self: *StreamHandler) void {
+        assert(!self.kitty_replay_tracking);
+        self.kitty_replay_tracking = true;
+        self.kitty_replay_failed = false;
+    }
+
+    pub fn failKittyReplayIfTracking(self: *StreamHandler) void {
+        if (self.kitty_replay_tracking) self.kitty_replay_failed = true;
+    }
+
+    pub fn finishKittyReplayTracking(self: *StreamHandler) bool {
+        assert(self.kitty_replay_tracking);
+        if (self.apc.takeKittyError()) self.kitty_replay_failed = true;
+        self.kitty_replay_tracking = false;
+        defer self.kitty_replay_failed = false;
+        return !self.kitty_replay_failed;
+    }
+
+    pub fn cancelKittyReplayTracking(self: *StreamHandler) void {
+        self.kitty_replay_tracking = false;
+        self.kitty_replay_failed = false;
     }
 
     inline fn bell(self: *StreamHandler) void {
@@ -1099,6 +1191,7 @@ pub const StreamHandler = struct {
 
         // Clear the progress bar
         self.progressReport(.{ .state = .remove });
+        self.programStatus(.{ .report = .{ .state = .clear } });
     }
 
     pub fn queryKittyKeyboard(self: *StreamHandler) !void {
@@ -1252,6 +1345,7 @@ pub const StreamHandler = struct {
                     self.terminal.modes.set(.mouse_event_any, false);
                     try self.setMouseShape(.text);
                 }
+                self.programStatusPromptStart();
             },
 
             // Handled by Terminal, no special handling by us
@@ -1707,6 +1801,55 @@ pub const StreamHandler = struct {
     /// Display a GUI progress report.
     fn progressReport(self: *StreamHandler, report: terminal.osc.Command.ProgressReport) void {
         self.surfaceMessageWriter(.{ .progress_report = report });
+    }
+
+    fn programStatus(self: *StreamHandler, command: terminal.osc.Command.ProgramStatus) void {
+        switch (command) {
+            .query => |terminator| {
+                var data: termio.Message.WriteReq.Small.Array = undefined;
+                const reply = std.fmt.bufPrint(&data, "\x1b]7501;?{s}", .{terminator.string()}) catch return;
+                self.messageWriter(.{ .write_small = .{ .data = data, .len = @intCast(reply.len) } });
+            },
+            .report => |report| self.programStatusReport(report),
+        }
+    }
+
+    fn programStatusReport(
+        self: *StreamHandler,
+        report: terminal.osc.Command.ProgramStatus.Report,
+    ) void {
+        const status = self.alloc.create(apprt.surface.Message.ProgramStatus) catch return;
+        status.* = .{ .alloc = self.alloc, .state = report.state };
+        var delivered = false;
+        defer if (!delivered) status.deinit();
+
+        if (report.readOption(.kind)) |kind| status.kind = kind;
+        status.progress = report.readOption(.progress);
+        if (report.readOption(.id)) |value| status.id = apprt.surface.Message.WriteReq.init(self.alloc, value) catch return;
+        if (report.readOption(.app)) |value| status.app = apprt.surface.Message.WriteReq.init(self.alloc, value) catch return;
+
+        inline for (.{ terminal.osc.Command.ProgramStatus.Option.title, terminal.osc.Command.ProgramStatus.Option.msg }) |option| {
+            if (report.readOption(option) != null) {
+                var writer: std.Io.Writer.Allocating = .init(self.alloc);
+                defer writer.deinit();
+                report.writeText(option, &writer.writer) catch return;
+                const value = apprt.surface.Message.WriteReq.init(self.alloc, writer.writer.buffered()) catch return;
+                if (option == .title) status.title = value else status.msg = value;
+            }
+        }
+
+        self.surfaceMessageWriter(.{ .program_status = status });
+        delivered = true;
+    }
+
+    fn programStatusPromptStart(self: *StreamHandler) void {
+        const status = self.alloc.create(apprt.surface.Message.ProgramStatus) catch return;
+        status.* = .{
+            .alloc = self.alloc,
+            .event = .prompt_start,
+            .state = .idle,
+        };
+        self.surfaceMessageWriter(.{ .program_status = status });
     }
 };
 

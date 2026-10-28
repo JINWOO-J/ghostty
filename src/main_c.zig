@@ -163,7 +163,11 @@ pub export fn ghostty_init(argc: usize, argv: [*][*:0]u8) c_int {
 /// with no other ghostty call in flight — the global environment has no
 /// concurrency control.
 pub export fn ghostty_sync_environ() void {
-    global.syncEnviron();
+    global.syncEnviron() catch |err| {
+        // The previous snapshot stays in place, so later reads see the
+        // environment as of the last successful sync.
+        std.log.err("ghostty_sync_environ failed err={}", .{err});
+    };
 }
 
 /// Runs an action if it is specified. If there is no action this returns

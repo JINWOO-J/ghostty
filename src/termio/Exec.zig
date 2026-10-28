@@ -22,7 +22,6 @@ const shell_integration = @import("shell_integration.zig");
 const terminal = @import("../terminal/main.zig");
 const termio = @import("../termio.zig");
 const Command = @import("../Command.zig");
-const SegmentedPool = @import("../datastruct/main.zig").SegmentedPool;
 const ptypkg = @import("../pty.zig");
 const Pty = ptypkg.Pty;
 const EnvMap = std.process.Environ.Map;
@@ -30,6 +29,12 @@ const PasswdEntry = internal_os.passwd.Entry;
 const windows = internal_os.windows;
 const ProcessInfo = @import("../pty.zig").ProcessInfo;
 const compat_fd = @import("../lib/compat/fd.zig");
+
+const darwin_proc = if (builtin.target.os.tag.isDarwin()) struct {
+    const c = @cImport({
+        @cInclude("sys/sysctl.h");
+    });
+} else struct {};
 
 const log = std.log.scoped(.io_exec);
 
@@ -124,8 +129,8 @@ pub fn threadEnter(
     // Create our pipe that we'll use to kill our read thread.
     // pipe[0] is the read end, pipe[1] is the write end.
     const pipe = try internal_os.pipe();
-    errdefer _ = posix.system.close(pipe[0]);
-    errdefer _ = posix.system.close(pipe[1]);
+    errdefer closePipeEnd(pipe[0]);
+    errdefer closePipeEnd(pipe[1]);
 
     // Setup our stream so that we can write.
     var stream = xev.Stream.initFd(pty_fds.write);
@@ -204,7 +209,9 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
     // Quit our read thread after exiting the subprocess so that
     // we don't get stuck waiting for data to stop flowing if it is
     // a particularly noisy process.
-    switch (posix.errno(posix.system.write(exec.read_thread_pipe, "x", 1))) {
+    if (comptime builtin.os.tag == .windows) {
+        signalReadThreadQuitWindows(exec.read_thread_pipe);
+    } else switch (posix.errno(posix.system.write(exec.read_thread_pipe, "x", 1))) {
         .SUCCESS => {},
 
         // EPIPE means that our read thread is closed already, which is
@@ -228,6 +235,31 @@ pub fn threadExit(self: *Exec, td: *termio.Termio.ThreadData) void {
     }
 
     exec.read_thread.join();
+}
+
+/// Writes the quit byte to the read thread's quit pipe on Windows. The pipe
+/// is a Win32 HANDLE (os/pipe.zig), not a CRT fd: the CRT's write() fails
+/// fast on it (invalid parameter).
+fn signalReadThreadQuitWindows(pipe: posix.fd_t) void {
+    var written: windows.DWORD = 0;
+    if (windows.exp.kernel32.WriteFile(pipe, "x", 1, &written, null) == windows.FALSE) {
+        switch (windows.GetLastError()) {
+            // The read thread already closed its end.
+            .BROKEN_PIPE, .NO_DATA => {},
+            else => |err| log.warn("error writing to read thread quit pipe err={}", .{err}),
+        }
+    }
+}
+
+/// Closes one end of the read-thread quit pipe from `internal_os.pipe`: a
+/// Win32 HANDLE on Windows (the CRT's close() fails fast on it), a file
+/// descriptor elsewhere.
+fn closePipeEnd(fd: posix.fd_t) void {
+    if (comptime builtin.os.tag == .windows) {
+        _ = windows.exp.kernel32.CloseHandle(fd);
+    } else {
+        _ = posix.system.close(fd);
+    }
 }
 
 pub fn focusGained(
@@ -418,8 +450,9 @@ pub fn queueWrite(
     // our cached buffers that we can queue to the stream.
     var i: usize = 0;
     while (i < data.len) {
-        const req = try exec.write_req_pool.getGrow(alloc);
-        const buf = try exec.write_buf_pool.getGrow(alloc);
+        const w = try exec.write_pool.create(alloc);
+        w.td = exec;
+        const buf = &w.buf;
         const slice = slice: {
             // The maximum end index is either the end of our data or
             // the end of our buffer, whichever is smaller.
@@ -459,26 +492,25 @@ pub fn queueWrite(
         exec.write_stream.queueWrite(
             td.loop,
             &exec.write_queue,
-            req,
+            &w.req,
             .{ .slice = slice },
-            termio.Exec.ThreadData,
-            exec,
+            ThreadData.Write,
+            w,
             ttyWrite,
         );
     }
 }
 
 fn ttyWrite(
-    td_: ?*ThreadData,
+    w_: ?*ThreadData.Write,
     _: *xev.Loop,
     _: *xev.Completion,
     _: xev.Stream,
     _: xev.WriteBuffer,
     r: xev.WriteError!usize,
 ) xev.CallbackAction {
-    const td = td_.?;
-    td.write_req_pool.put();
-    td.write_buf_pool.put();
+    const w = w_.?;
+    w.td.write_pool.destroy(w);
 
     const d = r catch |err| {
         log.err("write error: {}", .{err});
@@ -492,9 +524,21 @@ fn ttyWrite(
 
 /// The thread local data for the exec implementation.
 pub const ThreadData = struct {
-    // The preallocation size for the write request pool. This should be big
-    // enough to satisfy most write requests. It must be a power of 2.
-    const WRITE_REQ_PREALLOC = std.math.pow(usize, 2, 5);
+    /// The state for a single queued pty write. The write request and
+    /// the buffer it writes from must both remain pointer-stable until
+    /// the write completes, so they're pooled together and checked out
+    /// per write.
+    pub const Write = struct {
+        /// Backpointer to the thread data so the write completion
+        /// callback can put this back into the pool.
+        td: *ThreadData,
+
+        /// The libxev write request.
+        req: xev.WriteRequest,
+
+        /// The buffer for the data being written.
+        buf: [64]u8,
+    };
 
     /// Process start time and boolean of whether its already exited.
     start: std.Io.Timestamp,
@@ -506,12 +550,9 @@ pub const ThreadData = struct {
     /// The process watcher
     process: ?xev.Process,
 
-    /// This is the pool of available (unused) write requests. If you grab
+    /// This is the pool of available (unused) write states. If you grab
     /// one from the pool, you must put it back when you're done!
-    write_req_pool: SegmentedPool(xev.WriteRequest, WRITE_REQ_PREALLOC) = .{},
-
-    /// The pool of available buffers for writing to the pty.
-    write_buf_pool: SegmentedPool([64]u8, WRITE_REQ_PREALLOC) = .{},
+    write_pool: std.heap.MemoryPool(Write) = .empty,
 
     /// The write queue for the data stream.
     write_queue: xev.WriteQueue = .{},
@@ -539,13 +580,12 @@ pub const ThreadData = struct {
     termios_mode: ptypkg.Mode = .{},
 
     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
-        _ = posix.system.close(self.read_thread_pipe);
+        closePipeEnd(self.read_thread_pipe);
 
-        // Clear our write pools. We know we aren't ever going to do
+        // Clear our write pool. We know we aren't ever going to do
         // any more IO since we stop our data stream below so we can just
         // drop this.
-        self.write_req_pool.deinit(alloc);
-        self.write_buf_pool.deinit(alloc);
+        self.write_pool.deinit(alloc);
 
         // Stop our process watcher
         if (self.process) |*p| p.deinit();
@@ -577,6 +617,8 @@ const Subprocess = struct {
     const c = @cImport({
         @cInclude("errno.h");
         @cInclude("signal.h");
+        // MinGW has no sys/ioctl.h; the ioctl users are POSIX-only.
+        if (builtin.os.tag != .windows) @cInclude("sys/ioctl.h");
         @cInclude("unistd.h");
     });
 
@@ -588,6 +630,9 @@ const Subprocess = struct {
     screen_size: renderer.ScreenSize,
     pty: ?Pty = null,
     process: ?Process = null,
+    /// POSIX `setsid` makes the direct child both session and process-group
+    /// leader, so its pid is the stable group identity even after it exits.
+    process_group_id: ?c.pid_t = null,
 
     rt_pre_exec_info: Command.RtPreExecInfo,
     rt_post_fork_info: Command.RtPostForkInfo,
@@ -679,36 +724,7 @@ const Subprocess = struct {
                 log.warn("failed to get ghostty exe path err={}", .{err});
                 break :ghostty_path;
             }];
-            const ghostty_bin = resolveGhosttyBin(&env, exe_bin_path) orelse {
-                log.warn("failed to resolve ghostty CLI path; CLI shell integration disabled", .{});
-                break :ghostty_path;
-            };
-            const bin_dir = std.fs.path.dirname(ghostty_bin) orelse break :ghostty_path;
-            log.debug("resolved ghostty CLI path={s}", .{ghostty_bin});
-
-            // Always export both forms so shell integration keeps an exact CLI
-            // path even if the shell later overwrites PATH. GHOSTTY_BIN_DIR is
-            // retained for the separate shell-integration `path` feature.
-            try env.put("GHOSTTY_BIN", ghostty_bin);
-            try env.put("GHOSTTY_BIN_DIR", bin_dir);
-
-            // Append if we have a path. We want to append so that ghostty is
-            // the last priority in the path. If we don't have a path set
-            // then we just set it to the directory of the binary.
-            if (env.get("PATH")) |path| {
-                // Verify that our path doesn't already contain this entry
-                var it = std.mem.tokenizeScalar(u8, path, std.fs.path.delimiter);
-                while (it.next()) |entry| {
-                    if (std.mem.eql(u8, entry, bin_dir)) break :ghostty_path;
-                }
-
-                try env.put(
-                    "PATH",
-                    try appendEnv(alloc, path, bin_dir),
-                );
-            } else {
-                try env.put("PATH", bin_dir);
-            }
+            try exportGhosttyBinEnv(alloc, &env, exe_bin_path);
         }
 
         // On macOS, export additional data directories from our
@@ -1076,6 +1092,13 @@ const Subprocess = struct {
             }
         };
 
+        if (comptime builtin.os.tag != .windows) {
+            // `Pty.childPreExec` calls setsid before exec, making the child pid
+            // the authoritative group id. Retain it independently from the
+            // waitable Command because descendants can outlive that leader.
+            self.process_group_id = cmd.pid;
+        }
+
         if (comptime builtin.os.tag == .windows) {
             // CreatePseudoConsole duplicates its synchronous pipe handles. Once
             // CreateProcess succeeds, release our setup copies so channel
@@ -1087,7 +1110,7 @@ const Subprocess = struct {
             pty.in_pipe_pty = self.pty.?.in_pipe_pty;
         }
 
-        errdefer killCommand(&cmd) catch |err| {
+        errdefer killCommand(&cmd, self.process_group_id) catch |err| {
             log.warn("error killing command during cleanup err={}", .{err});
         };
         log.info("started subcommand path={s} pid={?}", .{ self.args[0], cmd.pid });
@@ -1117,32 +1140,83 @@ const Subprocess = struct {
     /// Called to notify that we exited externally so we can unset our
     /// running state.
     pub fn externalExit(self: *Subprocess) void {
+        self.releaseProcess();
+    }
+
+    /// Forgets the started process. On Windows this also closes the
+    /// CreateProcessW process handle (Command.pid), which only this struct
+    /// owns: the xev watcher waits on its own duplicate.
+    fn releaseProcess(self: *Subprocess) void {
+        if (comptime builtin.os.tag == .windows) {
+            if (self.process) |process| switch (process) {
+                .fork_exec => |cmd| if (cmd.pid) |pid| {
+                    _ = windows.exp.kernel32.CloseHandle(pid);
+                },
+                .flatpak => {},
+            };
+        }
         self.process = null;
     }
 
-    /// Stop the subprocess. This is safe to call anytime. This call is
-    /// synchronous. The POSIX fork/exec path polls only for a bounded period
-    /// while terminating the process group; other platforms use separate
-    /// cleanup paths with their own waiting behavior.
+    /// Stop the subprocess. This is safe to call anytime. POSIX teardown
+    /// allows the process group a bounded SIGHUP grace period, then escalates
+    /// to SIGKILL and bounds that reap wait as well.
     /// This does not close the pty.
     pub fn stop(self: *Subprocess) void {
-        switch (self.process orelse return) {
-            .fork_exec => |*cmd| {
-                // Note: this will also wait for the command to exit, so
-                // DO NOT call cmd.wait
-                killCommand(cmd) catch |err|
-                    log.err("error terminating command: {}", .{err});
-            },
+        self.stopWithTimeouts(.{});
+    }
 
-            .flatpak => |*cmd| if (comptime build_config.flatpak) {
-                killCommandFlatpak(cmd) catch |err|
-                    log.err("error sending SIGHUP to command, may hang: {}", .{err});
-                _ = cmd.wait() catch |err|
-                    log.err("error waiting for command to exit: {}", .{err});
-            },
+    fn stopWithTimeouts(self: *Subprocess, timeouts: KillTimeouts) void {
+        const foreground_process_group_id = self.foregroundProcessGroupId();
+        if (self.process) |*process| {
+            switch (process.*) {
+                .fork_exec => |*cmd| {
+                    // Note: this will also wait for the command to exit, so
+                    // DO NOT call cmd.wait.
+                    killCommandWithTimeouts(
+                        cmd,
+                        self.process_group_id,
+                        foreground_process_group_id,
+                        timeouts,
+                    ) catch |err|
+                        log.err("error stopping command: {}", .{err});
+                },
+
+                .flatpak => |*cmd| if (comptime build_config.flatpak) {
+                    killCommandFlatpak(cmd) catch |err|
+                        log.err("error sending SIGHUP to command, may hang: {}", .{err});
+                    _ = cmd.wait() catch |err|
+                        log.err("error waiting for command to exit: {}", .{err});
+                },
+            }
+        } else if (comptime builtin.os.tag != .windows) {
+            // Once the watcher consumes the direct child's wait status, its
+            // cached numeric process-group id may be recycled. A foreground
+            // group freshly observed through this retained PTY is the only
+            // group identity that remains attributable to this subprocess.
+            if (foreground_process_group_id) |pgid| {
+                killProcessGroupWithTimeouts(pgid, null, timeouts) catch |err|
+                    log.err("error stopping foreground process group: {}", .{err});
+            }
         }
 
-        self.process = null;
+        self.releaseProcess();
+        self.process_group_id = null;
+    }
+
+    fn foregroundProcessGroupId(self: *Subprocess) ?c.pid_t {
+        const pty = &(self.pty orelse return null);
+        const raw = pty.getProcessInfo(.foreground_pid) orelse return null;
+        const pgid = std.math.cast(c.pid_t, raw) orelse return null;
+        return if (isSignallableProcessGroup(pgid)) pgid else null;
+    }
+
+    /// killpg(0) and killpg of the caller's own group both signal the
+    /// process running this teardown (and its parent shell or test runner),
+    /// never the terminal's jobs. A PTY whose session leader has exited
+    /// reports a foreground group of 0 on Linux, so this is reachable.
+    fn isSignallableProcessGroup(pgid: c.pid_t) bool {
+        return pgid > 0 and pgid != c.getpgrp();
     }
 
     /// Resize the pty subprocess. This is safe to call anytime.
@@ -1168,11 +1242,18 @@ const Subprocess = struct {
         }
     }
 
-    /// Kill the underlying subprocess. On POSIX this gives the process group
-    /// a bounded SIGHUP grace period, then uses SIGKILL for another bounded
-    /// period. A slow SIGHUP handler may therefore be interrupted so surface
-    /// teardown cannot wait forever.
-    fn killCommand(command: *Command) !void {
+    /// Kill the underlying subprocess. POSIX process groups receive SIGHUP
+    /// first and SIGKILL if they outlive the graceful shutdown budget.
+    fn killCommand(command: *Command, process_group_id: ?c.pid_t) !void {
+        return killCommandWithTimeouts(command, process_group_id, null, .{});
+    }
+
+    fn killCommandWithTimeouts(
+        command: *Command,
+        process_group_id: ?c.pid_t,
+        foreground_process_group_id: ?c.pid_t,
+        timeouts: KillTimeouts,
+    ) !void {
         if (command.pid) |pid| {
             switch (builtin.os.tag) {
                 .windows => {
@@ -1183,174 +1264,283 @@ const Subprocess = struct {
                     _ = try command.wait(false);
                 },
 
-                else => try killPid(pid),
+                else => try killProcessGroupsWithTimeouts(
+                    process_group_id orelse pid,
+                    foreground_process_group_id,
+                    pid,
+                    timeouts,
+                ),
             }
         }
+    }
+
+    const KillTimeouts = struct {
+        // term-mesh frees surfaces on the main actor, and `Surface.deinit`
+        // joins the IO thread that runs this teardown, so each grace period
+        // stalls the UI. Upstream's 12 s SIGHUP grace (room for Claude's
+        // SessionEnd hook) assumes the embedder requested termination early.
+        sighup_grace: std.Io.Duration = .fromMilliseconds(200),
+        sigterm_grace: std.Io.Duration = .fromMilliseconds(250),
+        sigkill_grace: std.Io.Duration = .fromMilliseconds(200),
+        poll_interval: std.Io.Duration = .fromMilliseconds(10),
+    };
+
+    const KillPhase = enum { sighup, sigterm, sigkill };
+
+    fn processIgnoresSignal(pid: c.pid_t, signal: c_int) bool {
+        if (comptime !builtin.target.os.tag.isDarwin()) return false;
+
+        var mib = [_]c_int{
+            darwin_proc.c.CTL_KERN,
+            darwin_proc.c.KERN_PROC,
+            darwin_proc.c.KERN_PROC_PID,
+            pid,
+        };
+        // Keep the fallback safe if the kernel returns a short record while
+        // the process is exiting. The signal mask is only trustworthy when
+        // the complete kinfo record was copied.
+        var process = std.mem.zeroes(darwin_proc.c.struct_kinfo_proc);
+        var size: usize = @sizeOf(@TypeOf(process));
+        if (darwin_proc.c.sysctl(
+            &mib,
+            mib.len,
+            &process,
+            &size,
+            null,
+            0,
+        ) != 0 or size < @sizeOf(@TypeOf(process))) return false;
+
+        const signal_bit = @as(@TypeOf(process.kp_proc.p_sigignore), 1) <<
+            @intCast(signal - 1);
+        return process.kp_proc.p_sigignore & signal_bit != 0;
     }
 
     fn killPid(pid: c.pid_t) !void {
-        return killPidWithOptions(pid, .{});
+        return killPidWithTimeouts(pid, .{});
     }
 
-    /// The three periods are deliberately asymmetric; keep them that way.
-    ///
-    /// `graceful_attempts` and `force_attempts` are short because they run on
-    /// every close and an embedder blocks its UI thread for their duration.
-    ///
-    /// `group_lookup_attempts` is long because it costs nothing on a normal
-    /// close — `getpgid` returns on its first call once the child has called
-    /// `setsid`, and only sleeps while the child still shares our group. What
-    /// it buys is correctness: when this period expires, cleanup can only
-    /// signal the direct child, and same-group descendants survive. Trading a
-    /// rare pre-exec stall for leaked descendants is the wrong direction.
-    const KillPidOptions = struct {
-        group_lookup_attempts: usize = 100,
-        graceful_attempts: usize = 20,
-        force_attempts: usize = 20,
-    };
+    fn killPidWithTimeouts(pid: c.pid_t, timeouts: KillTimeouts) !void {
+        return killProcessGroupWithTimeouts(pid, pid, timeouts);
+    }
 
-    /// Stop a process group without allowing child setup or signal handling
-    /// to wedge surface teardown forever. Each attempt is followed by a 10 ms
-    /// reap interval, so the default grace and force periods are each bounded
-    /// to approximately 200 ms, and the group-discovery period — which a
-    /// normal close never enters — to approximately one second.
-    fn killPidWithOptions(pid: c.pid_t, options: KillPidOptions) !void {
-        const pgid = getpgid(pid, options.group_lookup_attempts) orelse {
-            // Darwin no longer exposes a process group for an exited child,
-            // even while its wait status is still pending. The process
-            // watcher normally owns reaping, but teardown can win that race.
-            if (try reapExitedChild(pid)) return;
-
-            // The child may still share our process group if its pre-exec
-            // setup stalled. Never signal that group; fall back to the direct
-            // PID with the same bounded grace and force periods.
-            return killDirectPid(pid, options);
-        };
-
-        // It is possible to send a killpg between the time that
-        // our child process calls setsid but before or simultaneous
-        // to calling execve. In this case, the direct child dies
-        // but same-group descendants survive. Continue probing until killpg
-        // reports ESRCH or the bounded force period expires, even if the
-        // direct child has already been reaped. Descendants that move to a
-        // different process group are outside this cleanup.
-        switch (try signalProcessGroup(
-            pid,
+    fn killProcessGroupWithTimeouts(
+        pgid: c.pid_t,
+        direct_child_pid: ?c.pid_t,
+        timeouts: KillTimeouts,
+    ) !void {
+        return killProcessGroupsWithTimeouts(
             pgid,
-            c.SIGHUP,
-            options.graceful_attempts,
-            false,
-        )) {
-            .gone => return,
-            .child_moved => return killDirectPid(pid, options),
-            .deadline => {},
-        }
-
-        log.warn("process group ignored SIGHUP, escalating pgid={}", .{pgid});
-        switch (try signalProcessGroup(
-            pid,
-            pgid,
-            c.SIGKILL,
-            options.force_attempts,
-            true,
-        )) {
-            .gone => return,
-            .child_moved => return killDirectPid(pid, options),
-            .deadline => {},
-        }
-
-        _ = try reapExitedChild(pid);
-        log.warn(
-            "process group did not exit before teardown deadline pgid={} pid={}",
-            .{ pgid, pid },
+            null,
+            direct_child_pid,
+            timeouts,
         );
     }
 
-    const GroupSignalResult = enum { gone, child_moved, deadline };
-
-    /// Signal a process group once, then poll it for at most `attempts`
-    /// intervals. Sending destructive signals only once reduces the window in
-    /// which a recycled numeric process-group ID could target unrelated work.
-    fn signalProcessGroup(
-        pid: c.pid_t,
-        pgid: c.pid_t,
-        signal: c_int,
-        attempts: usize,
-        reap_during_observation: bool,
-    ) !GroupSignalResult {
-        switch (posix.errno(c.killpg(pgid, signal))) {
-            .SUCCESS => log.debug("process group signaled pgid={} signal={}", .{ pgid, signal }),
-            .SRCH => return if (try reapExitedChild(pid)) .gone else .child_moved,
-            else => |err| {
-                if ((comptime builtin.target.os.tag.isDarwin()) and err == .PERM) {
-                    log.warn("killpg denied on Darwin pgid={} signal={}", .{ pgid, signal });
-                } else {
-                    log.warn("error killing process group pgid={} err={}", .{ pgid, err });
-                    return error.KillFailed;
-                }
-            },
+    fn killProcessGroupsWithTimeouts(
+        primary_pgid: c.pid_t,
+        foreground_pgid: ?c.pid_t,
+        direct_child_pid: ?c.pid_t,
+        timeouts: KillTimeouts,
+    ) !void {
+        if (!isSignallableProcessGroup(primary_pgid)) {
+            log.warn(
+                "refusing to signal unsafe process group pgid={}",
+                .{primary_pgid},
+            );
+            return error.UnsafeProcessGroup;
         }
 
-        for (0..attempts) |_| {
-            // Keep the direct child waitable through the grace period so its
-            // PID continues to reserve the process-group ID until the final
-            // destructive signal. After SIGKILL has been sent, opportunistic
-            // reaping is safe because the remaining probes use signal 0 only.
-            if (reap_during_observation) _ = try reapExitedChild(pid);
+        // `Pty.childPreExec` calls setsid before exec, so the direct child pid
+        // is the process-group id. Unlike getpgid(pid), that identity remains
+        // valid after the leader exits while descendants retain the group. Job
+        // control may move the terminal's foreground process into a distinct
+        // group, so both groups share one graceful and forced-shutdown budget.
+        const distinct_foreground_pgid = if (foreground_pgid) |pgid|
+            if (pgid != primary_pgid and isSignallableProcessGroup(pgid))
+                pgid
+            else
+                null
+        else
+            null;
+        const group_ids: [2]?c.pid_t = .{
+            primary_pgid,
+            distinct_foreground_pgid,
+        };
+        var group_gone: [2]bool = .{ false, distinct_foreground_pgid == null };
+        var phase_signal_sent: [2]bool = .{ false, false };
+        var phases: [2]KillPhase = .{ .sighup, .sighup };
+        const initial_now = std.Io.Timestamp.now(global.io(), .awake);
+        var deadlines: [2]std.Io.Timestamp = .{
+            initial_now.addDuration(timeouts.sighup_grace),
+            initial_now.addDuration(timeouts.sighup_grace),
+        };
+        var direct_child_reaped = direct_child_pid == null;
+        var direct_sigkill_sent = false;
+        while (true) {
+            var primary_group_missing = false;
+            for (group_ids, 0..) |maybe_pgid, index| {
+                const pgid = maybe_pgid orelse continue;
+                if (group_gone[index]) continue;
 
-            switch (posix.errno(c.killpg(pgid, 0))) {
-                .SUCCESS => {},
-                .SRCH => return if (try reapExitedChild(pid)) .gone else .child_moved,
-                else => |err| {
-                    if (!((comptime builtin.target.os.tag.isDarwin()) and err == .PERM)) {
-                        log.warn("error probing process group pgid={} err={}", .{ pgid, err });
-                        return error.KillFailed;
+                if (!phase_signal_sent[index]) {
+                    const signal = switch (phases[index]) {
+                        .sighup => c.SIGHUP,
+                        .sigterm => c.SIGTERM,
+                        .sigkill => c.SIGKILL,
+                    };
+                    switch (posix.errno(c.killpg(pgid, signal))) {
+                        .SUCCESS => {
+                            phase_signal_sent[index] = true;
+                            if (phases[index] == .sigterm) {
+                                deadlines[index] = std.Io.Timestamp.now(
+                                    global.io(),
+                                    .awake,
+                                ).addDuration(timeouts.sigterm_grace);
+                            }
+                            log.debug(
+                                "process group signalled pgid={} signal={}",
+                                .{ pgid, signal },
+                            );
+
+                            // macOS's login(1) deliberately ignores SIGHUP
+                            // while it is still handing the terminal to the
+                            // shell. Escalate only that group immediately so
+                            // an early close does not consume the shell hook's
+                            // normal graceful-shutdown budget.
+                            if (phases[index] == .sighup and
+                                processIgnoresSignal(pgid, c.SIGHUP))
+                            {
+                                phases[index] = .sigterm;
+                                phase_signal_sent[index] = false;
+                            }
+                        },
+                        .SRCH => {
+                            // A just-forked direct child may not have called
+                            // setsid yet. Retry its primary group until the
+                            // child creates it or is reaped. The foreground
+                            // group was already observed through tcgetpgrp, so
+                            // once it disappears it must not be targeted again.
+                            if (index == 0 and !direct_child_reaped) {
+                                primary_group_missing = true;
+                            } else {
+                                group_gone[index] = true;
+                            }
+                        },
+                        else => |err| killpg: {
+                            if ((comptime builtin.target.os.tag.isDarwin()) and
+                                err == .PERM)
+                            {
+                                phase_signal_sent[index] = true;
+                                log.debug(
+                                    "killpg failed with EPERM, expected on Darwin and ignoring",
+                                    .{},
+                                );
+                                break :killpg;
+                            }
+
+                            log.warn(
+                                "error signalling process group pgid={} err={}",
+                                .{ pgid, err },
+                            );
+                            return error.KillFailed;
+                        },
                     }
-                },
+                } else switch (posix.errno(c.killpg(pgid, 0))) {
+                    .SUCCESS => {},
+                    .SRCH => {
+                        if (index == 0 and !direct_child_reaped) {
+                            primary_group_missing = true;
+                        } else {
+                            group_gone[index] = true;
+                        }
+                    },
+                    .PERM => {},
+                    else => |err| {
+                        log.warn(
+                            "error probing process group pgid={} err={}",
+                            .{ pgid, err },
+                        );
+                        return error.KillFailed;
+                    },
+                }
             }
 
-            try std.Io.sleep(global.io(), .fromMilliseconds(10), .awake);
-        }
+            if (!direct_child_reaped) {
+                direct_child_reaped = try reapExitedChild(direct_child_pid.?);
+            }
+            if (direct_child_reaped and primary_group_missing) {
+                group_gone[0] = true;
+            }
+            if (phases[0] == .sigkill and
+                primary_group_missing and
+                !direct_child_reaped and
+                !direct_sigkill_sent)
+            {
+                // If teardown raced the child's pre-exec setsid, the intended
+                // process group does not exist yet. The still-waitable direct
+                // child is ours, so terminate it without risking pid reuse.
+                switch (posix.errno(c.kill(direct_child_pid.?, c.SIGKILL))) {
+                    .SUCCESS, .SRCH => direct_sigkill_sent = true,
+                    else => |err| {
+                        log.warn(
+                            "error signalling direct child pid={} err={}",
+                            .{ direct_child_pid.?, err },
+                        );
+                        return error.KillFailed;
+                    },
+                }
+            }
+            if (direct_child_reaped and group_gone[0] and group_gone[1]) return;
 
-        return .deadline;
+            const now = std.Io.Timestamp.now(global.io(), .awake);
+            for (deadlines, 0..) |deadline, index| {
+                if (group_gone[index] or
+                    !phase_signal_sent[index] or
+                    now.toNanoseconds() < deadline.toNanoseconds()) continue;
+
+                switch (phases[index]) {
+                    .sighup => {
+                        phases[index] = .sigkill;
+                        phase_signal_sent[index] = false;
+                        deadlines[index] = now.addDuration(timeouts.sigkill_grace);
+                        log.warn(
+                            "process group exceeded SIGHUP grace; escalating " ++
+                                "pgid={}",
+                            .{group_ids[index].?},
+                        );
+                    },
+                    .sigterm => {
+                        phases[index] = .sigkill;
+                        phase_signal_sent[index] = false;
+                        deadlines[index] = now.addDuration(timeouts.sigkill_grace);
+                        log.warn(
+                            "process group did not exit after SIGTERM; escalating " ++
+                                "pgid={}",
+                            .{group_ids[index].?},
+                        );
+                    },
+                    .sigkill => {
+                        log.err(
+                            "process group did not reap after SIGKILL " ++
+                                "primary_pgid={} foreground_pgid={?} pid={?}",
+                            .{
+                                primary_pgid,
+                                distinct_foreground_pgid,
+                                direct_child_pid,
+                            },
+                        );
+                        return error.ProcessTerminationTimedOut;
+                    },
+                }
+            }
+
+            try std.Io.sleep(global.io(), timeouts.poll_interval, .awake);
+        }
     }
 
-    /// Bounded safe fallback for a child that never left our process group.
-    /// Signaling the group in this state would kill Ghostty itself.
-    fn killDirectPid(pid: c.pid_t, options: KillPidOptions) !void {
-        if (try signalDirectPid(pid, c.SIGHUP, options.graceful_attempts)) return;
-
-        log.warn("child ignored SIGHUP, escalating pid={}", .{pid});
-        if (try signalDirectPid(pid, c.SIGKILL, options.force_attempts)) return;
-
-        _ = try reapExitedChild(pid);
-        log.warn("child did not exit before teardown deadline pid={}", .{pid});
-    }
-
-    fn signalDirectPid(pid: c.pid_t, signal: c_int, attempts: usize) !bool {
-        switch (posix.errno(c.kill(pid, signal))) {
-            .SUCCESS => log.debug("process signaled pid={} signal={}", .{ pid, signal }),
-            .SRCH => {
-                _ = try reapExitedChild(pid);
-                return true;
-            },
-            else => |err| {
-                log.warn("error killing process pid={} err={}", .{ pid, err });
-                return error.KillFailed;
-            },
-        }
-
-        for (0..attempts) |_| {
-            if (try reapExitedChild(pid)) return true;
-            try std.Io.sleep(global.io(), .fromMilliseconds(10), .awake);
-        }
-
-        return false;
-    }
-
-    /// Reap the child if it has exited without racing the process watcher.
-    /// Returns true when no further wait is needed and false while the child
-    /// is still running.
+    /// Reap the direct child if it exited without racing the process watcher.
+    /// Returns true when that child needs no further wait and false while it
+    /// is still running. Descendant process-group liveness is tracked separately.
     fn reapExitedChild(pid: c.pid_t) !bool {
         while (true) {
             var status: c_int = 0;
@@ -1373,49 +1563,6 @@ const Subprocess = struct {
         }
     }
 
-    fn getpgid(pid: c.pid_t, attempts: usize) ?c.pid_t {
-        // Get our process group ID. Before the child pid calls setsid
-        // the pgid will be ours because we forked it. Its possible that
-        // we may be calling this before setsid if we are killing a surface
-        // VERY quickly after starting it.
-        const my_pgid = c.getpgid(0);
-
-        // Wait only for a bounded period. Child pre-exec setup can fail or
-        // stall; in that case the caller must avoid signaling our group.
-        for (0..attempts) |_| {
-            const pgid = c.getpgid(pid);
-            if (pgid == my_pgid) {
-                log.warn("pgid is our own, retrying", .{});
-                std.Io.sleep(global.io(), .fromMilliseconds(10), .awake) catch {};
-                continue;
-            }
-
-            // Don't know why it would be zero but its not a valid pid
-            if (pgid == 0) return null;
-
-            if (pgid < 0) {
-                switch (posix.errno(pgid)) {
-                    // The child already exited or another waiter reaped it.
-                    .SRCH => return null,
-                    else => |err| {
-                        log.warn("error getting pgid for kill err={}", .{err});
-                        return null;
-                    },
-                }
-            }
-
-            if (pgid != pid) {
-                log.warn("child has unexpected process group pid={} pgid={}", .{ pid, pgid });
-                return null;
-            }
-
-            return pgid;
-        }
-
-        log.warn("child did not leave our process group before deadline pid={}", .{pid});
-        return null;
-    }
-
     /// Kill the underlying process started via Flatpak host command.
     /// This sends a signal via the Flatpak API.
     fn killCommandFlatpak(command: *FlatpakHostCommand) !void {
@@ -1426,6 +1573,23 @@ const Subprocess = struct {
     /// Returns `null` if there was an error getting the information or the
     /// information is not available on a particular platform.
     pub fn getProcessInfo(self: *Subprocess, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
+        if (comptime builtin.os.tag == .windows and info == .foreground_pid) {
+            // ConPTY has no foreground process group, so the PTY cannot
+            // report one (WindowsPty.getProcessInfo returns null, and
+            // foregroundProcessGroupId relies on that). Report the direct
+            // child's process id instead: the shell, not the program the
+            // shell is running. Callers that want the running program must
+            // walk the child's process tree.
+            const process = self.process orelse return null;
+            return switch (process) {
+                .fork_exec => |cmd| if (cmd.windows_process_id) |id|
+                    if (id != 0) id else null
+                else
+                    null,
+                .flatpak => null,
+            };
+        }
+
         const pty = &(self.pty orelse return null);
         return pty.getProcessInfo(info);
     }
@@ -1433,6 +1597,85 @@ const Subprocess = struct {
 
 /// Resolve the CLI executable used by shell integration. Native Ghostty owns
 /// its executable path; embedded hosts can supply a distinct helper path.
+/// Exports the exact Ghostty CLI path and adds its directory to PATH.
+///
+/// Embedded runtimes may provide a helper that doesn't live beside the host
+/// executable, so shell integration must not reconstruct this path by
+/// appending a hardcoded executable name to selfExePath's directory. The
+/// resolved path can alias the map's own `GHOSTTY_BIN` value, and putting
+/// that key frees the old value, so the path is copied first.
+fn exportGhosttyBinEnv(
+    alloc: Allocator,
+    env: *EnvMap,
+    self_exe_path: []const u8,
+) !void {
+    const resolved = resolveGhosttyBin(env, self_exe_path) orelse {
+        log.warn("failed to resolve ghostty CLI path; CLI shell integration disabled", .{});
+        return;
+    };
+    const ghostty_bin = try alloc.dupe(u8, resolved);
+    const bin_dir = std.fs.path.dirname(ghostty_bin) orelse return;
+    log.debug("resolved ghostty CLI path={s}", .{ghostty_bin});
+
+    // Always export both forms so shell integration keeps an exact CLI
+    // path even if the shell later overwrites PATH. GHOSTTY_BIN_DIR is
+    // retained for the separate shell-integration `path` feature.
+    try env.put("GHOSTTY_BIN", ghostty_bin);
+    try env.put("GHOSTTY_BIN_DIR", bin_dir);
+
+    // Append if we have a path. We want to append so that ghostty is
+    // the last priority in the path. If we don't have a path set
+    // then we just set it to the directory of the binary.
+    if (env.get("PATH")) |path| {
+        // Verify that our path doesn't already contain this entry
+        var it = std.mem.tokenizeScalar(u8, path, std.fs.path.delimiter);
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry, bin_dir)) return;
+        }
+
+        try env.put(
+            "PATH",
+            try appendEnv(alloc, path, bin_dir),
+        );
+    } else {
+        try env.put("PATH", bin_dir);
+    }
+}
+
+test "exportGhosttyBinEnv keeps an embedded GHOSTTY_BIN intact" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    // The env map owns its strings with an allocator that poisons freed
+    // memory, like the surface allocator in the app.
+    var env = EnvMap.init(testing.allocator);
+    defer env.deinit();
+    try env.put("GHOSTTY_BIN", "/Applications/cmux.app/Contents/Resources/bin/ghostty");
+    try env.put("PATH", "/usr/bin:/bin");
+
+    try exportGhosttyBinEnv(
+        arena.allocator(),
+        &env,
+        "/Applications/cmux.app/Contents/MacOS/cmux",
+    );
+
+    try testing.expectEqualStrings(
+        "/Applications/cmux.app/Contents/Resources/bin/ghostty",
+        env.get("GHOSTTY_BIN").?,
+    );
+    try testing.expectEqualStrings(
+        "/Applications/cmux.app/Contents/Resources/bin",
+        env.get("GHOSTTY_BIN_DIR").?,
+    );
+    // The existing PATH value is kept as-is (here one entry, even on
+    // Windows); the bin dir is appended with the platform delimiter.
+    try testing.expectEqualStrings(
+        "/usr/bin:/bin" ++ .{std.fs.path.delimiter} ++ "/Applications/cmux.app/Contents/Resources/bin",
+        env.get("PATH").?,
+    );
+}
+
 fn resolveGhosttyBin(env: *const EnvMap, self_exe_path: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, std.fs.path.basename(self_exe_path), "ghostty")) {
         return self_exe_path;
@@ -2009,7 +2252,7 @@ pub const ReadThread = struct {
 
     fn threadMainWindows(fd: posix.fd_t, io: *termio.Termio, quit: posix.fd_t) void {
         // Always close our end of the pipe when we exit.
-        defer _ = posix.system.close(quit);
+        defer closePipeEnd(quit);
 
         // Setup our crash metadata
         crash.sentry.thread_state = .{
@@ -2027,7 +2270,7 @@ pub const ReadThread = struct {
             log.err("error creating read event err={}", .{windows.GetLastError()});
             return;
         };
-        defer _ = windows.CloseHandle(read_event);
+        defer _ = windows.exp.kernel32.CloseHandle(read_event);
 
         var buf: [1024]u8 = undefined;
         while (true) {
@@ -2035,7 +2278,7 @@ pub const ReadThread = struct {
             // race where teardown cancels before ReadFile becomes pending.
             if (windowsQuitRequested(quit)) return;
 
-            if (windows.exp.kernel32.ResetEvent(read_event) == 0) {
+            if (windows.exp.kernel32.ResetEvent(read_event) == windows.FALSE) {
                 log.err("error resetting read event err={}", .{windows.GetLastError()});
                 return;
             }
@@ -2043,7 +2286,7 @@ pub const ReadThread = struct {
             var overlapped = std.mem.zeroes(windows.OVERLAPPED);
             overlapped.hEvent = read_event;
 
-            if (windows.exp.kernel32.ReadFile(fd, &buf, buf.len, null, &overlapped) == 0) {
+            if (windows.exp.kernel32.ReadFile(fd, &buf, buf.len, null, &overlapped) == windows.FALSE) {
                 const err = windows.GetLastError();
                 switch (err) {
                     .IO_PENDING => {},
@@ -2066,7 +2309,7 @@ pub const ReadThread = struct {
                 // Cancel this exact request. The main IO thread also cancels
                 // all requests, but it may have done so before this ReadFile
                 // was submitted.
-                if (windows.exp.kernel32.CancelIoEx(fd, &overlapped) == 0) {
+                if (windows.exp.kernel32.CancelIoEx(fd, &overlapped) == windows.FALSE) {
                     switch (windows.GetLastError()) {
                         .NOT_FOUND => {},
                         else => |err| log.warn("error cancelling submitted read err={}", .{err}),
@@ -2090,7 +2333,7 @@ pub const ReadThread = struct {
     /// broken quit pipe also stops the reader so teardown cannot deadlock.
     fn windowsQuitRequested(quit: posix.fd_t) bool {
         var quit_bytes: windows.DWORD = 0;
-        if (windows.exp.kernel32.PeekNamedPipe(quit, null, 0, null, &quit_bytes, null) == 0) {
+        if (windows.exp.kernel32.PeekNamedPipe(quit, null, 0, null, &quit_bytes, null) == windows.FALSE) {
             log.err("quit pipe reader error err={}", .{windows.GetLastError()});
             return true;
         }
@@ -2115,7 +2358,7 @@ pub const ReadThread = struct {
             overlapped,
             &n,
             windows.TRUE,
-        ) == 0) {
+        ) == windows.FALSE) {
             const err = windows.GetLastError();
             switch (err) {
                 .OPERATION_ABORTED => {
@@ -2133,6 +2376,73 @@ pub const ReadThread = struct {
         return @intCast(n);
     }
 };
+
+test "Windows read thread quit pipe uses Win32 handle calls" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+
+    // internal_os.pipe returns Win32 HANDLEs on Windows. The CRT's write()
+    // and close() fail fast on them (0xC0000409), so this test crashes if
+    // the quit signal or the close goes through the CRT again.
+    const pipe = try internal_os.pipe();
+    var read_open = true;
+    defer if (read_open) closePipeEnd(pipe[0]);
+    defer closePipeEnd(pipe[1]);
+
+    try testing.expect(!ReadThread.windowsQuitRequested(pipe[0]));
+    signalReadThreadQuitWindows(pipe[1]);
+    try testing.expect(ReadThread.windowsQuitRequested(pipe[0]));
+
+    // The read thread can exit (child EOF) and close its end before
+    // teardown signals it: the write must fail quietly, not crash.
+    closePipeEnd(pipe[0]);
+    read_open = false;
+    signalReadThreadQuitWindows(pipe[1]);
+}
+
+test "Windows subprocess foreground_pid is the child process id" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const comspec = testing.environ.getAlloc(testing.allocator, "COMSPEC") catch
+        try testing.allocator.dupe(u8, "C:\\Windows\\System32\\cmd.exe");
+    defer testing.allocator.free(comspec);
+    const shell = try testing.allocator.dupeZ(u8, comspec);
+    defer testing.allocator.free(shell);
+
+    var subprocess: Subprocess = .{
+        .arena = ArenaAllocator.init(testing.allocator),
+        .cwd = null,
+        .env = null,
+        .args = &.{shell},
+        .grid_size = .{ .columns = 80, .rows = 24 },
+        .screen_size = .{ .width = 800, .height = 600 },
+        .rt_pre_exec_info = undefined,
+        .rt_post_fork_info = undefined,
+    };
+    defer subprocess.deinit();
+
+    // Not started: no process, no id.
+    try testing.expectEqual(
+        @as(?u64, null),
+        subprocess.getProcessInfo(.foreground_pid),
+    );
+
+    _ = try subprocess.start(testing.allocator);
+
+    const cmd = subprocess.process.?.fork_exec;
+    const foreground_pid = subprocess.getProcessInfo(.foreground_pid) orelse
+        return error.ForegroundPidUnavailable;
+    try testing.expect(foreground_pid != 0);
+    // It is the shell's own process id, as the kernel reports it for the
+    // process handle Command keeps.
+    try testing.expectEqual(
+        @as(u64, windows.exp.kernel32.GetProcessId(cmd.pid.?)),
+        foreground_pid,
+    );
+    try testing.expectEqual(@as(u64, cmd.windows_process_id.?), foreground_pid);
+}
 
 test "io-gather exits on persistent EOF readiness" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
@@ -2228,76 +2538,16 @@ test "subprocess stop reaps an already-exited child on Darwin" {
     try testing.expectEqual(posix.E.CHILD, wait_err);
 }
 
-fn testReadAllWithDeadline(fd: posix.fd_t, buf: []u8) !void {
-    var offset: usize = 0;
-    for (0..500) |_| {
-        if (offset == buf.len) return;
-        const result = posix.system.read(fd, buf[offset..].ptr, buf.len - offset);
-        switch (posix.errno(result)) {
-            .SUCCESS => {
-                if (result == 0) return error.EndOfStream;
-                offset += @intCast(result);
-            },
-            .INTR => continue,
-            .AGAIN => try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake),
-            else => |err| return posix.unexpectedErrno(err),
-        }
-    }
-
-    return error.Timeout;
-}
-
-fn testExpectPipeEOFWithDeadline(fd: posix.fd_t) !void {
-    var byte: [1]u8 = undefined;
-    for (0..500) |_| {
-        const result = posix.system.read(fd, &byte, 1);
-        switch (posix.errno(result)) {
-            .SUCCESS => if (result == 0) return else return error.UnexpectedData,
-            .INTR => continue,
-            .AGAIN => try std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake),
-            else => |err| return posix.unexpectedErrno(err),
-        }
-    }
-
-    return error.Timeout;
-}
-
-fn testWriteAllRetryInterrupt(fd: posix.fd_t, buf: []const u8) !void {
-    var offset: usize = 0;
-    while (offset < buf.len) {
-        const result = posix.system.write(fd, buf[offset..].ptr, buf.len - offset);
-        switch (posix.errno(result)) {
-            .SUCCESS => offset += @intCast(result),
-            .INTR => continue,
-            else => |err| return posix.unexpectedErrno(err),
-        }
-    }
-}
-
-const TestHupProbe = struct {
-    var write_fd: posix.fd_t = -1;
-
-    fn handler(_: posix.SIG) callconv(.c) void {
-        if (write_fd >= 0) _ = posix.system.write(write_fd, "h", 1);
-    }
-};
-
-test "subprocess stop gracefully signals then kills the complete process group" {
+test "subprocess stop escalates ignored SIGHUP to SIGKILL" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 
     const testing = std.testing;
     const c = Subprocess.c;
-    const ready_pipe = try compat_fd.pipe2(.{ .CLOEXEC = true });
-    defer compat_fd.close(ready_pipe[0]);
-    defer compat_fd.close(ready_pipe[1]);
-    try testing.expect(ReadThread.setNonblock(ready_pipe[0]));
-    const hup_pipe = try compat_fd.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
-    defer compat_fd.close(hup_pipe[0]);
-    defer compat_fd.close(hup_pipe[1]);
-    const death_pipe = try compat_fd.pipe2(.{ .CLOEXEC = true, .NONBLOCK = true });
-    defer compat_fd.close(death_pipe[0]);
-    var parent_death_writer_open = true;
-    defer if (parent_death_writer_open) compat_fd.close(death_pipe[1]);
+    const ready_pipe = try internal_os.pipe();
+    defer {
+        _ = posix.system.close(ready_pipe[0]);
+        _ = posix.system.close(ready_pipe[1]);
+    }
 
     const pid: posix.pid_t = pid: {
         const rc = posix.system.fork();
@@ -2308,158 +2558,623 @@ test "subprocess stop gracefully signals then kills the complete process group" 
         }
     };
     if (pid == 0) {
-        if (c.setsid() < 0) {
-            testWriteAllRetryInterrupt(ready_pipe[1], "e") catch {};
-            c._exit(2);
-        }
-        testWriteAllRetryInterrupt(ready_pipe[1], "s") catch c._exit(3);
-
-        // The direct child exits on SIGHUP while its descendant records the
-        // graceful signal and stays alive until the SIGKILL phase.
-        var default_action: posix.Sigaction = .{
-            .handler = .{ .handler = posix.SIG.DFL },
-            .mask = posix.sigemptyset(),
-            .flags = 0,
-        };
-        posix.sigaction(posix.SIG.HUP, &default_action, null);
-
-        const helper_rc = posix.system.fork();
-        if (posix.errno(helper_rc) != .SUCCESS) {
-            testWriteAllRetryInterrupt(ready_pipe[1], "f") catch {};
-            c._exit(4);
-        }
-        const helper_pid: c.pid_t = @intCast(helper_rc);
-        if (helper_pid == 0) {
-            TestHupProbe.write_fd = hup_pipe[1];
-            var action: posix.Sigaction = .{
-                .handler = .{ .handler = TestHupProbe.handler },
-                .mask = posix.sigemptyset(),
-                .flags = 0,
-            };
-            posix.sigaction(posix.SIG.HUP, &action, null);
-            testWriteAllRetryInterrupt(ready_pipe[1], "r") catch c._exit(5);
-            while (true) _ = c.pause();
-        }
-
-        compat_fd.close(death_pipe[1]);
-        while (true) _ = c.pause();
-    }
-    compat_fd.close(death_pipe[1]);
-    parent_death_writer_open = false;
-
-    var cleanup_needed = true;
-    var group_ready = false;
-    defer if (cleanup_needed) {
-        if (group_ready) _ = c.killpg(pid, c.SIGKILL) else _ = c.kill(pid, c.SIGKILL);
-        var status: c_int = 0;
-        _ = std.c.waitpid(pid, &status, 0);
-    };
-
-    var child_state: [1]u8 = undefined;
-    try testReadAllWithDeadline(ready_pipe[0], &child_state);
-    try testing.expectEqual(@as(u8, 's'), child_state[0]);
-    group_ready = true;
-    try testReadAllWithDeadline(ready_pipe[0], &child_state);
-    try testing.expectEqual(@as(u8, 'r'), child_state[0]);
-
-    const started = std.Io.Timestamp.now(testing.io, .awake);
-    try Subprocess.killPid(pid);
-    const elapsed_ms = started.untilNow(testing.io, .awake).toMilliseconds();
-    try testing.expect(elapsed_ms < 5_000);
-
-    var hup_seen: [1]u8 = undefined;
-    try testReadAllWithDeadline(hup_pipe[0], &hup_seen);
-    try testing.expectEqual(@as(u8, 'h'), hup_seen[0]);
-    try testExpectPipeEOFWithDeadline(death_pipe[0]);
-
-    var status: c_int = 0;
-    const wait_result = std.c.waitpid(pid, &status, std.c.W.NOHANG);
-    const wait_err = posix.errno(wait_result);
-    try testing.expectEqual(@as(c.pid_t, -1), wait_result);
-    try testing.expectEqual(posix.E.CHILD, wait_err);
-    cleanup_needed = false;
-}
-
-// Guards the asymmetry documented on `KillPidOptions`, not any embedder's
-// response budget — this fork does not know what that budget is. The point of
-// the assertions is that a future edit cannot quietly unify the three periods
-// in either direction: shortening discovery leaks descendants, lengthening
-// grace or force blocks an embedder's UI thread.
-test "subprocess stop keeps discovery long and shutdown short" {
-    const options: Subprocess.KillPidOptions = .{};
-    try std.testing.expectEqual(@as(usize, 100), options.group_lookup_attempts);
-    try std.testing.expectEqual(@as(usize, 20), options.graceful_attempts);
-    try std.testing.expectEqual(@as(usize, 20), options.force_attempts);
-    try std.testing.expect(options.group_lookup_attempts > options.graceful_attempts);
-    try std.testing.expect(options.group_lookup_attempts > options.force_attempts);
-}
-
-test "subprocess stop bounds process-group discovery and direct fallback" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
-
-    const testing = std.testing;
-    const c = Subprocess.c;
-    const ready_pipe = try compat_fd.pipe2(.{ .CLOEXEC = true });
-    defer compat_fd.close(ready_pipe[0]);
-    defer compat_fd.close(ready_pipe[1]);
-    try testing.expect(ReadThread.setNonblock(ready_pipe[0]));
-
-    const pid: posix.pid_t = pid: {
-        const rc = posix.system.fork();
-        switch (posix.errno(rc)) {
-            .SUCCESS => break :pid @intCast(rc),
-            .AGAIN, .NOMEM => return error.SystemResources,
-            else => |err| return posix.unexpectedErrno(err),
-        }
-    };
-    if (pid == 0) {
+        _ = posix.system.close(ready_pipe[0]);
+        if (c.setsid() < 0) c._exit(1);
         var action: posix.Sigaction = .{
             .handler = .{ .handler = posix.SIG.IGN },
             .mask = posix.sigemptyset(),
             .flags = 0,
         };
         posix.sigaction(posix.SIG.HUP, &action, null);
-        testWriteAllRetryInterrupt(ready_pipe[1], "r") catch c._exit(2);
+        if (posix.system.write(ready_pipe[1], "r", 1) != 1) c._exit(1);
         while (true) _ = c.pause();
     }
 
-    var cleanup_needed = true;
-    defer if (cleanup_needed) {
-        _ = c.kill(pid, c.SIGKILL);
+    var reaped = false;
+    defer if (!reaped) {
+        _ = c.killpg(pid, c.SIGKILL);
         var status: c_int = 0;
-        _ = std.c.waitpid(pid, &status, 0);
+        _ = posix.system.waitpid(pid, &status, 0);
     };
-
+    _ = posix.system.close(ready_pipe[1]);
     var ready: [1]u8 = undefined;
-    try testReadAllWithDeadline(ready_pipe[0], &ready);
-    try testing.expectEqual(@as(u8, 'r'), ready[0]);
+    try testing.expectEqual(@as(usize, 1), try posix.read(ready_pipe[0], &ready));
 
-    const started = std.Io.Timestamp.now(testing.io, .awake);
-    const options: Subprocess.KillPidOptions = .{
-        .group_lookup_attempts = 2,
-        .graceful_attempts = 2,
-        .force_attempts = 10,
-    };
-    try testing.expectEqual(@as(?c.pid_t, null), Subprocess.getpgid(
-        pid,
-        options.group_lookup_attempts,
-    ));
-    // Exercise the actual orchestration without risking a test regression
-    // signaling the runner's process group: zero lookup attempts forces the
-    // same bounded direct-child fallback after the lookup behavior above has
-    // been verified independently.
-    var fallback_options = options;
-    fallback_options.group_lookup_attempts = 0;
-    try Subprocess.killPidWithOptions(pid, fallback_options);
-    const elapsed_ms = started.untilNow(testing.io, .awake).toMilliseconds();
-    try testing.expect(elapsed_ms < 2_000);
+    try Subprocess.killPidWithTimeouts(pid, .{
+        .sighup_grace = .fromMilliseconds(20),
+        .sigkill_grace = .fromSeconds(1),
+    });
 
     var status: c_int = 0;
-    const wait_result = std.c.waitpid(pid, &status, std.c.W.NOHANG);
+    const wait_result = posix.system.waitpid(pid, &status, std.c.W.NOHANG);
     const wait_err = posix.errno(wait_result);
+    reaped = wait_result == pid or
+        (wait_result < 0 and wait_err == .CHILD);
+
     try testing.expectEqual(@as(c.pid_t, -1), wait_result);
     try testing.expectEqual(posix.E.CHILD, wait_err);
-    cleanup_needed = false;
+}
+
+test "subprocess stop fast escalates a leader that ignores SIGHUP" {
+    if (comptime builtin.os.tag == .windows or
+        !builtin.target.os.tag.isDarwin()) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const c = Subprocess.c;
+    const ready_pipe = try internal_os.pipe();
+    const term_pipe = try internal_os.pipe();
+    defer {
+        _ = posix.system.close(ready_pipe[0]);
+        _ = posix.system.close(ready_pipe[1]);
+        _ = posix.system.close(term_pipe[0]);
+        _ = posix.system.close(term_pipe[1]);
+    }
+
+    const pid: posix.pid_t = pid: {
+        const rc = posix.system.fork();
+        switch (posix.errno(rc)) {
+            .SUCCESS => break :pid @intCast(rc),
+            .AGAIN, .NOMEM => return error.SystemResources,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    };
+    if (pid == 0) {
+        _ = posix.system.close(ready_pipe[0]);
+        _ = posix.system.close(term_pipe[0]);
+        if (c.setsid() < 0) c._exit(1);
+
+        var blocked: c.sigset_t = undefined;
+        if (c.sigemptyset(&blocked) < 0 or
+            c.sigaddset(&blocked, c.SIGTERM) < 0 or
+            c.sigprocmask(c.SIG_BLOCK, &blocked, null) < 0)
+        {
+            c._exit(1);
+        }
+        var action: posix.Sigaction = .{
+            .handler = .{ .handler = posix.SIG.IGN },
+            .mask = posix.sigemptyset(),
+            .flags = 0,
+        };
+        posix.sigaction(posix.SIG.HUP, &action, null);
+        if (posix.system.write(ready_pipe[1], "r", 1) != 1) c._exit(1);
+
+        var received: c_int = 0;
+        if (c.sigwait(&blocked, &received) != 0 or received != c.SIGTERM) {
+            c._exit(1);
+        }
+        if (posix.system.write(term_pipe[1], "t", 1) != 1) c._exit(1);
+        c._exit(0);
+    }
+
+    var reaped = false;
+    defer if (!reaped) {
+        _ = c.killpg(pid, c.SIGKILL);
+        var status: c_int = 0;
+        _ = posix.system.waitpid(pid, &status, 0);
+    };
+    _ = posix.system.close(ready_pipe[1]);
+    _ = posix.system.close(term_pipe[1]);
+    var ready: [1]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), try posix.read(ready_pipe[0], &ready));
+
+    const started = std.Io.Timestamp.now(testing.io, .awake);
+    try Subprocess.killPidWithTimeouts(pid, .{
+        .sighup_grace = .fromSeconds(1),
+        .sigterm_grace = .fromSeconds(1),
+        .sigkill_grace = .fromSeconds(1),
+    });
+    const elapsed = std.Io.Timestamp.now(testing.io, .awake).toNanoseconds() -
+        started.toNanoseconds();
+    try testing.expect(elapsed < 500_000_000);
+
+    var status: c_int = 0;
+    const wait_result = posix.system.waitpid(pid, &status, std.c.W.NOHANG);
+    reaped = wait_result == pid or
+        (wait_result < 0 and posix.errno(wait_result) == .CHILD);
+    try testing.expectEqual(@as(c.pid_t, -1), wait_result);
+
+    var received: [1]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), try posix.read(term_pipe[0], &received));
+    try testing.expectEqual(@as(u8, 't'), received[0]);
+}
+
+test "subprocess stop sends one SIGHUP during the grace window" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const c = Subprocess.c;
+    const ready_pipe = try internal_os.pipe();
+    const completed_pipe = try internal_os.pipe();
+    defer {
+        _ = posix.system.close(ready_pipe[0]);
+        _ = posix.system.close(ready_pipe[1]);
+        _ = posix.system.close(completed_pipe[0]);
+        _ = posix.system.close(completed_pipe[1]);
+    }
+
+    const pid: posix.pid_t = pid: {
+        const rc = posix.system.fork();
+        switch (posix.errno(rc)) {
+            .SUCCESS => break :pid @intCast(rc),
+            .AGAIN, .NOMEM => return error.SystemResources,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    };
+    if (pid == 0) {
+        _ = posix.system.close(ready_pipe[0]);
+        _ = posix.system.close(completed_pipe[0]);
+        if (c.setsid() < 0) c._exit(1);
+
+        var blocked: c.sigset_t = undefined;
+        if (c.sigemptyset(&blocked) < 0 or
+            c.sigaddset(&blocked, c.SIGHUP) < 0 or
+            c.sigprocmask(c.SIG_BLOCK, &blocked, null) < 0)
+        {
+            c._exit(1);
+        }
+        if (posix.system.write(ready_pipe[1], "r", 1) != 1) c._exit(1);
+
+        var received: c_int = 0;
+        if (c.sigwait(&blocked, &received) != 0 or received != c.SIGHUP) {
+            c._exit(1);
+        }
+
+        const hook_pid = posix.system.fork();
+        switch (posix.errno(hook_pid)) {
+            .SUCCESS => {},
+            else => c._exit(1),
+        }
+        if (hook_pid == 0) {
+            var action: posix.Sigaction = .{
+                .handler = .{ .handler = posix.SIG.DFL },
+                .mask = posix.sigemptyset(),
+                .flags = 0,
+            };
+            posix.sigaction(posix.SIG.HUP, &action, null);
+            if (c.sigprocmask(c.SIG_UNBLOCK, &blocked, null) < 0) c._exit(1);
+            _ = c.usleep(100_000);
+            if (posix.system.write(completed_pipe[1], "c", 1) != 1) c._exit(1);
+            c._exit(0);
+        }
+
+        var hook_status: c_int = 0;
+        _ = posix.system.waitpid(hook_pid, &hook_status, 0);
+        c._exit(0);
+    }
+
+    var process_group_gone = false;
+    defer if (!process_group_gone) {
+        _ = c.killpg(pid, c.SIGKILL);
+        var status: c_int = 0;
+        _ = posix.system.waitpid(pid, &status, std.c.W.NOHANG);
+    };
+    _ = posix.system.close(ready_pipe[1]);
+    _ = posix.system.close(completed_pipe[1]);
+    var ready: [1]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), try posix.read(ready_pipe[0], &ready));
+
+    try Subprocess.killPidWithTimeouts(pid, .{
+        .sighup_grace = .fromSeconds(1),
+        .sigkill_grace = .fromSeconds(1),
+    });
+
+    const group_probe = c.killpg(pid, 0);
+    const group_probe_err = posix.errno(group_probe);
+    process_group_gone = group_probe < 0 and group_probe_err == .SRCH;
+    try testing.expect(process_group_gone);
+
+    var completed: [1]u8 = undefined;
+    try testing.expectEqual(
+        @as(usize, 1),
+        try posix.read(completed_pipe[0], &completed),
+    );
+    try testing.expectEqual(@as(u8, 'c'), completed[0]);
+}
+
+test "subprocess stop kills descendants after the direct child exits" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const c = Subprocess.c;
+    const ready_pipe = try internal_os.pipe();
+    var ready_write_open = true;
+    defer {
+        _ = posix.system.close(ready_pipe[0]);
+        if (ready_write_open) _ = posix.system.close(ready_pipe[1]);
+    }
+
+    const pid: posix.pid_t = pid: {
+        const rc = posix.system.fork();
+        switch (posix.errno(rc)) {
+            .SUCCESS => break :pid @intCast(rc),
+            .AGAIN, .NOMEM => return error.SystemResources,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    };
+    if (pid == 0) {
+        _ = posix.system.close(ready_pipe[0]);
+        if (c.setsid() < 0) c._exit(1);
+
+        const descendant_pid = posix.system.fork();
+        switch (posix.errno(descendant_pid)) {
+            .SUCCESS => {},
+            else => c._exit(1),
+        }
+        if (descendant_pid == 0) {
+            var action: posix.Sigaction = .{
+                .handler = .{ .handler = posix.SIG.IGN },
+                .mask = posix.sigemptyset(),
+                .flags = 0,
+            };
+            posix.sigaction(posix.SIG.HUP, &action, null);
+            if (posix.system.write(ready_pipe[1], "r", 1) != 1) c._exit(1);
+            while (true) _ = c.pause();
+        }
+
+        while (true) _ = c.pause();
+    }
+
+    var process_group_gone = false;
+    defer if (!process_group_gone) {
+        _ = c.killpg(pid, c.SIGKILL);
+        var status: c_int = 0;
+        _ = posix.system.waitpid(pid, &status, std.c.W.NOHANG);
+    };
+    _ = posix.system.close(ready_pipe[1]);
+    ready_write_open = false;
+    var ready: [1]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), try posix.read(ready_pipe[0], &ready));
+
+    try Subprocess.killPidWithTimeouts(pid, .{
+        .sighup_grace = .fromMilliseconds(20),
+        .sigkill_grace = .fromSeconds(1),
+    });
+
+    const group_probe = c.killpg(pid, 0);
+    const group_probe_err = posix.errno(group_probe);
+    process_group_gone = group_probe < 0 and group_probe_err == .SRCH;
+    try testing.expectEqual(@as(c_int, -1), group_probe);
+    try testing.expectEqual(posix.E.SRCH, group_probe_err);
+}
+
+test "subprocess stop kills descendants after the group leader was reaped" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const c = Subprocess.c;
+    const ready_pipe = try internal_os.pipe();
+    defer {
+        _ = posix.system.close(ready_pipe[0]);
+        _ = posix.system.close(ready_pipe[1]);
+    }
+
+    const pid: posix.pid_t = pid: {
+        const rc = posix.system.fork();
+        switch (posix.errno(rc)) {
+            .SUCCESS => break :pid @intCast(rc),
+            .AGAIN, .NOMEM => return error.SystemResources,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    };
+    if (pid == 0) {
+        _ = posix.system.close(ready_pipe[0]);
+        if (c.setsid() < 0) c._exit(1);
+
+        const descendant_pid = posix.system.fork();
+        switch (posix.errno(descendant_pid)) {
+            .SUCCESS => {},
+            else => c._exit(1),
+        }
+        if (descendant_pid == 0) {
+            var action: posix.Sigaction = .{
+                .handler = .{ .handler = posix.SIG.IGN },
+                .mask = posix.sigemptyset(),
+                .flags = 0,
+            };
+            posix.sigaction(posix.SIG.HUP, &action, null);
+            if (posix.system.write(ready_pipe[1], "r", 1) != 1) c._exit(1);
+            while (true) _ = c.pause();
+        }
+
+        c._exit(0);
+    }
+
+    var process_group_gone = false;
+    defer if (!process_group_gone) {
+        _ = c.killpg(pid, c.SIGKILL);
+    };
+    _ = posix.system.close(ready_pipe[1]);
+    var ready: [1]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), try posix.read(ready_pipe[0], &ready));
+
+    var leader_status: c_int = 0;
+    try testing.expectEqual(
+        pid,
+        @as(posix.pid_t, @intCast(posix.system.waitpid(pid, &leader_status, 0))),
+    );
+
+    try Subprocess.killPidWithTimeouts(pid, .{
+        .sighup_grace = .fromMilliseconds(20),
+        .sigkill_grace = .fromSeconds(1),
+    });
+
+    const group_probe = c.killpg(pid, 0);
+    const group_probe_err = posix.errno(group_probe);
+    process_group_gone = group_probe < 0 and group_probe_err == .SRCH;
+    try testing.expectEqual(@as(c_int, -1), group_probe);
+    try testing.expectEqual(posix.E.SRCH, group_probe_err);
+}
+
+test "subprocess stop ignores a cached process group after the child was reaped" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .ios) {
+        return error.SkipZigTest;
+    }
+
+    const testing = std.testing;
+    const c = Subprocess.c;
+    var pty = try Pty.open(.{});
+    defer pty.deinit();
+
+    const ready_pipe = try internal_os.pipe();
+    defer {
+        _ = posix.system.close(ready_pipe[0]);
+        _ = posix.system.close(ready_pipe[1]);
+    }
+
+    const unrelated_pid: posix.pid_t = unrelated: {
+        const rc = posix.system.fork();
+        switch (posix.errno(rc)) {
+            .SUCCESS => break :unrelated @intCast(rc),
+            .AGAIN, .NOMEM => return error.SystemResources,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    };
+    if (unrelated_pid == 0) {
+        _ = posix.system.close(ready_pipe[0]);
+        if (c.setsid() < 0) c._exit(1);
+
+        var action: posix.Sigaction = .{
+            .handler = .{ .handler = posix.SIG.IGN },
+            .mask = posix.sigemptyset(),
+            .flags = 0,
+        };
+        posix.sigaction(posix.SIG.HUP, &action, null);
+        if (posix.system.write(ready_pipe[1], "r", 1) != 1) c._exit(1);
+        while (true) _ = c.pause();
+    }
+
+    var unrelated_reaped = false;
+    defer if (!unrelated_reaped) {
+        _ = c.killpg(unrelated_pid, c.SIGKILL);
+        var status: c_int = 0;
+        _ = posix.system.waitpid(unrelated_pid, &status, 0);
+    };
+    _ = posix.system.close(ready_pipe[1]);
+    var ready: [1]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), try posix.read(ready_pipe[0], &ready));
+
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var subprocess: Subprocess = .{
+        .arena = arena,
+        .cwd = null,
+        .env = null,
+        .args = &.{},
+        .grid_size = .{},
+        .screen_size = .{ .width = 1, .height = 1 },
+        .pty = pty,
+        .process = null,
+        .process_group_id = unrelated_pid,
+        .rt_pre_exec_info = undefined,
+        .rt_post_fork_info = undefined,
+    };
+    try testing.expectEqual(
+        @as(?c.pid_t, null),
+        subprocess.foregroundProcessGroupId(),
+    );
+
+    subprocess.stopWithTimeouts(.{
+        .sighup_grace = .fromMilliseconds(20),
+        .sigkill_grace = .fromMilliseconds(100),
+    });
+
+    var status: c_int = 0;
+    const wait_result: posix.pid_t = @intCast(
+        posix.system.waitpid(unrelated_pid, &status, std.c.W.NOHANG),
+    );
+    unrelated_reaped = wait_result == unrelated_pid;
+    try testing.expectEqual(@as(posix.pid_t, 0), wait_result);
+}
+
+test "subprocess stop kills a distinct foreground process group" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .ios) {
+        return error.SkipZigTest;
+    }
+
+    const testing = std.testing;
+    const c = Subprocess.c;
+    var pty = try Pty.open(.{});
+    defer pty.deinit();
+
+    const ready_pipe = try internal_os.pipe();
+    const job_ready_pipe = try internal_os.pipe();
+    defer {
+        _ = posix.system.close(ready_pipe[0]);
+        _ = posix.system.close(ready_pipe[1]);
+        _ = posix.system.close(job_ready_pipe[0]);
+        _ = posix.system.close(job_ready_pipe[1]);
+    }
+
+    const leader_pid: posix.pid_t = leader: {
+        const rc = posix.system.fork();
+        switch (posix.errno(rc)) {
+            .SUCCESS => break :leader @intCast(rc),
+            .AGAIN, .NOMEM => return error.SystemResources,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    };
+    if (leader_pid == 0) {
+        _ = posix.system.close(pty.master);
+        _ = posix.system.close(ready_pipe[0]);
+        if (c.setsid() < 0) c._exit(1);
+        if (c.ioctl(pty.slave, c.TIOCSCTTY, @as(c_ulong, 0)) < 0) c._exit(1);
+
+        const job_pid = posix.system.fork();
+        switch (posix.errno(job_pid)) {
+            .SUCCESS => {},
+            else => c._exit(1),
+        }
+        if (job_pid == 0) {
+            _ = posix.system.close(ready_pipe[1]);
+            _ = posix.system.close(job_ready_pipe[0]);
+            if (c.setpgid(0, 0) < 0) c._exit(1);
+
+            var action: posix.Sigaction = .{
+                .handler = .{ .handler = posix.SIG.IGN },
+                .mask = posix.sigemptyset(),
+                .flags = 0,
+            };
+            posix.sigaction(posix.SIG.HUP, &action, null);
+            if (posix.system.write(job_ready_pipe[1], "j", 1) != 1) c._exit(1);
+            while (true) _ = c.pause();
+        }
+
+        _ = posix.system.close(job_ready_pipe[1]);
+        var job_ready: [1]u8 = undefined;
+        if (posix.system.read(job_ready_pipe[0], &job_ready, 1) != 1) c._exit(1);
+        if (c.tcsetpgrp(pty.slave, @intCast(job_pid)) < 0) c._exit(1);
+        if (posix.system.write(ready_pipe[1], "r", 1) != 1) c._exit(1);
+
+        // Stay alive as the session leader, like a shell running a
+        // foreground job. If the leader exits, the kernel disassociates the
+        // controlling terminal and the PTY stops reporting the job's group.
+        // Reap the job so its group disappears once it is killed.
+        var job_status: c_int = 0;
+        _ = posix.system.waitpid(@intCast(job_pid), &job_status, 0);
+        while (true) _ = c.pause();
+    }
+
+    var foreground_pgid: ?c.pid_t = null;
+    defer {
+        // Never killpg a group of 0 or the runner's own group: both
+        // signal the test runner itself.
+        if (foreground_pgid) |pgid| {
+            if (pgid > 0 and pgid != c.getpgrp()) _ = c.killpg(pgid, c.SIGKILL);
+        }
+        // The leader is never reaped before this point, so its pid and
+        // process group cannot have been recycled.
+        _ = c.killpg(leader_pid, c.SIGKILL);
+        var status: c_int = 0;
+        _ = posix.system.waitpid(leader_pid, &status, 0);
+    }
+
+    _ = posix.system.close(ready_pipe[1]);
+    var ready: [1]u8 = undefined;
+    try testing.expectEqual(@as(usize, 1), try posix.read(ready_pipe[0], &ready));
+    _ = posix.system.close(pty.slave);
+
+    foreground_pgid = std.math.cast(
+        c.pid_t,
+        pty.getProcessInfo(.foreground_pid) orelse
+            return error.ForegroundProcessGroupUnavailable,
+    ) orelse return error.ForegroundProcessGroupUnavailable;
+    try testing.expect(foreground_pgid.? > 0);
+    try testing.expect(foreground_pgid.? != leader_pid);
+    try testing.expect(foreground_pgid.? != c.getpgrp());
+
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var subprocess: Subprocess = .{
+        .arena = arena,
+        .cwd = null,
+        .env = null,
+        .args = &.{},
+        .grid_size = .{},
+        .screen_size = .{ .width = 1, .height = 1 },
+        .pty = pty,
+        .process = null,
+        .process_group_id = leader_pid,
+        .rt_pre_exec_info = undefined,
+        .rt_post_fork_info = undefined,
+    };
+
+    subprocess.stopWithTimeouts(.{
+        .sighup_grace = .fromMilliseconds(20),
+        .sigkill_grace = .fromSeconds(1),
+    });
+
+    const foreground_probe = c.killpg(foreground_pgid.?, 0);
+    const foreground_probe_err = posix.errno(foreground_probe);
+    try testing.expectEqual(@as(c_int, -1), foreground_probe);
+    try testing.expectEqual(posix.E.SRCH, foreground_probe_err);
+}
+
+test "subprocess stop never signals the caller's own process group" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .ios) {
+        return error.SkipZigTest;
+    }
+
+    const testing = std.testing;
+    const c = Subprocess.c;
+    // Open the pty before forking: openpty is not async-signal-safe.
+    var pty = try Pty.open(.{});
+    defer pty.deinit();
+
+    // Teardown must never signal the process group that runs it. Run the
+    // check in a forked child that owns a fresh session whose controlling
+    // terminal reports the child's own group as foreground. A regression then
+    // kills only that child, never the test runner's process group.
+    const child_pid: posix.pid_t = child: {
+        const rc = posix.system.fork();
+        switch (posix.errno(rc)) {
+            .SUCCESS => break :child @intCast(rc),
+            .AGAIN, .NOMEM => return error.SystemResources,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    };
+    if (child_pid == 0) {
+        if (c.setsid() < 0) c._exit(10);
+        if (c.ioctl(pty.slave, c.TIOCSCTTY, @as(c_ulong, 0)) < 0) c._exit(12);
+        const own_pgid = c.getpgrp();
+        const foreground = pty.getProcessInfo(.foreground_pid) orelse c._exit(13);
+        if (foreground != @as(u64, @intCast(own_pgid))) c._exit(14);
+
+        var subprocess: Subprocess = .{
+            .arena = ArenaAllocator.init(std.heap.page_allocator),
+            .cwd = null,
+            .env = null,
+            .args = &.{},
+            .grid_size = .{},
+            .screen_size = .{ .width = 1, .height = 1 },
+            .pty = pty,
+            .process = null,
+            .process_group_id = own_pgid,
+            .rt_pre_exec_info = undefined,
+            .rt_post_fork_info = undefined,
+        };
+        if (subprocess.foregroundProcessGroupId() != null) c._exit(15);
+        subprocess.stopWithTimeouts(.{
+            .sighup_grace = .fromMilliseconds(20),
+            .sigkill_grace = .fromMilliseconds(100),
+        });
+
+        if (Subprocess.killProcessGroupWithTimeouts(own_pgid, null, .{
+            .sighup_grace = .fromMilliseconds(20),
+            .sigkill_grace = .fromMilliseconds(100),
+        })) |_| c._exit(16) else |_| {}
+        c._exit(0);
+    }
+
+    var status: c_int = 0;
+    try testing.expectEqual(
+        child_pid,
+        @as(posix.pid_t, @intCast(posix.system.waitpid(child_pid, &status, 0))),
+    );
+    // A signal death here means teardown signalled its own process group.
+    const exit_status: u32 = @bitCast(status);
+    try testing.expect(!posix.W.IFSIGNALED(exit_status));
+    try testing.expect(posix.W.IFEXITED(exit_status));
+    try testing.expectEqual(@as(u8, 0), posix.W.EXITSTATUS(exit_status));
 }
 
 /// Builds the argv array for the process we should exec for the

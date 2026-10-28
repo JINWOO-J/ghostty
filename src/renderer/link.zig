@@ -313,16 +313,18 @@ pub const Set = struct {
         result: *terminal.RenderState.CellSet,
         prepared: PreparedHover,
         mouse_mods: inputpkg.Mods,
+        filter: ?linkpkg.Filter,
     ) !void {
         for (self.links) |link| {
             if (link.alwaysActive(mouse_mods)) break;
         } else {
-            const match = try linkpkg.resolveAt(
+            const match = try linkpkg.resolveAtFiltered(
                 HoverCell,
                 alloc,
                 prepared,
                 self.links,
                 mouse_mods,
+                filter,
             ) orelse return;
             defer alloc.free(match.cells);
             for (match.cells) |cell| {
@@ -392,7 +394,7 @@ fn renderHoverForTest(
         mods,
         false,
     ) orelse return;
-    try set.renderPreparedHover(alloc, result, prepared, mods);
+    try set.renderPreparedHover(alloc, result, prepared, mods, null);
 }
 
 fn renderAlwaysForTest(
@@ -1060,6 +1062,55 @@ test "renderPreparedHover keeps adjacent independent links separate" {
                 .y = @intCast(y),
             }));
         }
+    }
+}
+
+test "renderPreparedHover does not join a short URL row ending in slash" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const url = @import("../config/url.zig");
+    const first = "https://google.com/";
+    const second = "foobar";
+
+    var t: terminal.Terminal = try .init(std.testing.io, alloc, .{ .cols = 80, .rows = 2 });
+    defer t.deinit(alloc);
+    var stream = t.vtStream();
+    defer stream.deinit();
+    stream.nextSlice(first ++ "\r\n" ++ second);
+
+    var set = try Set.fromConfig(alloc, &.{
+        .{
+            .regex = url.scheme_regex,
+            .action = .{ .open = {} },
+            .highlight = .{ .hover_mods = inputpkg.ctrlOrSuper(.{}) },
+            .candidate_scope = .bounded_logical,
+            .hard_wrap_continuations = true,
+        },
+        .{
+            .regex = url.path_regex,
+            .action = .{ .open = {} },
+            .highlight = .{ .hover_mods = inputpkg.ctrlOrSuper(.{}) },
+            .hard_wrap_continuations = true,
+            .hard_wrap_match_delimiter = true,
+        },
+    });
+    defer set.deinit(alloc);
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var result: terminal.RenderState.CellSet = .empty;
+    try renderHoverForTest(
+        &set,
+        arena.allocator(),
+        &t,
+        &result,
+        .{ .x = 10, .y = 0 },
+        inputpkg.ctrlOrSuper(.{}),
+    );
+
+    try testing.expectEqual(first.len, result.count());
+    for (0..first.len) |x| {
+        try testing.expect(result.contains(.{ .x = @intCast(x), .y = 0 }));
     }
 }
 

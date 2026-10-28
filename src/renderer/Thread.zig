@@ -22,6 +22,38 @@ const log = std.log.scoped(.renderer_thread);
 const DRAW_INTERVAL = 8; // 120 FPS
 const CURSOR_BLINK_INTERVAL = 600;
 
+/// cmux fork: minimum spacing between frames of an unfocused surface (about
+/// 30 FPS). Unfocusing stops the display link, so an unfocused surface renders
+/// on every renderer wakeup. An agent streaming into a background pane then
+/// presents a new full-pane frame per output burst, and the compositor blends
+/// each of them, which costs more on high refresh displays and behind
+/// translucent or glass windows. The focused surface is never paced.
+const UNFOCUSED_RENDER_INTERVAL_MS = 33;
+
+/// cmux fork: frame pacing for unfocused surfaces on the change-driven path.
+const UnfocusedRenderPacer = struct {
+    last_render_ms: i64 = std.math.minInt(i64) / 2,
+
+    /// Lets the next `delay` render immediately. The paced timer uses this so
+    /// its own render can never be deferred again.
+    fn release(self: *UnfocusedRenderPacer) void {
+        self.last_render_ms = std.math.minInt(i64) / 2;
+    }
+
+    /// Returns null when a wake should render now, or the milliseconds to wait
+    /// before a paced render. Focused surfaces always render now, and the first
+    /// wake after a quiet interval renders immediately.
+    fn delay(self: *UnfocusedRenderPacer, focused: bool, now_ms: i64) ?u64 {
+        if (focused) return null;
+        const elapsed = now_ms - self.last_render_ms;
+        if (elapsed >= UNFOCUSED_RENDER_INTERVAL_MS) {
+            self.last_render_ms = now_ms;
+            return null;
+        }
+        return @intCast(UNFOCUSED_RENDER_INTERVAL_MS - elapsed);
+    }
+};
+
 /// Coalesces renderer visibility changes across one mailbox drain. The flags
 /// still update in message order, but expensive renderer work observes only
 /// the final state after every already-queued transition has been applied.
@@ -708,6 +740,18 @@ const must_draw_from_app_thread =
     else
         false;
 
+/// cmux fork: like `must_draw_from_app_thread`, but decided per surface at
+/// runtime so one embedded runtime can host both renderer-thread surfaces
+/// and app-thread surfaces (the offscreen platform owns its GL context on
+/// the app thread).
+fn drawsFromAppThread(surface: *const apprt.Surface) bool {
+    if (comptime must_draw_from_app_thread) return true;
+    if (comptime @hasDecl(apprt.Surface, "mustDrawFromAppThread")) {
+        return surface.mustDrawFromAppThread();
+    }
+    return false;
+}
+
 /// The type used for sending messages to the IO thread. For now this is
 /// hardcoded with a capacity. We can make this a comptime parameter in
 /// the future if we want it configurable.
@@ -756,12 +800,28 @@ draw_active: bool = false,
 draw_now: xev.Async,
 draw_now_c: xev.Completion = .{},
 
+/// cmux fork: single-slot pending presentation for an embedder-requested
+/// tokened draw executed on the renderer thread. Producers on any thread fill
+/// the slot through `requestDrawWithPresentation` and the renderer thread's
+/// `drawNowCallback` consumes it. One slot keeps the contract honest: every
+/// accepted request gets its own forced update+draw whose backend
+/// presentation carries the exact token, and a concurrent second request is
+/// refused instead of silently sharing or dropping a frame.
+pending_draw_presentation_mutex: std.Io.Mutex = .init,
+pending_draw_presentation: ?rendererpkg.FramePresentation = null,
+
 /// Dedicated, coalescing retry signal for a retained visibility submission.
 /// Keeping this separate from `draw_now` makes stale capacity notifications
 /// no-op instead of turning them into duplicate forced draws.
 visibility_retry: xev.Async,
 visibility_retry_c: xev.Completion = .{},
 visibility_retry_generation: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+/// cmux fork: one-shot timer that delivers a paced render for an unfocused
+/// surface. See `UNFOCUSED_RENDER_INTERVAL_MS`.
+unfocused_render_h: xev.Timer,
+unfocused_render_c: xev.Completion = .{},
+unfocused_render_pacer: UnfocusedRenderPacer = .{},
 
 /// The timer used for cursor blinking
 cursor_h: xev.Timer,
@@ -904,6 +964,10 @@ pub fn init(
     var visibility_retry = try xev.Async.init();
     errdefer visibility_retry.deinit();
 
+    // Paced renders for unfocused surfaces.
+    var unfocused_render_h = try xev.Timer.init();
+    errdefer unfocused_render_h.deinit();
+
     // Setup a timer for blinking the cursor
     var cursor_timer = try xev.Timer.init();
     errdefer cursor_timer.deinit();
@@ -922,6 +986,7 @@ pub fn init(
         .draw_h = draw_h,
         .draw_now = draw_now,
         .visibility_retry = visibility_retry,
+        .unfocused_render_h = unfocused_render_h,
         .cursor_h = cursor_timer,
         .surface = surface,
         .renderer = renderer_impl,
@@ -949,6 +1014,7 @@ pub fn deinit(self: *Thread) void {
     self.draw_h.deinit();
     self.draw_now.deinit();
     self.visibility_retry.deinit();
+    self.unfocused_render_h.deinit();
     self.cursor_h.deinit();
     if (comptime terminalpkg.compression_enabled)
         self.compression.deinit();
@@ -995,6 +1061,7 @@ pub fn renderNowWithPresentation(
 
     self.updateFrame(self.effectiveCursorBlinkVisible()) catch |err| {
         log.warn("renderNowWithPresentation: error updating frame err={}", .{err});
+        presentation.fail(.backend_failed);
         return;
     };
 
@@ -1003,6 +1070,65 @@ pub fn renderNowWithPresentation(
         &self.instrumentation,
         presentation,
     );
+}
+
+/// cmux fork: queue one tokened forced render executed on the renderer
+/// thread. Unlike `renderNowWithPresentation`, which performs the whole
+/// render cycle on the calling thread (safe only when the embedder owns
+/// renderer state, i.e. iOS external-drain mode), this is safe to call from
+/// any thread while the renderer OS thread is live: it only fills the pending
+/// slot and rings the existing `draw_now` async. iOS always uses an external
+/// render driver, so this entrypoint rejects iOS before queueing. It also
+/// returns false after another platform enters external-drain mode, when
+/// another tokened draw is pending, or when the wakeup could not be delivered.
+pub fn requestDrawWithPresentation(
+    self: *Thread,
+    presentation: rendererpkg.FramePresentation,
+) bool {
+    if (comptime builtin.os.tag == .ios) return false;
+    // A queued tokened draw runs on the renderer thread, which has no GL
+    // context for app-thread surfaces.
+    if (drawsFromAppThread(self.surface)) return false;
+    {
+        self.pending_draw_presentation_mutex.lockUncancelable(global.io());
+        defer self.pending_draw_presentation_mutex.unlock(global.io());
+        if (!tokenedDrawQueueAdmissionAllows(
+            self.externalDrainActive(),
+            self.pending_draw_presentation != null,
+        )) return false;
+        self.pending_draw_presentation = presentation;
+    }
+    self.draw_now.notify() catch |err| {
+        log.warn("requestDrawWithPresentation: notify failed err={}", .{err});
+        self.pending_draw_presentation_mutex.lockUncancelable(global.io());
+        defer self.pending_draw_presentation_mutex.unlock(global.io());
+        self.pending_draw_presentation = null;
+        return false;
+    };
+    return true;
+}
+
+/// cmux fork: take the pending tokened presentation, if any.
+fn takePendingDrawPresentation(self: *Thread) ?rendererpkg.FramePresentation {
+    self.pending_draw_presentation_mutex.lockUncancelable(global.io());
+    defer self.pending_draw_presentation_mutex.unlock(global.io());
+    const presentation = self.pending_draw_presentation;
+    self.pending_draw_presentation = null;
+    return presentation;
+}
+
+fn tokenedDrawQueueAdmissionAllows(
+    external_drain_active: bool,
+    has_pending_presentation: bool,
+) bool {
+    return !external_drain_active and !has_pending_presentation;
+}
+
+test "tokened draw queue admission rejects external drain mode" {
+    const testing = std.testing;
+    try testing.expect(tokenedDrawQueueAdmissionAllows(false, false));
+    try testing.expect(!tokenedDrawQueueAdmissionAllows(false, true));
+    try testing.expect(!tokenedDrawQueueAdmissionAllows(true, false));
 }
 
 /// Finish a forced draw before delivering a synchronous backend presentation.
@@ -1021,9 +1147,13 @@ fn finishRenderNowWithPresentation(
             error.Timeout => log.warn("renderNowWithPresentation: frame acquire timeout", .{}),
             else => log.warn("renderNowWithPresentation: error drawing err={}", .{err}),
         }
+        presentation.fail(.backend_failed);
         return;
     };
 
+    // Metal returns null here because its completion handler owns delivery;
+    // synchronous backends return the presentation value for this final
+    // handoff. A null result is therefore not itself a failure.
     const value = completed orelse return;
     value.deliver();
 }
@@ -1672,7 +1802,7 @@ fn drawFrame(self: *Thread, now: bool) DrawFrameResult {
     // when we're forced to via `now`.
     if (!now and self.renderer.hasVsync()) return .deferred_to_vsync;
 
-    if (must_draw_from_app_thread) {
+    if (drawsFromAppThread(self.surface)) {
         const pushed = self.app_mailbox.push(
             .{ .redraw_surface = .{ .surface = self.surface } },
             .{ .instant = {} },
@@ -1788,11 +1918,60 @@ fn drawNowCallback(
     // Draw immediately. App-thread submission recovery has its own async, so
     // this remains a pure display-link draw and cannot consume stale retries.
     const t = self_.?;
-    if (t.externalDrainActive()) return .rearm;
+    if (t.externalDrainActive()) {
+        // Close the admission race with enterExternalDrainMode: a request
+        // accepted immediately before the transition still receives a
+        // terminal disposition instead of occupying the slot forever.
+        if (t.takePendingDrawPresentation()) |presentation| {
+            presentation.fail(.backend_failed);
+        }
+        return .rearm;
+    }
+
+    // cmux fork: a queued tokened draw takes this wake. It rebuilds frame data
+    // from current terminal state and skips the `flags.visible` gate on
+    // purpose (drawFrame's early-return): the whole point of the tokened path
+    // is ground-truth capture of a window the compositor considers occluded.
+    // The renderer-realized gate still applies (drawing unrealized GPU state
+    // is invalid); every consumed presentation receives a success or failure
+    // callback before this renderer accepts another token.
+    if (t.takePendingDrawPresentation()) |presentation| {
+        drawPendingTokenedFrame(t, presentation);
+        return .rearm;
+    }
+
     if (t.visibility_regain.isPending()) return .rearm;
     _ = t.drawFrame(true);
 
     return .rearm;
+}
+
+/// cmux fork: renderer-thread half of `requestDrawWithPresentation`. Rebuilds
+/// frame data from the current terminal state, then draws one forced frame
+/// whose backend presentation carries the embedder token. On Metal the
+/// presentation is captured into the command-buffer completion and delivered
+/// after the main-thread IOSurface assignment; synchronous backends return it
+/// here and it is delivered as the final operation (delivery may reentrantly
+/// destroy Thread).
+fn drawPendingTokenedFrame(
+    t: *Thread,
+    presentation: rendererpkg.FramePresentation,
+) void {
+    if (!t.renderer_realized) {
+        log.warn("tokened draw skipped: renderer unrealized", .{});
+        presentation.fail(.backend_failed);
+        return;
+    }
+    t.updateFrame(t.effectiveCursorBlinkVisible()) catch |err| {
+        log.warn("tokened draw: error updating frame err={}", .{err});
+        presentation.fail(.backend_failed);
+        return;
+    };
+    finishRenderNowWithPresentation(
+        t.renderer,
+        &t.instrumentation,
+        presentation,
+    );
 }
 
 fn visibilityRetryCallback(
@@ -1942,6 +2121,39 @@ fn drawCallback(
     return .disarm;
 }
 
+/// cmux fork: returns true when an unfocused surface rendered less than
+/// `UNFOCUSED_RENDER_INTERVAL_MS` ago. The skipped render is not lost: this
+/// arms (or keeps) a one-shot timer that runs `renderCallback` when the
+/// interval ends, and that render picks up every change made meanwhile.
+fn deferUnfocusedRender(self: *Thread) bool {
+    const now_ms = std.Io.Timestamp.now(global.io(), .awake).toMilliseconds();
+    const wait_ms = self.unfocused_render_pacer.delay(
+        self.flags.focused,
+        now_ms,
+    ) orelse return false;
+    if (self.unfocused_render_c.state() != .active) {
+        self.unfocused_render_h.run(
+            &self.loop,
+            &self.unfocused_render_c,
+            wait_ms,
+            Thread,
+            self,
+            unfocusedRenderTimerCallback,
+        );
+    }
+    return true;
+}
+
+fn unfocusedRenderTimerCallback(
+    self_: ?*Thread,
+    loop: *xev.Loop,
+    c: *xev.Completion,
+    r: xev.Timer.RunError!void,
+) xev.CallbackAction {
+    if (self_) |t| t.unfocused_render_pacer.release();
+    return renderCallback(self_, loop, c, r);
+}
+
 fn renderCallback(
     self_: ?*Thread,
     _: *xev.Loop,
@@ -1964,6 +2176,10 @@ fn renderCallback(
     // consumes the accumulated row union in one update before presenting.
     if (!t.flags.visible or !t.renderer_realized) return .disarm;
 
+    // cmux fork: pace unfocused surfaces. The terminal keeps its dirty state,
+    // and the one-shot timer renders the newest state once the interval ends.
+    if (t.deferUnfocusedRender()) return .disarm;
+
     // Update our frame data
     t.updateFrame(t.flags.cursor_blink_visible) catch |err|
         log.warn("error rendering err={}", .{err});
@@ -1972,6 +2188,30 @@ fn renderCallback(
     _ = t.drawFrame(false);
 
     return .disarm;
+}
+
+test "unfocused render pacer spaces unfocused frames" {
+    const testing = std.testing;
+    var pacer: UnfocusedRenderPacer = .{};
+
+    // The focused surface always renders now.
+    try testing.expectEqual(@as(?u64, null), pacer.delay(true, 1000));
+
+    // The first unfocused wake renders now, later wakes inside the interval
+    // wait for the remainder, and the boundary renders again.
+    try testing.expectEqual(@as(?u64, null), pacer.delay(false, 1000));
+    try testing.expectEqual(@as(?u64, UNFOCUSED_RENDER_INTERVAL_MS - 5), pacer.delay(false, 1005));
+    try testing.expectEqual(@as(?u64, 1), pacer.delay(false, 1000 + UNFOCUSED_RENDER_INTERVAL_MS - 1));
+    try testing.expectEqual(@as(?u64, null), pacer.delay(false, 1000 + UNFOCUSED_RENDER_INTERVAL_MS));
+
+    // Regaining focus renders at once even inside the interval.
+    try testing.expectEqual(@as(?u64, null), pacer.delay(true, 1000 + UNFOCUSED_RENDER_INTERVAL_MS + 1));
+
+    // The paced timer's render is never deferred, even right after a wake
+    // rendered at the same boundary.
+    try testing.expect(pacer.delay(false, 2000) == null);
+    pacer.release();
+    try testing.expect(pacer.delay(false, 2001) == null);
 }
 
 test "visibility drain coalesces rapid hide show ordering" {

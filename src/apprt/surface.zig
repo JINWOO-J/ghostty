@@ -99,6 +99,10 @@ pub const Message = union(enum) {
     /// Report the progress of an action using a GUI element
     progress_report: terminal.osc.Command.ProgressReport,
 
+    /// Report an OSC 7501 program status change. The pointed-to value owns
+    /// all copied strings and must be deinitialized by the receiver.
+    program_status: *ProgramStatus,
+
     /// Read-only tmux control-mode state for embedded runtimes.
     tmux_control: TmuxControlMsg,
 
@@ -123,6 +127,27 @@ pub const Message = union(enum) {
         csi_21_t,
 
         // This enum is a placeholder for future title styles.
+    };
+
+    pub const ProgramStatus = struct {
+        pub const Event = enum { report, prompt_start };
+        alloc: Allocator,
+        event: Event = .report,
+        state: terminal.osc.Command.ProgramStatus.State,
+        kind: ?terminal.osc.Command.ProgramStatus.Kind = null,
+        progress: ?u8 = null,
+        id: ?WriteReq = null,
+        app: ?WriteReq = null,
+        title: ?WriteReq = null,
+        msg: ?WriteReq = null,
+
+        pub fn deinit(self: *ProgramStatus) void {
+            if (self.id) |v| v.deinit();
+            if (self.app) |v| v.deinit();
+            if (self.title) |v| v.deinit();
+            if (self.msg) |v| v.deinit();
+            self.alloc.destroy(self);
+        }
     };
 
     pub const TmuxControlMsg = struct {

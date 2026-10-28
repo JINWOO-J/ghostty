@@ -939,6 +939,7 @@ pub fn init(
             .size = size,
             .full_config = config,
             .config = try termio.Termio.DerivedConfig.init(alloc, config),
+            .color_scheme = self.config_conditional_state.theme,
             .backend = io_backend,
             .suppress_terminal_responses = if (comptime @hasDecl(apprt.runtime.Surface, "suppressTerminalResponses"))
                 rt_surface.suppressTerminalResponses()
@@ -946,7 +947,9 @@ pub fn init(
                 false,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
-            .renderer_wakeup = render_thread.wakeup,
+            // `self.renderer_thread` (assigned above) is the struct the
+            // renderer thread waits on; `render_thread` is only its source.
+            .renderer_wakeup = &self.renderer_thread.wakeup,
             .renderer_mailbox = render_thread.mailbox,
             .surface_mailbox = .{ .surface = self, .app = app_mailbox },
             .tearing_down = &self.tearing_down,
@@ -1090,20 +1093,35 @@ pub fn deinit(self: *Surface) void {
     self.renderer_thread.mailbox.wakeWaiters(global.io());
     self.io.mailbox.wakeWaiters();
 
+    // Start renderer and child-process shutdown before waiting on any one
+    // owned thread. Embedded hosts may already have requested IO shutdown;
+    // xev async notifications are safe to repeat before Thread.deinit.
+    self.renderer_thread.stop.notify() catch |err|
+        log.err("error notifying renderer thread to stop, may stall err={}", .{err});
+    self.requestProcessTermination();
+
     // Stop search thread
     if (self.search) |*s| s.deinit();
 
-    self.renderer_thread.stop.notify() catch |err|
-        log.err("error notifying renderer thread to stop, may stall err={}", .{err});
-    self.io_thread.stop.notify() catch |err|
-        log.err("error notifying io thread to stop, may stall err={}", .{err});
-
     // Stop rendering thread
+    var renderer_context_ok = true;
     {
         self.renderer_thr.join();
 
-        // We need to become the active rendering thread again
-        self.renderer.threadEnter(self.rt_surface) catch unreachable;
+        // We need to become the active rendering thread again. Embedded
+        // hosts can refuse make_current here (EGL rejects a context that is
+        // still current on another thread, and a tearing-down host may
+        // already have abandoned the context). The host owns the context and
+        // destroys it right after this surface is freed, so every GPU-side
+        // resource dies with it either way; skip the renderer's GPU teardown
+        // instead of crashing the whole process on `unreachable`.
+        self.renderer.threadEnter(self.rt_surface) catch |err| {
+            log.err(
+                "renderer threadEnter failed during deinit; skipping renderer teardown err={}",
+                .{err},
+            );
+            renderer_context_ok = false;
+        };
     }
 
     // Stop our IO thread
@@ -1114,7 +1132,7 @@ pub fn deinit(self: *Surface) void {
     // We need to deinit AFTER everything is stopped, since there are
     // shared values between the two threads.
     self.renderer_thread.deinit();
-    self.renderer.deinit();
+    if (renderer_context_ok) self.renderer.deinit();
     self.io_thread.deinit();
     self.mouse.selection_gesture.deinit(&self.io.terminal);
     _ = self.clearKeyboardCopyCursor();
@@ -1139,6 +1157,13 @@ pub fn deinit(self: *Surface) void {
     self.config.deinit();
 
     log.info("surface closed addr={x}", .{@intFromPtr(self)});
+}
+
+/// Ask the IO owner to terminate and reap this surface's child process without
+/// waiting for surface destruction. Safe to call repeatedly before deinit.
+pub fn requestProcessTermination(self: *Surface) void {
+    self.io_thread.stop.notify() catch |err|
+        log.err("error notifying io thread to stop, may stall err={}", .{err});
 }
 
 /// Signal that the app-thread mailbox has capacity for a retained renderer
@@ -1456,6 +1481,54 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             ) catch |err| {
                 log.warn("apprt failed to report progress err={}", .{err});
             };
+        },
+
+        .program_status => |v| {
+            defer v.deinit();
+            var id_buf: [129]u8 = undefined;
+            var app_buf: [33]u8 = undefined;
+            var title_buf: [193]u8 = undefined;
+            var msg_buf: [2049]u8 = undefined;
+            const copyCString = struct {
+                fn run(req: ?Message.WriteReq, buf: []u8) ?[]const u8 {
+                    const value = req orelse return null;
+                    const data = value.slice();
+                    if (data.len + 1 > buf.len) return null;
+                    @memcpy(buf[0..data.len], data);
+                    buf[data.len] = 0;
+                    return buf[0..data.len];
+                }
+            }.run;
+            const state: apprt.Action.ProgramStatus.State = switch (v.state) {
+                .idle => .idle,
+                .working => .working,
+                .done => .done,
+                .blocked => .blocked,
+                .@"error" => .@"error",
+                .clear => .clear,
+            };
+            const kind: apprt.Action.ProgramStatus.Kind = if (v.kind) |value| switch (value) {
+                .permission => .permission,
+                .question => .question,
+                .auth => .auth,
+            } else .none;
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .program_status,
+                .{
+                    .event = switch (v.event) {
+                        .report => .report,
+                        .prompt_start => .prompt_start,
+                    },
+                    .state = state,
+                    .kind = kind,
+                    .progress = if (v.progress) |percent| @intCast(percent) else -1,
+                    .id = copyCString(v.id, &id_buf),
+                    .app = copyCString(v.app, &app_buf),
+                    .title = copyCString(v.title, &title_buf),
+                    .msg = copyCString(v.msg, &msg_buf),
+                },
+            ) catch |err| log.warn("apprt failed to report program status err={}", .{err});
         },
 
         .tmux_control => |v| {
@@ -2002,14 +2075,16 @@ fn mouseRefreshLinks(
             mouse_pin,
             mouse_mods,
         );
+        const link_filter = self.renderer_state.link_filter;
         for (0..2) |attempt| {
             self.renderer_state.mutex.unlock(global.io());
-            const resolved_result = linkpkg.resolveAt(
+            const resolved_result = linkpkg.resolveAtFiltered(
                 terminal.Pin,
                 alloc,
                 prepared,
                 self.config.links,
                 mouse_mods,
+                link_filter,
             );
             self.renderer_state.mutex.lockUncancelable(global.io());
 
@@ -2157,6 +2232,80 @@ pub const AbsoluteScrollSnapshot = struct {
     row_space_revision: u64,
 };
 
+/// Bound for the fractional pixel scroll offset accepted from embedders.
+/// This is far larger than any cell height; it only guards against wildly
+/// wrong values (the offset is a render-space translation, so an absurd
+/// value would just translate content off screen).
+const max_viewport_pixel_offset: f32 = 4096.0;
+
+/// Pixel-precise variant of `scrollToRowIfRevision`: atomically scroll the
+/// viewport to `row` and apply a fractional vertical pixel offset in the
+/// same critical section. The renderer snapshots (viewport, offset) under
+/// the same lock, so a presented frame is always composed from one
+/// consistent scroll position. This is the primitive behind native touch
+/// scrolling on mobile.
+///
+/// `pixel_offset` is a render-space translation: positive values shift
+/// content up by that many pixels, revealing the top sliver of the row
+/// below the viewport bottom (the renderer overscans one row for this).
+/// Callers keep it in [0, cell_height) between rows; values at the row
+/// space edges render as background gap, which is what overscroll
+/// (rubber-band) looks like.
+///
+/// The offset only ever applies to the primary screen. On the alternate
+/// screen it is forced to zero: there is no scrollback and the application
+/// owns its content, so a fractional offset would shear against
+/// app-authored repaints.
+pub fn scrollToRowPixelIfRevision(
+    self: *Surface,
+    row: usize,
+    pixel_offset: f32,
+    expected_row_space_revision: u64,
+) !?AbsoluteScrollSnapshot {
+    if (!std.math.isFinite(pixel_offset)) return null;
+    const clamped = std.math.clamp(
+        pixel_offset,
+        -max_viewport_pixel_offset,
+        max_viewport_pixel_offset,
+    );
+
+    const snapshot: AbsoluteScrollSnapshot = snapshot: {
+        self.renderer_state.lockDemand(global.io());
+        defer self.renderer_state.unlockDemand(global.io());
+
+        const screens = &self.renderer_state.terminal.screens;
+        const screen_key = screens.active_key;
+        var scrollbar = screens.active.pages.scrollbar();
+        const revision = self.rowSpaceIdentity(
+            screen_key,
+            screens.generation(screen_key),
+            scrollbar.row_space_revision,
+        );
+        if (revision != expected_row_space_revision) return null;
+
+        // scroll() resets the pixel offset, so set it afterwards while
+        // still holding the lock.
+        screens.active.scroll(.{ .row = row });
+        if (screen_key == .primary) {
+            screens.active.pages.viewport_pixel_offset = clamped;
+        }
+
+        scrollbar = screens.active.pages.scrollbar();
+        break :snapshot .{
+            .total = @intCast(scrollbar.total),
+            .offset = @intCast(scrollbar.offset),
+            .len = @intCast(scrollbar.len),
+            .row_space_revision = self.rowSpaceIdentity(
+                screen_key,
+                screens.generation(screen_key),
+                scrollbar.row_space_revision,
+            ),
+        };
+    };
+    try self.queueRender();
+    return snapshot;
+}
+
 /// Scroll to an absolute row only while the caller's row-space identity is
 /// still current. Validation, mutation, and the returned geometry share the
 /// renderer-state lock so destructive output cannot race the operation.
@@ -2194,6 +2343,14 @@ pub fn scrollToRowIfRevision(
     };
     try self.queueRender();
     return snapshot;
+}
+
+/// Try to move the viewport to the bottom without waiting on terminal state.
+/// This is used by embedded display-driven clients when user input should
+/// reveal the prompt, but the render/output serial queue must never block on a
+/// busy PTY parser or renderer lock.
+pub fn tryScrollToBottom(self: *Surface) bool {
+    return self.io.tryScrollViewport(.{ .bottom = {} });
 }
 
 fn hashRowSpaceIdentity(
@@ -2609,6 +2766,34 @@ pub fn selectCursorLine(self: *Surface) !bool {
     }
 
     const sel = screen.selectLine(.{ .pin = pin }) orelse return false;
+    try self.setSelection(sel);
+    screen.dirty.selection = true;
+    try self.queueRender();
+    return true;
+}
+
+/// Describe the shell input the cursor is editing (cmux-specific).
+///
+/// Null unless the terminal is at a prompt on the primary screen and the
+/// cursor is inside an OSC 133 input region. Takes the renderer mutex once;
+/// meant for key gestures, not for every keystroke.
+pub fn promptInput(self: *Surface) ?terminal.Screen.PromptInput {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    if (!self.io.terminal.cursorIsAtPrompt()) return null;
+    return self.io.terminal.screens.active.promptInput();
+}
+
+/// Select caret stops `[start, end)` of the shell input the cursor is
+/// editing (cmux-specific). Never writes a clipboard.
+pub fn selectPromptInput(self: *Surface, start: u32, end: u32) !bool {
+    self.renderer_state.lockDemand(global.io());
+    defer self.renderer_state.unlockDemand(global.io());
+
+    if (!self.io.terminal.cursorIsAtPrompt()) return false;
+    const screen: *terminal.Screen = self.io.terminal.screens.active;
+    const sel = screen.promptInputSelection(start, end) orelse return false;
     try self.setSelection(sel);
     screen.dirty.selection = true;
     try self.queueRender();
@@ -4149,9 +4334,13 @@ pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
 
+    // cmux fork: the apprt speaks the app-facing size; the drawable grows
+    // by the render insets internally (see Size.top_inset/bottom_inset).
+    // This is the single point where the insets are added, so re-feeding
+    // the stored screen through resize() stays idempotent.
     const new_screen_size: rendererpkg.ScreenSize = .{
         .width = size.width,
-        .height = size.height,
+        .height = size.height +| self.size.top_inset +| self.size.bottom_inset,
     };
 
     // Update our screen size, but only if it actually changed. And if
@@ -4160,6 +4349,29 @@ pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
     if (self.size.screen.equals(new_screen_size)) return;
 
     try self.resize(new_screen_size);
+}
+
+/// cmux fork: reserve drawable pixels above and below the padded grid for
+/// render-only scrollback overscan (the iOS scroll-edge-effect bands under
+/// the navigation bar and the bottom chrome). The app-facing size contract
+/// is unchanged: sizeCallback keeps speaking the un-inset size and the
+/// drawable grows by the insets internally, so the terminal grid (and
+/// therefore the PTY size) never changes when the insets do. The renderer
+/// fills the bands with the rows directly above and below the viewport
+/// (see terminal.RenderState overscan).
+pub fn setRenderInsets(self: *Surface, top_px: u32, bottom_px: u32) !void {
+    const top: u16 = std.math.cast(u16, top_px) orelse std.math.maxInt(u16);
+    const bottom: u16 = std.math.cast(u16, bottom_px) orelse std.math.maxInt(u16);
+    if (self.size.top_inset == top and
+        self.size.bottom_inset == bottom) return;
+    const app_height = self.size.screen.height -|
+        (@as(u32, self.size.top_inset) + self.size.bottom_inset);
+    self.size.top_inset = top;
+    self.size.bottom_inset = bottom;
+    try self.resize(.{
+        .width = self.size.screen.width,
+        .height = app_height +| top +| bottom,
+    });
 }
 
 fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
@@ -4321,10 +4533,18 @@ pub fn keyEventIsBinding(
 ) ?input.Binding.Flags {
     const entry = self.keyEventBindingEntry(event_orig) orelse return null;
 
-    return switch (entry.value_ptr.*) {
+    var flags: input.Binding.Flags = switch (entry.value_ptr.*) {
         .leader => .{},
         inline .leaf, .leaf_chained => |v| v.flags,
     };
+
+    // Embedders may preserve predictive local echo only for a binding that
+    // is definitely consumed, non-performable, and has no PTY or grid effect.
+    if (flags.consumed and !flags.performable and entry.value_ptr.*.predictionLocalOnly()) {
+        flags.prediction_local_only = true;
+    }
+
+    return flags;
 }
 
 /// Consume a key event whose corresponding native menu action was unavailable.
@@ -5279,10 +5499,15 @@ pub fn scrollCallback(
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
 
+        // The tracked copy cursor owns wheel navigation for this surface.
+        // Keep the program's DEC modes intact so exiting copy mode restores
+        // its input, and retain Ghostty's normal delta scaling above.
+        const copy_mode = self.keyboard_copy_cursor != null;
+
         // If we have an active mouse reporting mode, clear the selection.
         // The selection can occur if the user uses the shift mod key to
         // override mouse grabbing from the window.
-        if (self.isMouseReporting()) {
+        if (!copy_mode and self.isMouseReporting()) {
             try self.setSelection(null);
         }
 
@@ -5290,7 +5515,8 @@ pub fn scrollCallback(
         // we convert to cursor keys. This only happens if we're:
         // (1) alt screen (2) no explicit mouse reporting and (3) alt
         // scroll mode enabled.
-        if (self.io.terminal.screens.active_key == .alternate and
+        if (!copy_mode and
+            self.io.terminal.screens.active_key == .alternate and
             self.io.terminal.flags.mouse_event == .none and
             self.io.terminal.modes.get(.mouse_alternate_scroll))
         {
@@ -5325,7 +5551,7 @@ pub fn scrollCallback(
         // the normal logic.
 
         // If we're scrolling up or down, then send a mouse event.
-        if (self.isMouseReporting()) {
+        if (!copy_mode and self.isMouseReporting()) {
             for (0..@abs(y.delta)) |_| {
                 const pos = try self.rt_surface.getCursorPos();
                 self.mouseReport(switch (y.direction()) {
@@ -5531,6 +5757,14 @@ pub fn mouseCaptured(self: *Surface) bool {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
     return self.io.terminal.flags.mouse_event != .none;
+}
+
+/// Returns true if the terminal's active screen is the alternate screen
+/// (e.g. a full-screen TUI such as vim, less, or htop is running).
+pub fn isAlternateScreen(self: *Surface) bool {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    return self.io.terminal.screens.active_key == .alternate;
 }
 
 /// Called for mouse button press/release events. This will return true
@@ -6250,6 +6484,18 @@ test "link snapshot validation retries once and detects exact changes" {
 /// Returns the link at the given cursor position, if any.
 ///
 /// Requires the renderer mutex is held.
+/// Installs the embedder's link filter, or with null removes it
+/// (`ghostty_surface_set_link_filter`). The renderer reads it on its next frame.
+pub fn setLinkFilter(self: *Surface, filter: ?rendererpkg.LinkFilter) void {
+    {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        self.renderer_state.link_filter = filter;
+        self.renderer_state.terminal.screens.active.dirty.hyperlink_hover = true;
+    }
+    self.queueRender() catch |err| log.warn("error queueing render after link filter change err={}", .{err});
+}
+
 fn linkAtPos(
     self: *Surface,
     pos: apprt.CursorPos,
@@ -6282,6 +6528,7 @@ fn linkAtPos(
         self.config.links,
         mouse_pin,
         mouse_mods,
+        self.renderer_state.link_filter,
     );
 }
 
@@ -6314,6 +6561,7 @@ fn linkAtScreenPinWithOsc8(
     links: []const DerivedConfig.Link,
     mouse_pin: terminal.Pin,
     mouse_mods: input.Mods,
+    filter: ?linkpkg.Filter,
 ) !?Link {
     if (mouse_mods.equal(input.ctrlOrSuper(.{}))) {
         if (osc8URI(mouse_pin)) |uri| return .{
@@ -6322,7 +6570,7 @@ fn linkAtScreenPinWithOsc8(
             .value = try alloc.dupeZ(u8, uri),
         };
     }
-    return try linkAtScreenPin(alloc, screen, links, mouse_pin, mouse_mods);
+    return try linkAtScreenPinFiltered(alloc, screen, links, mouse_pin, mouse_mods, filter);
 }
 
 /// Detects a configured link at a terminal pin without requiring a full
@@ -6334,6 +6582,18 @@ fn linkAtScreenPin(
     links: []const DerivedConfig.Link,
     mouse_pin: terminal.Pin,
     mouse_mods: ?input.Mods,
+) !?Link {
+    return linkAtScreenPinFiltered(alloc, screen, links, mouse_pin, mouse_mods, null);
+}
+
+/// `linkAtScreenPin`, where a link the embedder's filter rejects is no link.
+fn linkAtScreenPinFiltered(
+    alloc: Allocator,
+    screen: *terminal.Screen,
+    links: []const DerivedConfig.Link,
+    mouse_pin: terminal.Pin,
+    mouse_mods: ?input.Mods,
+    filter: ?linkpkg.Filter,
 ) !?Link {
     if (links.len == 0) return null;
     var arena = ArenaAllocator.init(alloc);
@@ -6347,12 +6607,13 @@ fn linkAtScreenPin(
         mouse_pin,
         mouse_mods,
     );
-    const resolved = (try linkpkg.resolveAt(
+    const resolved = (try linkpkg.resolveAtFiltered(
         terminal.Pin,
         arena_alloc,
         prepared,
         links,
         mouse_mods,
+        filter,
     )) orelse return null;
 
     const value = try alloc.dupeZ(u8, resolved.value);
@@ -6730,6 +6991,9 @@ pub fn colorSchemeCallback(self: *Surface, scheme: apprt.ColorScheme) !void {
 
     // Setup our conditional state which has the current color theme.
     self.config_conditional_state.theme = new_scheme;
+    // Reports must follow the surface even if a plain config has no conditional
+    // theme to reload, or the embedder coalesces the reload notification.
+    self.io.updateColorScheme(new_scheme);
     self.notifyConfigConditionalState();
 
     // If mode 2031 is on, then we report the change live.
@@ -7955,29 +8219,13 @@ fn completeClipboardPaste(
         break :encode_opts opts;
     };
 
-    // Encode the data. In most cases this doesn't require any
-    // copies, so we optimize for that case.
-    var data_duped: ?[]u8 = null;
-    const vecs = input.paste.encode(data, encode_opts) catch |err| switch (err) {
-        error.MutableRequired => vecs: {
-            const buf: []u8 = try self.alloc.dupe(u8, data);
-            errdefer self.alloc.free(buf);
-            data_duped = buf;
-            break :vecs input.paste.encode(buf, encode_opts);
-        },
-    };
-    defer if (data_duped) |v| {
-        // This code path means the data did require a copy and mutation.
-        // We must free it.
-        self.alloc.free(v);
-    };
-
-    for (vecs) |vec| if (vec.len > 0) {
-        self.queueIo(try termio.Message.writeReq(
-            self.alloc,
-            vec,
-        ), .unlocked);
-    };
+    // The opening fence, payload, and closing fence must cross the IO mailbox
+    // as one message. Terminal replies share this mailbox and must never land
+    // inside a bracketed paste while these bytes are being enqueued.
+    self.queueIo(.{ .write_alloc = .{
+        .alloc = self.alloc,
+        .data = try input.paste.encodeAlloc(self.alloc, data, encode_opts),
+    } }, .unlocked);
 }
 
 fn completeTextInput(
@@ -9074,16 +9322,20 @@ test "Surface: path link selection spans an indented hard newline" {
     )) == null);
 }
 
-test "Surface: markdown path spans unindented hard newlines" {
+test "Surface: markdown path spans width-filled unindented hard newlines" {
     if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
     const prefix = "##  ";
     const first = "/Users/austinwang/Library/Developer/Xcode/DerivedData/";
-    const second = "cmux-fix-split-resize/Build/Products/Debug/cmux DEV fix-";
+    const second = "cmux-fix-split-resize/Build/Products/Debug/cmux DEV fix-x-";
     const third = "split-resize.app";
     const value = first ++ second ++ third;
+
+    comptime {
+        std.debug.assert(prefix.len + first.len == second.len);
+    }
 
     try oni.testing.ensureInit();
     var config = try configpkg.Config.default(alloc);
@@ -9092,7 +9344,7 @@ test "Surface: markdown path spans unindented hard newlines" {
     defer derived.deinit();
 
     var screen = try terminal.Screen.init(std.testing.io, alloc, .{
-        .cols = 80,
+        .cols = second.len,
         .rows = 4,
         .max_scrollback = 0,
     });
@@ -9100,7 +9352,7 @@ test "Surface: markdown path spans unindented hard newlines" {
 
     screen.cursorSetSemanticContent(.output);
     try screen.testWriteString(
-        prefix ++ first ++ "\r\n" ++ second ++ "\r\n" ++ third,
+        prefix ++ first ++ "\n" ++ second ++ "\n" ++ third,
     );
 
     for ([_]terminal.point.Coordinate{
@@ -9121,15 +9373,21 @@ test "Surface: markdown path spans unindented hard newlines" {
     }
 }
 
-test "Surface: URL spans unindented hard newlines" {
+test "Surface: URL spans width-filled unindented hard newlines" {
     if (comptime !@import("terminal_options").oniguruma) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
-    const first = "https://github.com/manaflow-ai/cmux/issues/8583#issuecomment-";
-    const second = "0123456789-";
+    const first = "https://github.com/manaflow-ai/cmux/issues/8583#issuecomment-xy-";
+    const second = "01234567890abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-";
     const third = "abcdefghijklmnopqrstuvwxyz";
     const value = first ++ second ++ third;
+
+    comptime {
+        // An unindented real newline is only an unambiguous wrap when the
+        // preceding physical row ran out of columns.
+        std.debug.assert(first.len == second.len);
+    }
 
     try oni.testing.ensureInit();
     var config = try configpkg.Config.default(alloc);
@@ -9138,13 +9396,13 @@ test "Surface: URL spans unindented hard newlines" {
     defer derived.deinit();
 
     var screen = try terminal.Screen.init(std.testing.io, alloc, .{
-        .cols = 96,
+        .cols = first.len,
         .rows = 4,
         .max_scrollback = 0,
     });
     defer screen.deinit();
     screen.cursorSetSemanticContent(.output);
-    try screen.testWriteString(first ++ "\r\n" ++ second ++ "\r\n" ++ third);
+    try screen.testWriteString(first ++ "\n" ++ second ++ "\n" ++ third);
 
     for ([_]terminal.point.Coordinate{
         .{ .x = 20, .y = 0 },
@@ -9804,6 +10062,7 @@ test "Surface: OSC 8 owns an overlapping regex link target" {
         derived.links,
         pin,
         input.ctrlOrSuper(.{}),
+        null,
     )) orelse return error.TestExpectedEqual;
     defer link.deinit(alloc);
     try testing.expectEqual(input.Link.Action._open_osc8, std.meta.activeTag(link.action));

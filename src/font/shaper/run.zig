@@ -9,14 +9,8 @@ const autoHash = std.hash.autoHash;
 const Hasher = std.hash.Wyhash;
 const VisualRun = itijah.VisualRun;
 
-/// Classify a codepoint by bidi strength.
-/// Returns null for neutrals (spaces/punctuation).
-fn codepointIsRtl(cp: u32) ?bool {
-    return switch (itijah.unicode.bidiClass(@intCast(cp))) {
-        .right_to_left, .right_to_left_arabic => true,
-        .left_to_right, .european_number, .arabic_number => false,
-        else => null,
-    };
+test {
+    _ = @import("hangul_test.zig");
 }
 
 /// A single text run. A text run is only valid for one Shaper instance and
@@ -206,17 +200,12 @@ pub const RunIterator = struct {
                     have_font = true;
                 }
 
-                // If our fonts are not equal, then we're done with our run —
-                // UNLESS the codepoint is neutral (space, punctuation) and
-                // the current run's font also supports it.
-                if (font_info.idx != current_font) {
-                    if (!self.canCoalesceIntoCurrentFont(
-                        font_info,
-                        current_font,
-                        cell.codepoint(),
-                        presentation,
-                    )) break;
-                }
+                // Keep the resolver's font choice, including for bidi-neutral
+                // punctuation. Coverage in the current face does not imply
+                // compatible metrics: a CJK dash can fill two cells while the
+                // terminal allocates one. Bidi direction comes from the layout
+                // above and does not require overriding font selection.
+                if (font_info.idx != current_font) break;
             }
 
             // Defensive: ensure forward progress.
@@ -265,19 +254,11 @@ pub const RunIterator = struct {
                     presentation,
                 );
 
-                if (font_info.idx != current_font) {
-                    if (!self.canCoalesceIntoCurrentFont(
-                        font_info,
-                        current_font,
-                        cell.codepoint(),
-                        presentation,
-                    )) continue;
-                }
+                if (font_info.idx != current_font) continue;
 
-                // If we're a fallback character and that fallback is in the
-                // current run font, add it directly.
-                if (font_info.fallback) |cp| {
-                    // Only use fallback glyph if it comes from the run font.
+                // Keep a substituted shaping codepoint paired with its face.
+                // Terminal cells and their original copy/paste spelling remain intact.
+                if (font_info.codepoint) |cp| {
                     if (font_info.idx == current_font) {
                         try self.addCodepoint(&hasher, cp, cluster);
                         continue;
@@ -455,26 +436,10 @@ pub const RunIterator = struct {
 
     const FontInfo = struct {
         idx: font.Collection.Index,
-        fallback: ?u32 = null,
+        /// A single codepoint to shape instead of the stored grapheme.
+        /// Used for canonical Hangul composition and missing-glyph replacement.
+        codepoint: ?u32 = null,
     };
-
-    /// Returns true when a bidi-neutral codepoint may use the surrounding
-    /// run's font instead of the font selected by the resolver.
-    fn canCoalesceIntoCurrentFont(
-        self: *RunIterator,
-        font_info: FontInfo,
-        current_font: font.Collection.Index,
-        cp: u32,
-        presentation: ?font.Presentation,
-    ) bool {
-        // Special fonts bypass normal shaping and render their own glyphs.
-        // Their resolver result is authoritative even when a text font also
-        // happens to contain the same neutral codepoint.
-        return font_info.idx.special() == null and
-            cp != 0 and
-            codepointIsRtl(cp) == null and
-            self.opts.grid.hasCodepoint(current_font, cp, presentation);
-    }
 
     /// Resolve which font to use for a cell, falling back to the replacement
     /// character or space if the cell's glyph is unavailable.
@@ -486,16 +451,33 @@ pub const RunIterator = struct {
         style: font.Style,
         presentation: ?font.Presentation,
     ) !FontInfo {
+        // Resolve AND shape canonically composable Hangul with the same
+        // syllable. A face may cover the syllable but have no jamo glyphs;
+        // sending its NFD spelling to CoreText can return fallback-face glyph
+        // IDs, which the renderer would incorrectly draw with this face.
+        if (cell.hasGrapheme()) hangul: {
+            const composed = font.hangul.composedSyllable(
+                cell.codepoint(),
+                graphemes,
+            ) orelse break :hangul;
+            if (try self.opts.grid.getIndex(
+                alloc,
+                composed,
+                style,
+                presentation,
+            )) |idx| return .{ .idx = idx, .codepoint = composed };
+        }
+
         if (try self.indexForCell(alloc, cell, graphemes, style, presentation)) |idx|
             return .{ .idx = idx };
 
         // Prefer the official replacement character.
         if (try self.opts.grid.getIndex(alloc, 0xFFFD, style, presentation)) |idx|
-            return .{ .idx = idx, .fallback = 0xFFFD };
+            return .{ .idx = idx, .codepoint = 0xFFFD };
 
         // Fallback to space.
         if (try self.opts.grid.getIndex(alloc, ' ', style, presentation)) |idx|
-            return .{ .idx = idx, .fallback = ' ' };
+            return .{ .idx = idx, .codepoint = ' ' };
 
         // We can't render at all. This is a bug, we should always
         // have a font that can render a space.

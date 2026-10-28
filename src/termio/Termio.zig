@@ -44,6 +44,10 @@ backend: termio.Backend,
 /// The derived configuration for this termio implementation.
 config: DerivedConfig,
 
+/// Runtime scheme used by CSI 996 queries and mode 2031 reports. Guarded by
+/// renderer_state.mutex; config swaps must never overwrite appearance state.
+color_scheme: configpkg.ConditionalState.Theme,
+
 /// The terminal emulator internal state. This is the abstract "terminal"
 /// that manages input, grid updating, etc. and is renderer-agnostic. It
 /// just stores internal state about a grid.
@@ -52,9 +56,14 @@ terminal: terminalpkg.Terminal,
 /// The shared render state
 renderer_state: *renderer.State,
 
-/// A handle to wake up the renderer. This hints to the renderer that
-/// a repaint should happen.
-renderer_wakeup: xev.Async,
+/// The renderer thread's own wakeup handle (not a copy). This hints to the
+/// renderer that a repaint should happen. A pointer because libxev's IOCP
+/// `Async` (Windows) keeps its waiter inside the struct: a copy made before
+/// the renderer thread starts waiting never wakes it, so PTY output did not
+/// redraw a terminal there until something else (focus, resize, cursor
+/// blink) woke its renderer. The eventfd and kqueue backends share a handle
+/// between copies, which hid this elsewhere.
+renderer_wakeup: *xev.Async,
 
 /// The mailbox for notifying the renderer of things.
 renderer_mailbox: *renderer.Thread.Mailbox,
@@ -74,8 +83,8 @@ mailbox: termio.Mailbox,
 manual_linefeed_mode: std.atomic.Value(bool) = .{ .raw = false },
 
 /// cmux fork: optional tee callback that fires on every PTY-output byte
-/// before the VT parser sees it. Embedders (cmux's mac sync server) use
-/// this to broadcast raw bytes to a paired iPhone so the phone can feed
+/// after the VT parser applied it, under the renderer mutex. Embedders
+/// (cmux's mac sync server) use this to broadcast raw bytes to a paired iPhone so the phone can feed
 /// the same bytes through its own libghostty surface, producing an
 /// identical grid by construction. Both fields are read on the IO read
 /// thread. The embedded runtime installs initial values before starting that
@@ -149,13 +158,15 @@ const ThreadEnterState = struct {
     ) (Allocator.Error || error{InputNotFound})![]const Input {
         const alloc = self.arena.allocator();
 
-        var input = try alloc.alloc(
-            Input,
+        var inputs: std.ArrayList(Input) = try .initCapacity(
+            alloc,
             self.input.list.items.len,
         );
-        for (self.input.list.items, 0..) |item, i| {
-            input[i] = switch (item) {
-                .raw => |v| .{ .string = try alloc.dupe(u8, v) },
+        errdefer for (inputs.items) |item| item.deinit();
+
+        for (self.input.list.items) |item| {
+            inputs.appendAssumeCapacity(switch (item) {
+                .raw => |v| .{ .string = v },
                 .path => |path| file: {
                     const f = std.Io.Dir.cwd().openFile(
                         global.io(),
@@ -171,15 +182,22 @@ const ThreadEnterState = struct {
 
                     break :file .{ .file = f };
                 },
-            };
+            });
         }
 
-        return input;
+        return inputs.items;
     }
 
     const Input = union(enum) {
         string: []const u8,
         file: std.Io.File,
+
+        fn deinit(self: Input) void {
+            switch (self) {
+                .string => {},
+                .file => |f| f.close(global.io()),
+            }
+        }
     };
 };
 
@@ -200,7 +218,6 @@ pub const DerivedConfig = struct {
     osc_color_report_format: configpkg.Config.OSCColorReportFormat,
     clipboard_write: configpkg.ClipboardAccess,
     enquiry_response: []const u8,
-    conditional_state: configpkg.ConditionalState,
 
     pub fn init(
         alloc_gpa: Allocator,
@@ -240,7 +257,6 @@ pub const DerivedConfig = struct {
             .osc_color_report_format = config.@"osc-color-report-format",
             .clipboard_write = config.@"clipboard-write",
             .enquiry_response = try alloc.dupe(u8, config.@"enquiry-response"),
-            .conditional_state = config._conditional_state,
 
             // This has to be last so that we copy AFTER the arena allocations
             // above happen (Zig assigns in order).
@@ -366,6 +382,7 @@ pub fn init(self: *Termio, alloc: Allocator, opts: termio.Options) !void {
         .alloc = alloc,
         .terminal = term,
         .config = opts.config,
+        .color_scheme = opts.color_scheme,
         .renderer_state = opts.renderer_state,
         .renderer_wakeup = opts.renderer_wakeup,
         .renderer_mailbox = opts.renderer_mailbox,
@@ -412,6 +429,9 @@ pub fn threadEnter(
         try v.prepareInput()
     else
         null;
+    defer if (inputs) |items| {
+        for (items) |input| input.deinit();
+    };
 
     data.* = .{
         .alloc = self.alloc,
@@ -432,20 +452,21 @@ pub fn threadEnter(
             log.warn("failed to queue input string err={}", .{err});
             return error.InputFailed;
         },
-        .file => |f| self.queueWrite(
-            data,
-            compat_file.readToEndAlloc(
+        .file => |f| {
+            const contents = compat_file.readToEndAlloc(
                 f,
                 self.alloc,
                 10 * 1024 * 1024, // 10 MiB max
             ) catch |err| {
                 log.warn("failed to read input file err={}", .{err});
                 return error.InputFailed;
-            },
-            false,
-        ) catch |err| {
-            log.warn("failed to queue input file err={}", .{err});
-            return error.InputFailed;
+            };
+            defer self.alloc.free(contents);
+
+            self.queueWrite(data, contents, false) catch |err| {
+                log.warn("failed to queue input file err={}", .{err});
+                return error.InputFailed;
+            };
         },
     };
 }
@@ -613,6 +634,14 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
     self.terminal.setKittyGraphicsLoadingLimits(.allWithTempDir(global.tmpDirPath()));
 }
 
+/// Update report state synchronously with the surface appearance callback.
+/// The IO thread reads it under the same lock when it handles a queued query.
+pub fn updateColorScheme(self: *Termio, scheme: configpkg.ConditionalState.Theme) void {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    self.color_scheme = scheme;
+}
+
 /// Update only the terminal color defaults used by OSC resets.
 ///
 /// Manual-IO embedders call this on the same serial executor as processOutput.
@@ -740,58 +769,19 @@ pub fn resetSynchronizedOutput(self: *Termio) void {
 
 /// Clear the screen.
 pub fn clearScreen(self: *Termio, td: *ThreadData, history: bool) !void {
-    {
+    const at_prompt: bool = at_prompt: {
         self.renderer_state.mutex.lockUncancelable(global.io());
         defer self.renderer_state.mutex.unlock(global.io());
 
-        // If we're on the alternate screen, we do not clear. Since this is an
-        // emulator-level screen clear, this messes up the running programs
-        // knowledge of where the cursor is and causes rendering issues. So,
-        // for alt screen, we do nothing.
-        if (self.terminal.screens.active_key == .alternate) return;
+        // The terminal owns the whole clear (alternate screen no-op,
+        // prompt detection, erase ordering, history). It tells us whether
+        // the cursor was at a prompt, in which case the shell must repaint.
+        break :at_prompt self.terminal.clearScreen(history);
+    };
 
-        // Clear our selection
-        self.terminal.screens.active.clearSelection();
-
-        // Clear our scrollback
-        if (history) self.terminal.eraseDisplay(.scrollback, false);
-
-        // If we're not at a prompt, we just delete above the cursor.
-        if (!self.terminal.cursorIsAtPrompt()) {
-            if (self.terminal.screens.active.cursor.y > 0) {
-                self.terminal.screens.active.eraseActive(
-                    self.terminal.screens.active.cursor.y - 1,
-                );
-            }
-
-            // Clear all Kitty graphics state for this screen. This copies
-            // Kitty's behavior when Cmd+K deletes all Kitty graphics. I
-            // didn't spend time researching whether it only deletes Kitty
-            // graphics that are placed above the cursor or if it deletes
-            // all of them. We delete all of them for now but if this behavior
-            // isn't fully correct we should fix this later.
-            self.terminal.screens.active.kitty_images.delete(
-                self.terminal.io(),
-                self.terminal.screens.active.alloc,
-                &self.terminal,
-                .{ .all = true },
-            );
-
-            return;
-        }
-
-        // At a prompt, we want to first fully clear the screen, and then after
-        // send a FF (0x0C) to the shell so that it can repaint the screen.
-        // Mark the current row as a not a prompt so we can properly
-        // clear the full screen in the next eraseDisplay call.
-        // TODO: fix this
-        // self.terminal.markSemanticPrompt(.command);
-        // assert(!self.terminal.cursorIsAtPrompt());
-        self.terminal.eraseDisplay(.complete, false);
-    }
-
-    // If we reached here it means we're at a prompt, so we send a form-feed.
-    try self.queueWrite(td, &[_]u8{0x0C}, false);
+    // At a prompt the screen is now fully cleared, so send a form-feed
+    // (0x0C) to the shell so that it can repaint the prompt.
+    if (at_prompt) try self.queueWrite(td, &[_]u8{0x0C}, false);
 }
 
 /// Scroll the viewport
@@ -802,6 +792,22 @@ pub fn scrollViewport(
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
     self.terminal.scrollViewport(scroll);
+}
+
+/// Try to scroll the terminal viewport without waiting for the renderer-state
+/// mutex. Embedded display-driven surfaces run this from the same serial queue
+/// that feeds output and renders frames, so an unbounded lock wait here would
+/// strand every later output operation behind a transient PTY/render burst.
+/// The caller can retry after the next display tick when the lock is busy.
+pub fn tryScrollViewport(
+    self: *Termio,
+    scroll: terminalpkg.Terminal.ScrollViewport,
+) bool {
+    if (!self.renderer_state.mutex.tryLock()) return false;
+    self.terminal.scrollViewport(scroll);
+    self.renderer_state.mutex.unlock(global.io());
+    self.renderer_wakeup.notify() catch {};
+    return true;
 }
 
 /// Jump the viewport to the prompt.
@@ -840,14 +846,6 @@ pub fn focusGained(self: *Termio, td: *ThreadData, focused: bool) !void {
 /// call with pty data but it is also called by the read thread when using
 /// an exec subprocess.
 pub fn processOutput(self: *Termio, buf: []const u8) void {
-    // cmux fork: tee raw PTY bytes BEFORE locking the renderer mutex or
-    // touching terminal state. The tee callback is expected to be cheap
-    // (typically a memcpy into a ring buffer + a wakeup). It runs on the
-    // read thread; the embedder owns thread safety for any cross-thread
-    // hand-off. Tee fires for every byte the read thread produces,
-    // regardless of mode.
-    if (self.pty_tee_cb) |cb| cb(self.pty_tee_userdata, buf.ptr, buf.len);
-
     // We are modifying terminal state from here on out and we need
     // the lock to grab our read data.
     self.renderer_state.mutex.lockUncancelable(global.io());
@@ -856,6 +854,47 @@ pub fn processOutput(self: *Termio, buf: []const u8) void {
     if (self.renderer_state.pty_tap_with_output_sequence) |tap| {
         tap.cb(tap.userdata, buf.ptr, buf.len, self.processed_output_bytes);
     }
+
+    // cmux fork: tee raw PTY bytes AFTER the parser applied them, while
+    // the renderer mutex is still held. Anything that reads terminal state
+    // under that mutex (the cursor, a snapshot and its output sequence)
+    // then never sees bytes the tee has not delivered, and no tee consumer
+    // sees bytes the grid does not reflect yet. Predicted local echo relies
+    // on this: a consumer that drained the tee before the parser ran would
+    // measure its offsets from a cursor that had not moved yet. The callback
+    // must stay cheap and must not take the renderer mutex (typically a
+    // memcpy into a buffer + a wakeup). It runs on the read thread; the
+    // embedder owns thread safety for any cross-thread hand-off. Tee fires
+    // for every byte the read thread produces, regardless of mode.
+    if (self.pty_tee_cb) |cb| cb(self.pty_tee_userdata, buf.ptr, buf.len);
+}
+
+/// Start a destructive replay on a surface that has not processed output.
+/// The caller must hold renderer_state.mutex until it finishes or cancels.
+pub fn beginKittyReplayRestoreLocked(self: *Termio) bool {
+    if (self.processed_output_bytes != 0) return false;
+    self.terminal_stream.handler.beginKittyReplayTracking();
+    return true;
+}
+
+/// Apply replay bytes while the caller holds renderer_state.mutex.
+pub fn processKittyReplayOutputLocked(self: *Termio, buf: []const u8) void {
+    processOutputAndAdvanceLocked(self, buf);
+}
+
+/// Finish replay tracking and report all completed Kitty command failures.
+pub fn finishKittyReplayRestoreLocked(self: *Termio) bool {
+    if (self.terminal_stream.parser.state != .ground or
+        self.terminal_stream.utf8decoder.state != 0 or
+        !self.terminal_stream.handler.apc.isInactive())
+    {
+        self.terminal_stream.handler.failKittyReplayIfTracking();
+    }
+    return self.terminal_stream.handler.finishKittyReplayTracking();
+}
+
+pub fn cancelKittyReplayRestoreLocked(self: *Termio) void {
+    self.terminal_stream.handler.cancelKittyReplayTracking();
 }
 
 /// Apply output and publish its byte position as one renderer-mutex critical
@@ -884,9 +923,12 @@ fn processOutputLocked(self: *Termio, buf: []const u8) void {
         }
 
         self.last_cursor_reset = now;
-        _ = self.renderer_mailbox.push(global.io(), .{
+        const queue_size = self.renderer_mailbox.push(global.io(), .{
             .reset_cursor_blink = {},
         }, .{ .instant = {} });
+        if (queue_size == 0) {
+            self.terminal_stream.handler.failKittyReplayIfTracking();
+        }
     }
 
     // Forward raw PTY bytes to any registered peer-federation tap.
@@ -961,7 +1003,7 @@ pub fn colorSchemeReportLocked(self: *Termio, td: *ThreadData, force: bool) !voi
     if (!force and !self.renderer_state.terminal.modes.get(.report_color_scheme)) {
         return;
     }
-    const scheme: terminalpkg.device_status.ColorScheme = switch (self.config.conditional_state.theme) {
+    const scheme: terminalpkg.device_status.ColorScheme = switch (self.color_scheme) {
         .light => .light,
         .dark => .dark,
     };

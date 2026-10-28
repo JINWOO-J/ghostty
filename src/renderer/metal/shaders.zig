@@ -566,6 +566,12 @@ pub const Uniforms = extern struct {
     /// according to the WCAG 2.0 spec.
     min_contrast: f32 align(4),
 
+    /// Fractional vertical pixel scroll offset. Positive values shift all
+    /// grid-positioned primitives up by this many pixels, revealing the
+    /// overscan row at the bottom of the cell grid. Zero unless the
+    /// embedder drives pixel-precise scrolling.
+    scroll_offset: f32 align(4),
+
     /// The cursor position and color.
     cursor_pos: [2]u16 align(4),
     cursor_color: [4]u8 align(4),
@@ -596,6 +602,12 @@ pub const Uniforms = extern struct {
         /// with linear alpha blending have a similar apparent weight
         /// (thickness) to gamma-incorrect blending.
         use_linear_correction: bool align(1) = false,
+
+        /// The host app paints the background (layer-background mode or
+        /// a macOS glass style), so `bg_color`'s alpha is zeroed to skip
+        /// our fill. Text shaders still treat `bg_color` as opaque for
+        /// minimum contrast and linear correction.
+        host_paints_background: bool align(1) = false,
     },
 
     const PaddingExtend = packed struct(u8) {
