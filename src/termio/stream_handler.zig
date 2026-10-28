@@ -42,13 +42,6 @@ fn suppressTerminalResponseForState(
     return suppressTerminalResponse(configured or kitty_replay_tracking, msg);
 }
 
-fn discardTermioMessage(msg: termio.Message) void {
-    switch (msg) {
-        .write_alloc => |req| req.alloc.free(req.data),
-        else => {},
-    }
-}
-
 fn discardSurfaceMessage(msg: apprt.surface.Message) void {
     switch (msg) {
         .clipboard_write => |value| value.req.deinit(),
@@ -265,7 +258,7 @@ pub const StreamHandler = struct {
                 self.termio_messaged = true;
             } else {
                 self.kitty_replay_failed = true;
-                discardTermioMessage(msg);
+                termio.mailbox.discard(msg);
             }
             return;
         }
