@@ -32,25 +32,37 @@ const ipv6_url_pattern =
     \\(?:\[[:0-9a-fA-F]+(?:[:0-9a-fA-F]*)+\](?::[0-9]+)?)
 ;
 
-const scheme_url_chars =
-    \\[\w\-.~:/?#@!$&*+,;=%]
+// Korean prose attaches particles directly to a path or URL ("file.gif에").
+// Oniguruma's \w matches Hangul, so a non-ASCII word character is accepted
+// only when it does not directly follow an ASCII letter or digit. Non-ASCII
+// names such as "보고서.pdf" or "report_최종.pdf" still match.
+const non_ascii_word_char =
+    \\(?<![A-Za-z0-9])[\w&&[^\x00-\x7F]]
 ;
 
-const path_chars =
-    \\[\w\-.~:\/?#@!$&*+;=%]
-;
+fn linkChars(comptime ascii_class: []const u8) []const u8 {
+    return "(?:[" ++ ascii_class ++ "]|" ++ non_ascii_word_char ++ ")";
+}
 
-const path_chars_no_dot =
-    \\[\w\-~:\/?#@!$&*+;=%]
-;
+const scheme_url_chars = linkChars(
+    \\A-Za-z0-9_\-.~:/?#@!$&*+,;=%
+);
 
-const path_segment_chars =
-    \\[\w\-.~:?#@!$&*+;=%]
-;
+const path_chars = linkChars(
+    \\A-Za-z0-9_\-.~:\/?#@!$&*+;=%
+);
 
-const path_segment_chars_no_dot =
-    \\[\w\-~:?#@!$&*+;=%]
-;
+const path_chars_no_dot = linkChars(
+    \\A-Za-z0-9_\-~:\/?#@!$&*+;=%
+);
+
+const path_segment_chars = linkChars(
+    \\A-Za-z0-9_\-.~:?#@!$&*+;=%
+);
+
+const path_segment_chars_no_dot = linkChars(
+    \\A-Za-z0-9_\-~:?#@!$&*+;=%
+);
 
 const optional_bracketed_word_suffix =
     \\(?:[\(\[]\w*[\)\]])?
@@ -152,8 +164,9 @@ const dotted_path_space_suffix =
     "(?:" ++ dotted_path_space_dir_segment_dotted_tail ++ "|" ++ dotted_path_space_file_segment ++ ")";
 
 const any_path_space_segments =
-    \\(?:(?<!:) (?!\w+:\/\/)(?!\.{0,2}\/)(?!~\/)[\w\-.~:\/?#@!$&*+;=%]+)*
-;
+    \\(?:(?<!:) (?!\w+:\/\/)(?!\.{0,2}\/)(?!~\/)
+++ path_chars ++
+    "+)*";
 
 // Branch 1: URLs with explicit schemes (http, mailto, ftp, etc.).
 const scheme_url_branch =
@@ -679,6 +692,40 @@ test "url regex" {
         .{
             .input = "./Downloads: Operation not permitted",
             .expect = "./Downloads",
+        },
+        // Korean prose attaches particles directly to a path or URL; an ASCII
+        // character followed by Hangul ends the link.
+        .{
+            .input = "파일은 /Users/me/.reel/demo/incident-lifecycle.gif에 있습니다",
+            .expect = "/Users/me/.reel/demo/incident-lifecycle.gif",
+        },
+        .{
+            .input = "src/config/url.zig를 고쳤습니다",
+            .expect = "src/config/url.zig",
+        },
+        .{
+            .input = "/Users/me/work에서 실행",
+            .expect = "/Users/me/work",
+        },
+        .{
+            .input = "https://example.com/docs에서 확인",
+            .expect = "https://example.com/docs",
+        },
+        .{
+            .input = "/tmp/한글폴더/notes.md에 저장",
+            .expect = "/tmp/한글폴더/notes.md",
+        },
+        .{
+            .input = "open ~/Documents/보고서.pdf now",
+            .expect = "~/Documents/보고서.pdf",
+        },
+        .{
+            .input = "docs/report_최종.pdf 확인",
+            .expect = "docs/report_최종.pdf",
+        },
+        .{
+            .input = "https://ko.wikipedia.org/wiki/한글 문서",
+            .expect = "https://ko.wikipedia.org/wiki/한글",
         },
     };
 
