@@ -1725,7 +1725,7 @@ fn applyFocused(self: *Thread, value: bool, external_drain: bool) !void {
 
 fn applyDisplayID(self: *Thread, value: u32) !void {
     if (@hasDecl(rendererpkg.Renderer, "setMacOSDisplayID")) {
-        try self.renderer.setMacOSDisplayID(value);
+        try self.renderer.setMacOSDisplayID(value, &self.draw_now);
     }
 }
 

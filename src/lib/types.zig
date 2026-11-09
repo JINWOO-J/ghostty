@@ -8,7 +8,7 @@ pub const String = extern struct {
                 .ptr = zig.ptr,
                 .len = zig.len,
             },
-            else => @compileError("expected a byte slice"),
+            else => @compileError("unsupported String.init type: " ++ @typeName(@TypeOf(zig))),
         };
     }
 };

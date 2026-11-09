@@ -223,7 +223,6 @@ const rooted_or_relative_path_branch =
     path_chars ++ "+" ++
     any_path_space_segments ++
     no_trailing_colon ++
-    trailing_spaces_at_eol ++
     ")";
 
 // Branch 3: Bare relative paths such as src/config/url.zig.
@@ -449,6 +448,8 @@ test "url regex" {
             .input = "../example.py",
             .expect = "../example.py",
         },
+        // cmux keeps trailing spaces at end of line in the match; the
+        // link action trims them (Surface.zig), the copy policy keeps them.
         .{
             .input = "../example.py ",
             .expect = "../example.py ",
@@ -510,11 +511,12 @@ test "url regex" {
             .input = "IPv6 in markdown [link](http://[2001:db8::1]/docs)",
             .expect = "http://[2001:db8::1]/docs",
         },
-        // File paths with spaces
+        // Trailing whitespace isn't part of a detected file path.
         .{
             .input = "./spaces-end.   ",
             .expect = "./spaces-end.   ",
         },
+        // File paths with internal spaces
         .{
             .input = "./space middle",
             .expect = "./space middle",

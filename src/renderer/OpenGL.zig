@@ -772,6 +772,12 @@ pub fn presentLastTarget(self: *OpenGL) !void {
     if (self.last_target) |target| try self.present(target);
 }
 
+/// Called when the renderer released its GPU resources; the last
+/// presented target is deinited with them so we must drop our copy.
+pub fn gpuResourcesReleased(self: *OpenGL) void {
+    self.last_target = null;
+}
+
 test "OpenGL presentation preserves blit errors through state restoration" {
     const testing = std.testing;
     const Failure = error{

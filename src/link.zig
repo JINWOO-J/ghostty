@@ -1248,9 +1248,9 @@ fn candidateMapForSelection(
     var storage = try alloc.alloc(u8, output_len + 1);
     errdefer alloc.free(storage);
     var writer = std.Io.Writer.fixed(storage[0..output_len]);
-    var pins: std.ArrayList(terminal.Pin) = .empty;
-    defer pins.deinit(alloc);
-    formatter.pin_map = .{ .alloc = alloc, .map = &pins };
+    var pin_map: terminal.formatter.PinMap.Map = .empty;
+    defer pin_map.deinit(alloc);
+    formatter.pin_map = .{ .alloc = alloc, .map = &pin_map };
     formatter.format(&writer) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.WriteFailed => return null,
@@ -1259,8 +1259,9 @@ fn candidateMapForSelection(
     std.debug.assert(writer.end == output_len);
     storage[output_len] = 0;
     const string: [:0]u8 = storage[0..output_len :0];
-    const map = try pins.toOwnedSlice(alloc);
+    const map = try alloc.alloc(terminal.Pin, pin_map.count());
     errdefer alloc.free(map);
+    for (map, 0..) |*pin, offset| pin.* = pin_map.get(offset).?;
     if (!normalize_hard_wraps) return .{
         .string = string,
         .mapped_len = map.len,
