@@ -635,19 +635,6 @@ extension Ghostty {
                 display_id: screen?.displayID ?? 0
             ))
             config.scale_factor = Double(screen?.backingScaleFactor ?? 1)
-#elseif os(iOS)
-            config.platform_tag = GHOSTTY_PLATFORM_IOS
-            config.platform = ghostty_platform_u(ios: ghostty_platform_ios_s(
-                uiview: Unmanaged.passUnretained(view).toOpaque()
-            ))
-            // Note that UIScreen.main is deprecated and we're supposed to get the
-            // screen through the view hierarchy instead. This means that we should
-            // probably set this to some default, then modify the scale factor through
-            // libghostty APIs when a UIView is attached to a window/scene. TODO.
-            config.scale_factor = UIScreen.main.scale
-#else
-#error("unsupported target")
-#endif
 
             // Zero is our default value that means to inherit the font size.
             config.font_size = fontSize ?? 0
