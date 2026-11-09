@@ -366,7 +366,7 @@ const gl_debug_proc_callconv =
                 gl.c.GLDEBUGPROC,
             ).optional.child,
         ).pointer.child,
-    ).@"fn".calling_convention;
+    ).@"fn".attrs.@"callconv";
 
 fn glDebugMessageCallback(
     src: gl.c.GLenum,
@@ -863,22 +863,7 @@ test "OpenGL presentation preserves blit errors through state restoration" {
             target: MockTarget,
             ops: *MockOps,
         ) Failure!void {
-            if (@hasDecl(OpenGL, "presentWithOps")) {
-                return OpenGL.presentWithOps(renderer, target, ops);
-            }
-
-            // Exercise the pre-fix defer order: last_target is committed,
-            // then unbind runs, then checked restore drains and logs the blit
-            // error while the caller incorrectly observes success.
-            try ops.disableSRGB();
-            const binding = ops.bindRead(target) catch |err| {
-                ops.restoreSRGBUnchecked();
-                return err;
-            };
-            ops.blit(target);
-            renderer.last_target = target;
-            ops.unbindRead(binding);
-            ops.restoreSRGB() catch {};
+            return OpenGL.presentWithOps(renderer, target, ops);
         }
     };
 

@@ -33,7 +33,7 @@ pub const Face = switch (options.backend) {
 /// iOS like the FreeType/Linux 96 DPI default inflated every glyph and
 /// padding value by 96/72 ≈ 1.33x, which read as "way too zoomed in"
 /// on device. Group iOS with macOS so points map 1:1 to on-screen size.
-pub const default_dpi = switch (builtin.os.tag) {
+pub const default_dpi = switch (builtin.target.os.tag) {
     .macos, .ios => 72,
     else => 96,
 };

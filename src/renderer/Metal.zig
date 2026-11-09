@@ -227,7 +227,7 @@ autorelease_pool: ?*objc.AutoreleasePool = null,
 completion_generation: RendererCompletionGeneration,
 
 pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
-    comptime switch (builtin.os.tag) {
+    comptime switch (builtin.target.os.tag) {
         .macos, .ios => {},
         else => @compileError("unsupported platform for Metal"),
     };

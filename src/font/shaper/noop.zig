@@ -30,8 +30,8 @@ pub const Shaper = struct {
     /// Scratch reused for terminal bidi layout resolution.
     bidi_layout_scratch: itijah.VisualLayoutScratch = .{},
 
-    const CellBuf = std.ArrayListUnmanaged(font.shape.Cell);
-    const CodepointList = std.ArrayListUnmanaged(Codepoint);
+    const CellBuf = std.ArrayList(font.shape.Cell);
+    const CodepointList = std.ArrayList(Codepoint);
     const Codepoint = struct {
         codepoint: u32,
         cluster: u32,

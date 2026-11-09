@@ -16,6 +16,7 @@
 #elif defined(__APPLE__)
 
   #include <sys/ioctl.h> // ioctl and constants
+  #include <sys/sysctl.h> // cmux: kinfo_proc for termio/Exec.zig
   #include <sys/ttycom.h>  // ioctl and constants for TIOCPTYGNAME
   #include <sys/types.h>
   #include <unistd.h> // tcgetpgrp

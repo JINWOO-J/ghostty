@@ -21,7 +21,7 @@ pub const Log = opaque {
     pub fn typeEnabled(self: *Log, typ: LogType) bool {
         return c.os_log_type_enabled(
             @ptrCast(self),
-            @intFromEnum(typ),
+            @backingInt(typ),
         );
     }
 
@@ -34,8 +34,7 @@ pub const Log = opaque {
     ) void {
         if (!self.typeEnabled(typ)) return;
 
-        const str = nosuspend std.fmt.allocPrintSentinel(
-            alloc,
+        const str = nosuspend alloc.printSentinel(
             format,
             args,
             0,

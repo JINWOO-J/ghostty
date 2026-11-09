@@ -266,7 +266,7 @@ pub const App = struct {
     /// to run on every keypress.
     pub fn keyboardLayout(self: *App) input.KeyboardLayout {
         // We only support keyboard layout detection on macOS.
-        if (comptime builtin.os.tag != .macos) return .unknown;
+        if (comptime builtin.target.os.tag != .macos) return .unknown;
 
         // Lazily initialize the keymap.
         const keymap: *input.Keymap = keymap: {
@@ -363,7 +363,7 @@ pub const App = struct {
                     // error we just ignore it, since this only breaks a few minor things.
                     const alloc = self.core_app.alloc;
                     if (surface.rt_surface.title) |v| alloc.free(v);
-                    surface.rt_surface.title = alloc.dupeZ(u8, value.title) catch null;
+                    surface.rt_surface.title = alloc.dupeSentinel(u8, value.title, 0) catch null;
                 },
             },
 
@@ -708,7 +708,7 @@ test "embedded leased metal platform preserves ABI and validates callback" {
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(ExternalFrame));
     try std.testing.expectEqual(@as(usize, 40), @sizeOf(Platform.C));
 
-    const c = @import("ghostty.h");
+    const c = @import("ghostty-h");
     try std.testing.expectEqual(
         @as(c_int, @intFromEnum(ExternalFrameDisposition.drop)),
         @as(c_int, c.GHOSTTY_METAL_EXTERNAL_FRAME_DROP),
@@ -758,14 +758,15 @@ pub const OffscreenDmabufFrame = extern struct {
 fn expectSameLayout(comptime Zig: type, comptime C: type) !void {
     try std.testing.expectEqual(@sizeOf(C), @sizeOf(Zig));
     try std.testing.expectEqual(@alignOf(C), @alignOf(Zig));
-    inline for (@typeInfo(Zig).@"struct".fields) |field| {
-        try std.testing.expectEqual(@offsetOf(C, field.name), @offsetOf(Zig, field.name));
-        try std.testing.expectEqual(@sizeOf(@FieldType(C, field.name)), @sizeOf(field.type));
+    const info = @typeInfo(Zig).@"struct";
+    inline for (info.field_names, info.field_types) |field_name, field_type| {
+        try std.testing.expectEqual(@offsetOf(C, field_name), @offsetOf(Zig, field_name));
+        try std.testing.expectEqual(@sizeOf(@FieldType(C, field_name)), @sizeOf(field_type));
     }
 }
 
 test "embedded offscreen platform follows the build option and C ABI" {
-    const c = @import("ghostty.h");
+    const c = @import("ghostty-h");
     try std.testing.expectEqual(
         @as(c_int, @intFromEnum(PlatformTag.offscreen)),
         @as(c_int, c.GHOSTTY_PLATFORM_OFFSCREEN),
@@ -997,11 +998,6 @@ const SurfaceActionLifetime = struct {
 };
 
 test "embedded surface teardown completes before a retained action returns" {
-    if (comptime !@hasDecl(Surface, "deinitWith")) {
-        try std.testing.expect(false);
-        return;
-    }
-
     const Callbacks = struct {
         fn wakeup(_: ?*anyopaque) callconv(.c) void {}
 
@@ -1285,8 +1281,8 @@ pub const Surface = struct {
                 const value = std.mem.sliceTo(env_var.value, 0);
                 try config.env.map.put(
                     alloc,
-                    try alloc.dupeZ(u8, key),
-                    try alloc.dupeZ(u8, value),
+                    try alloc.dupeSentinel(u8, key, 0),
+                    try alloc.dupeSentinel(u8, value, 0),
                 );
             }
         }
@@ -1353,7 +1349,7 @@ pub const Surface = struct {
         }
         const direct = try alloc.alloc([:0]const u8, argv.len);
         for (argv, direct) |c_arg, *arg| {
-            arg.* = try alloc.dupeZ(u8, std.mem.sliceTo(c_arg, 0));
+            arg.* = try alloc.dupeSentinel(u8, std.mem.sliceTo(c_arg, 0), 0);
         }
         return .{ .direct = direct };
     }
@@ -1384,7 +1380,7 @@ pub const Surface = struct {
         // The expanded OpenGL presenter is the largest Platform.C union member.
         // Keep the public Zig options layout in lockstep with the C header.
         try std.testing.expectEqual(@as(usize, 168), @sizeOf(Options));
-        const c = @import("ghostty.h");
+        const c = @import("ghostty-h");
         try std.testing.expectEqual(
             @sizeOf(c.ghostty_surface_config_s),
             @sizeOf(Options),
@@ -1713,7 +1709,7 @@ pub const Surface = struct {
 
         const result = self.app.opts.read_clipboard(
             self.userdata,
-            @intCast(@intFromEnum(clipboard_type)),
+            @intCast(@backingInt(clipboard_type)),
             state_ptr,
             mimes.ptr,
             mimes.len,
@@ -1744,8 +1740,9 @@ pub const Surface = struct {
             error.UnauthorizedPaste => {
                 // Convert the would-be contents so the permission
                 // prompt can display exactly what would be written.
-                var stack = std.heap.stackFallback(1024, alloc);
-                const conv_alloc = stack.get();
+                var stack_buf: [1024]u8 = undefined;
+                var stack: std.heap.BufferFirstAllocator = .init(&stack_buf, alloc);
+                const conv_alloc = stack.allocator();
                 const contents = conv_alloc.alloc(
                     CAPI.ClipboardContent,
                     kitty.contents.len,
@@ -1796,8 +1793,9 @@ pub const Surface = struct {
 
         // Convert the C representations to the core types. Everything
         // remains borrowed from the caller for the duration of the call.
-        var stack = std.heap.stackFallback(1024, alloc);
-        const conv_alloc = stack.get();
+        var stack_buf: [1024]u8 = undefined;
+        var stack: std.heap.BufferFirstAllocator = .init(&stack_buf, alloc);
+        const conv_alloc = stack.allocator();
 
         const raw_contents: []const CAPI.ClipboardContent =
             if (complete.contents) |v| v[0..complete.contents_len] else &.{};
@@ -1903,7 +1901,7 @@ pub const Surface = struct {
 
         self.app.opts.write_clipboard(
             self.userdata,
-            @intCast(@intFromEnum(clipboard_type)),
+            @intCast(@backingInt(clipboard_type)),
             array.ptr,
             array.len,
             confirm,
@@ -2198,7 +2196,7 @@ pub const Surface = struct {
             if (!apprt.surface.shouldInheritWorkingDirectory(context, &self.app.config)) break :wd null;
             const cwd = self.core_surface.pwd(self.app.core_app.alloc) catch null orelse break :wd null;
             defer self.app.core_app.alloc.free(cwd);
-            break :wd self.app.core_app.alloc.dupeZ(u8, cwd) catch null;
+            break :wd self.app.core_app.alloc.dupeSentinel(u8, cwd, 0) catch null;
         };
 
         return .{
@@ -2258,21 +2256,7 @@ pub const Surface = struct {
 };
 
 test "surface action lifetime defers owner destruction until lease release" {
-    const Lifetime = if (@hasDecl(@This(), "SurfaceActionLifetime"))
-        @field(@This(), "SurfaceActionLifetime")
-    else
-        struct {
-            fn retain(_: *@This()) void {}
-            fn waitForActionsBeforeTeardown(_: *@This()) void {}
-            fn releaseOwner(_: *@This()) bool {
-                return false;
-            }
-            fn releaseAction(_: *@This()) bool {
-                return false;
-            }
-        };
-
-    var lifetime: Lifetime = .{};
+    var lifetime: SurfaceActionLifetime = .{};
     lifetime.retain();
     lifetime.waitForActionsBeforeTeardown();
     try std.testing.expect(!lifetime.releaseOwner());
@@ -2280,88 +2264,79 @@ test "surface action lifetime defers owner destruction until lease release" {
 }
 
 test "surface teardown waits for a cross-thread action lease" {
-    const Lifetime = if (@hasDecl(@This(), "SurfaceActionLifetime"))
-        @field(@This(), "SurfaceActionLifetime")
-    else
-        struct {};
+    const Lifetime = SurfaceActionLifetime;
 
-    if (comptime @hasDecl(Lifetime, "waitForActionsBeforeTeardown") and
-        @hasDecl(Lifetime, "releaseAction"))
-    {
-        const Context = struct {
-            lifetime: *Lifetime,
-            action_ready: std.Io.Event = .unset,
-            allow_action_return: std.Io.Event = .unset,
-            action_finished: std.Io.Event = .unset,
-            release_action_reached: std.Io.Event = .unset,
-            allow_release_completion: std.Io.Event = .unset,
-            teardown_started: std.Io.Event = .unset,
-            teardown_finished: std.Io.Event = .unset,
-            action_released_final: std.atomic.Value(bool) = .{ .raw = true },
+    const Context = struct {
+        lifetime: *Lifetime,
+        action_ready: std.Io.Event = .unset,
+        allow_action_return: std.Io.Event = .unset,
+        action_finished: std.Io.Event = .unset,
+        release_action_reached: std.Io.Event = .unset,
+        allow_release_completion: std.Io.Event = .unset,
+        teardown_started: std.Io.Event = .unset,
+        teardown_finished: std.Io.Event = .unset,
+        action_released_final: std.atomic.Value(bool) = .{ .raw = true },
 
-            fn runAction(self: *@This()) void {
-                self.lifetime.retain();
-                self.action_ready.set(global.io());
-                self.allow_action_return.waitUncancelable(global.io());
-                self.action_released_final.store(
-                    self.lifetime.releaseAction(),
-                    .release,
-                );
-                self.action_finished.set(global.io());
-            }
+        fn runAction(self: *@This()) void {
+            self.lifetime.retain();
+            self.action_ready.set(global.io());
+            self.allow_action_return.waitUncancelable(global.io());
+            self.action_released_final.store(
+                self.lifetime.releaseAction(),
+                .release,
+            );
+            self.action_finished.set(global.io());
+        }
 
-            fn runTeardown(self: *@This()) void {
-                self.action_ready.waitUncancelable(global.io());
-                self.teardown_started.set(global.io());
-                self.lifetime.waitForActionsBeforeTeardown();
-                self.teardown_finished.set(global.io());
-            }
-        };
+        fn runTeardown(self: *@This()) void {
+            self.action_ready.waitUncancelable(global.io());
+            self.teardown_started.set(global.io());
+            self.lifetime.waitForActionsBeforeTeardown();
+            self.teardown_finished.set(global.io());
+        }
+    };
 
-        var lifetime: Lifetime = .{};
-        var context: Context = .{ .lifetime = &lifetime };
-        lifetime.release_pause_for_testing = .{
-            .reached = &context.release_action_reached,
-            .continue_release = &context.allow_release_completion,
-        };
-        const action_thread = try std.Thread.spawn(.{}, Context.runAction, .{&context});
-        defer action_thread.join();
-        const teardown_thread = try std.Thread.spawn(.{}, Context.runTeardown, .{&context});
-        defer teardown_thread.join();
-        defer context.allow_action_return.set(global.io());
-        defer context.allow_release_completion.set(global.io());
+    var lifetime: Lifetime = .{};
+    var context: Context = .{ .lifetime = &lifetime };
+    lifetime.release_pause_for_testing = .{
+        .reached = &context.release_action_reached,
+        .continue_release = &context.allow_release_completion,
+    };
+    const action_thread = try std.Thread.spawn(.{}, Context.runAction, .{&context});
+    defer action_thread.join();
+    const teardown_thread = try std.Thread.spawn(.{}, Context.runTeardown, .{&context});
+    defer teardown_thread.join();
+    defer context.allow_action_return.set(global.io());
+    defer context.allow_release_completion.set(global.io());
 
-        context.teardown_started.waitUncancelable(global.io());
-        try std.testing.expectError(
-            error.Timeout,
-            context.teardown_finished.waitTimeout(global.io(), .{ .duration = .{
-                .clock = .awake,
-                .raw = .fromMilliseconds(20),
-            } }),
-        );
+    context.teardown_started.waitUncancelable(global.io());
+    try std.testing.expectError(
+        error.Timeout,
+        context.teardown_finished.waitTimeout(global.io(), .{ .duration = .{
+            .clock = .awake,
+            .raw = .fromMilliseconds(20),
+        } }),
+    );
 
-        context.allow_action_return.set(global.io());
-        context.release_action_reached.waitUncancelable(global.io());
-        try std.testing.expectError(
-            error.Timeout,
-            context.teardown_finished.waitTimeout(global.io(), .{ .duration = .{
-                .clock = .awake,
-                .raw = .fromMilliseconds(100),
-            } }),
-        );
-        context.allow_release_completion.set(global.io());
-        context.teardown_finished.waitUncancelable(global.io());
-        context.action_finished.waitUncancelable(global.io());
-        try std.testing.expect(
-            !context.action_released_final.load(.acquire),
-        );
-        try std.testing.expectEqual(
-            @as(usize, 1),
-            lifetime.countForTesting(),
-        );
-    } else {
-        try std.testing.expect(false);
-    }
+    context.allow_action_return.set(global.io());
+    context.release_action_reached.waitUncancelable(global.io());
+    try std.testing.expectError(
+        error.Timeout,
+        context.teardown_finished.waitTimeout(global.io(), .{ .duration = .{
+            .clock = .awake,
+            .raw = .fromMilliseconds(100),
+        } }),
+    );
+    context.allow_release_completion.set(global.io());
+    context.teardown_finished.waitUncancelable(global.io());
+    context.action_finished.waitUncancelable(global.io());
+    try std.testing.expect(
+        !context.action_released_final.load(.acquire),
+    );
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        lifetime.countForTesting(),
+    );
 }
 
 // The cmux integration combines the OpenGL platform payload (the largest
@@ -3792,7 +3767,7 @@ pub const CAPI = struct {
             log.warn("error formatting bounded screen tail err={}", .{err});
             return false;
         };
-        const owned = global.alloc().dupeZ(u8, formatted) catch |err| {
+        const owned = global.alloc().dupeSentinel(u8, formatted, 0) catch |err| {
             log.warn("error allocating bounded screen tail result err={}", .{err});
             return false;
         };
@@ -3900,7 +3875,7 @@ pub const CAPI = struct {
             log.warn("error formatting clipboard text err={}", .{err});
             return false;
         };
-        const formatted = global.alloc().dupeZ(u8, writer.buffered()) catch |err| {
+        const formatted = global.alloc().dupeSentinel(u8, writer.buffered(), 0) catch |err| {
             log.warn("error allocating clipboard text err={}", .{err});
             return false;
         };
@@ -4426,7 +4401,7 @@ pub const CAPI = struct {
     }
 
     fn renderGridColorSemantics(color: terminal.Style.Color) RenderGridColorSemantics {
-        return switch (color) {
+        return switch (color.value()) {
             .none => .{ .source = .default_color },
             .palette => |index| .{ .source = .palette, .palette_index = index },
             .rgb => .{ .source = .rgb },
@@ -4647,8 +4622,8 @@ pub const CAPI = struct {
             // Capture every non-default-handled DEC/ANSI mode so the client can
             // restore mouse tracking, bracketed paste, application keys, origin,
             // autowrap, etc. exactly.
-            inline for (@typeInfo(terminal.modes.Mode).@"enum".fields) |field| {
-                const mode: terminal.modes.Mode = @enumFromInt(field.value);
+            inline for (@typeInfo(terminal.modes.Mode).@"enum".field_values) |field_value| {
+                const mode: terminal.modes.Mode = @enumFromInt(field_value);
                 const tag = terminal.modes.ModeTag.fromMode(mode);
                 if (!renderGridModeIsExcluded(tag.value, tag.ansi)) {
                     try modes_out.append(alloc, .{
@@ -5524,7 +5499,7 @@ pub const CAPI = struct {
     /// freed by the caller via ghostty_string_free.
     export fn ghostty_surface_tty_name(surface: *Surface) String {
         const tty_name = surface.core_surface.getProcessInfo(.tty_name) orelse return .empty;
-        const copy = surface.app.core_app.alloc.dupeZ(u8, tty_name) catch |err| {
+        const copy = surface.app.core_app.alloc.dupeSentinel(u8, tty_name, 0) catch |err| {
             log.err("error allocating tty name err={}", .{err});
             return .empty;
         };
@@ -5672,13 +5647,15 @@ pub const CAPI = struct {
     }
 
     /// Set the preedit text for the surface. This is used for IME
-    /// composition. If the length is 0, then the preedit text is cleared.
+    /// composition. If the pointer is null or the length is 0, then the
+    /// preedit text is cleared.
     export fn ghostty_surface_preedit(
         surface: *Surface,
-        ptr: [*]const u8,
+        ptr: ?[*]const u8,
         len: usize,
     ) void {
-        surface.preeditCallback(if (len == 0) null else ptr[0..len]);
+        const text = ptr orelse return surface.preeditCallback(null);
+        surface.preeditCallback(if (len == 0) null else text[0..len]);
     }
 
     /// Process output bytes as if they were read from the PTY.
@@ -6469,11 +6446,11 @@ test "render grid preserves terminal color semantics" {
     try std.testing.expectEqual(CAPI.RenderGridColorSource.default_color, default_color.source);
     try std.testing.expectEqual(@as(?u8, null), default_color.palette_index);
 
-    const palette = CAPI.renderGridColorSemantics(.{ .palette = 42 });
+    const palette = CAPI.renderGridColorSemantics(.palette(42));
     try std.testing.expectEqual(CAPI.RenderGridColorSource.palette, palette.source);
     try std.testing.expectEqual(@as(?u8, 42), palette.palette_index);
 
-    const rgb = CAPI.renderGridColorSemantics(.{ .rgb = .{ .r = 1, .g = 2, .b = 3 } });
+    const rgb = CAPI.renderGridColorSemantics(.rgb(.{ .r = 1, .g = 2, .b = 3 }));
     try std.testing.expectEqual(CAPI.RenderGridColorSource.rgb, rgb.source);
     try std.testing.expectEqual(@as(?u8, null), rgb.palette_index);
 }

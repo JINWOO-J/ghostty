@@ -26,7 +26,7 @@ pub fn capture(self: *EnvironSnapshots, source: Environ) Allocator.Error!Environ
     const allocator = self.arena.allocator();
     const entries = try allocator.allocSentinel(?[*:0]const u8, source.block.slice.len, null);
     for (source.block.slice, 0..) |entry, i| {
-        entries[i] = try allocator.dupeZ(u8, std.mem.span(entry.?));
+        entries[i] = try allocator.dupeSentinel(u8, std.mem.span(entry.?), 0);
     }
     return .{ .block = .{ .slice = entries } };
 }
@@ -76,7 +76,7 @@ test "allocation failure preserves existing environment snapshots" {
             defer snapshots.deinit();
             const original = [_:null]?[*:0]const u8{"NAME=before"};
             const first = try snapshots.capture(.{ .block = .{ .slice = &original } });
-            const replacement = [_:null]?[*:0]const u8{ "NAME=after", "LARGE=" ++ "x" ** 4096 };
+            const replacement = [_:null]?[*:0]const u8{ "NAME=after", "LARGE=" ++ &@as([4096:0]u8, @splat('x')) };
             _ = snapshots.capture(.{ .block = .{ .slice = &replacement } }) catch |err| {
                 try std.testing.expectEqualStrings("before", first.getPosix("NAME").?);
                 return err;

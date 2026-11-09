@@ -170,22 +170,7 @@ test "OpenGL acknowledges only after successful present and GPU completion" {
             target: *MockTarget,
             presentation: ?FramePresentation,
         ) ?FramePresentation {
-            if (@hasDecl(Self, "completeFrame")) {
-                return Self.completeFrame(renderer, target, 1, presentation);
-            }
-
-            // Exercise the pre-fix production order. Once completeFrame is
-            // introduced, the branch above exercises that implementation.
-            renderer.api.finishFrame();
-            const health = renderer.api.frameHealth();
-            if (health == .healthy) {
-                renderer.api.present(target.*) catch {
-                    renderer.frameCompleted(target, .unhealthy, 1, false);
-                    return null;
-                };
-            }
-            renderer.frameCompleted(target, health, 1, false);
-            return if (health == .healthy) presentation else null;
+            return Self.completeFrame(renderer, target, 1, presentation);
         }
     };
 

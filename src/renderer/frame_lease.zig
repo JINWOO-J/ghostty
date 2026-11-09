@@ -44,7 +44,7 @@ pub fn Pool(comptime slot_count: usize) type {
         io: std.Io = std.Io.failing,
         mutex: std.Io.Mutex = .init,
         available: std.Io.Semaphore = .{ .permits = slot_count },
-        slots: [slot_count]Slot = [_]Slot{.{}} ** slot_count,
+        slots: [slot_count]Slot = @splat(.{}),
         next_token: Token = 0,
         /// Start each search after the last acquired slot so a serial producer
         /// still rotates IOSurfaces and forces Core Animation to recomposite.

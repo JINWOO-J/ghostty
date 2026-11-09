@@ -35,11 +35,10 @@ pub fn create(b: *std.Build, opts: Options) *LibtoolStep {
     // (warning only), which drops libghostty_zcu.o and erases all
     // ghostty_surface_* symbols from the combined archive. llvm-libtool-darwin
     // includes misaligned members, preserving the full symbol set. Fall back
-    // to plain libtool when llvm-libtool-darwin isn't available.
-    const libtool_exe = b.findProgram(
-        &.{"llvm-libtool-darwin"},
-        &.{"/opt/homebrew/opt/llvm/bin"},
-    ) catch "libtool";
+    // to plain libtool when llvm-libtool-darwin isn't on PATH.
+    const libtool_exe = b.findProgram(.{
+        .names = &.{"llvm-libtool-darwin"},
+    }) orelse "libtool";
     run_step.addArg(libtool_exe);
     run_step.addArgs(&.{ "-static", "-o" });
     const output = run_step.addOutputFileArg(opts.out_name);

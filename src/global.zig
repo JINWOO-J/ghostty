@@ -155,7 +155,7 @@ pub fn init(opts: InitOpts) !void {
         },
         .args = switch (opts) {
             .main, .tool => |m| m.args,
-            .c => |c| .{ .vector = if (comptime builtin.os.tag == .windows)
+            .c => |c| .{ .vector = if (comptime builtin.target.os.tag == .windows)
                 owned_c_args.?
             else
                 c.argv[0..c.argc] },
@@ -176,7 +176,7 @@ pub fn init(opts: InitOpts) !void {
         // can get easy memory leak detection in debug modes.
         if (builtin.link_libc) {
             if (switch (builtin.mode) {
-                .ReleaseSafe, .ReleaseFast => true,
+                .safe, .fast => true,
 
                 // We also use it if we can detect we're running under
                 // Valgrind since Valgrind only instruments the C allocator
@@ -184,7 +184,7 @@ pub fn init(opts: InitOpts) !void {
             }) break :gpa null;
         }
 
-        break :gpa .init;
+        break :gpa .init(std.heap.page_allocator, .{});
     };
 
     self.alloc = if (self.gpa) |*value|
@@ -402,7 +402,7 @@ pub fn environMap() !std.process.Environ.Map {
 /// After initialization, pass explicit environment maps to child processes and
 /// surfaces instead of mutating the process environment or refreshing globally.
 pub fn syncEnviron() std.mem.Allocator.Error!void {
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .windows => {},
         else => {
             assert(builtin.link_libc);
@@ -473,7 +473,7 @@ pub fn action() ?cli.ghostty.Action {
 /// be one of these at any given moment. This is extracted into a dedicated
 /// struct because it is reused by main and the static C lib.
 pub const GlobalState = struct {
-    const GPA = std.heap.DebugAllocator(.{});
+    const GPA = std.heap.SafeAllocator;
 
     io_impl: std.Io.Threaded,
     environ_snapshots: EnvironSnapshots,
@@ -498,7 +498,7 @@ pub const GlobalState = struct {
         stderr: bool = build_config.app_runtime != .none,
         /// Whether to log to macOS's unified logging. Enabled by default
         /// on macOS.
-        macos: bool = builtin.os.tag.isDarwin(),
+        macos: bool = builtin.target.os.tag.isDarwin(),
     };
 
     /// Asserts that `self.io_impl` has been initialized.
@@ -508,7 +508,7 @@ pub const GlobalState = struct {
 
     fn initSignals() void {
         // Only posix systems.
-        if (comptime builtin.os.tag == .windows) return;
+        if (comptime builtin.target.os.tag == .windows) return;
 
         const p = std.posix;
 

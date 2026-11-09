@@ -22,7 +22,7 @@ pub fn Prepared(comptime Cell: type) type {
     return struct {
         target: Cell,
         candidates: [candidate_key_count][]const Candidate(Cell) =
-            [_][]const Candidate(Cell){&.{}} ** candidate_key_count,
+            @splat(&.{}),
     };
 }
 
@@ -48,7 +48,7 @@ const CandidateKey = enum(u3) {
     bounded_logical_hard_delimited,
 };
 
-const candidate_key_count = @typeInfo(CandidateKey).@"enum".fields.len;
+const candidate_key_count = @typeInfo(CandidateKey).@"enum".field_names.len;
 
 fn candidateKey(link: anytype) CandidateKey {
     return switch (link.candidate_scope) {
@@ -137,7 +137,7 @@ pub fn prepareAt(
         target.left(1)
     else
         target;
-    var needed = [_]bool{false} ** candidate_key_count;
+    var needed: [candidate_key_count]bool = @splat(false);
 
     for (links) |link| {
         if (!matcherActive(link, mouse_mods)) continue;
@@ -153,8 +153,7 @@ pub fn prepareAt(
     // identical for click, hover, and whole-viewport rendering. For example,
     // a semantic matcher in the BAR half of FOOBAR must still suppress a
     // lower-priority logical FOOBAR match when the pointer is over FOO.
-    var builders = [_]std.ArrayList(Candidate(terminal.Pin)){.empty} **
-        candidate_key_count;
+    var builders: [candidate_key_count]std.ArrayList(Candidate(terminal.Pin)) = @splat(.empty);
     defer for (&builders) |*builder| builder.deinit(alloc);
     var covered: CandidateCoverage = .{};
     defer covered.deinit(alloc);
@@ -212,7 +211,7 @@ fn identityPin(
 pub fn VisibleCandidates(comptime Cell: type) type {
     return struct {
         candidates: [candidate_key_count][]const Candidate(Cell) =
-            [_][]const Candidate(Cell){&.{}} ** candidate_key_count,
+            @splat(&.{}),
 
         pub fn deinit(self: *@This(), alloc: Allocator) void {
             for (self.candidates) |candidates| {
@@ -643,7 +642,7 @@ pub fn prepareVisibleAlways(
     mapper_context: anytype,
     mapper: anytype,
 ) !VisibleCandidates(Cell) {
-    var needed = [_]bool{false} ** candidate_key_count;
+    var needed: [candidate_key_count]bool = @splat(false);
     for (links) |link| {
         if (!alwaysMatcherActive(link, mouse_mods)) continue;
         needed[@intFromEnum(candidateKey(link))] = true;
@@ -659,7 +658,7 @@ pub fn prepareVisibleAlways(
         }
     }
 
-    var builders = [_]std.ArrayList(Candidate(Cell)){.empty} ** candidate_key_count;
+    var builders: [candidate_key_count]std.ArrayList(Candidate(Cell)) = @splat(.empty);
     defer for (&builders) |*builder| builder.deinit(alloc);
     errdefer for (&builders) |*builder| {
         for (builder.items) |candidate| {
@@ -2140,7 +2139,7 @@ test "resolvers discard partial results when the search budget is exhausted" {
         .target = len - 1,
         .candidates = candidate: {
             var candidates: [candidate_key_count][]const Candidate(usize) =
-                [_][]const Candidate(usize){&.{}} ** candidate_key_count;
+                @splat(&.{});
             candidates[@intFromEnum(CandidateKey.semantic)] = &.{.{
                 .string = string,
                 .mapped_len = map.len,

@@ -1339,7 +1339,7 @@ fn threadMain_(self: *Thread) !void {
     // Right now, on Darwin, `std.Thread.setName` can only name the current
     // thread, and we have no way to get the current thread from within it,
     // so instead we use this code to name the thread instead.
-    if (builtin.os.tag.isDarwin()) {
+    if (builtin.target.os.tag.isDarwin()) {
         internal_os.macos.pthread_setname_np(&"renderer".*);
     }
 
@@ -1479,11 +1479,11 @@ fn drainMailbox(self: *Thread) !MailboxDrainResult {
     //
     // This is effectively an @autoreleasepool{} block, which we need in
     // order to ensure that autoreleased objects are properly released.
-    const pool = if (builtin.os.tag.isDarwin())
+    const pool = if (builtin.target.os.tag.isDarwin())
         @import("objc").AutoreleasePool.init()
     else
         void;
-    defer if (builtin.os.tag.isDarwin()) pool.deinit();
+    defer if (builtin.target.os.tag.isDarwin()) pool.deinit();
 
     const external_drain = self.externalDrainActive();
     var visibility = VisibilityDrainState.init(self.flags.visible);
@@ -2658,23 +2658,11 @@ test "synchronous presentation is delivered after thread draw cleanup" {
             instrumentation: *const MockInstrumentation,
             presentation: rendererpkg.FramePresentation,
         ) void {
-            if (@hasDecl(Thread, "finishRenderNowWithPresentation")) {
-                return Thread.finishRenderNowWithPresentation(
-                    renderer,
-                    instrumentation,
-                    presentation,
-                );
-            }
-
-            // Exercise the pre-fix ownership order. The generic renderer
-            // delivered before returning, then Thread ran its end defer.
-            instrumentation.emit(.draw_frame_begin);
-            const completed = renderer.drawFrameWithPresentation(
-                true,
+            return Thread.finishRenderNowWithPresentation(
+                renderer,
+                instrumentation,
                 presentation,
-            ) catch unreachable;
-            if (completed) |value| value.deliver();
-            instrumentation.emit(.draw_frame_end);
+            );
         }
     };
 

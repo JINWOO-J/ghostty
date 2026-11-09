@@ -23,7 +23,7 @@ pub const Frame = extern struct {
 test "external Metal frame C ABI" {
     const std = @import("std");
     const lib = @import("../lib/main.zig");
-    const c = @import("ghostty.h");
+    const c = @import("ghostty-h");
 
     try lib.checkGhosttyHEnum(
         Disposition,

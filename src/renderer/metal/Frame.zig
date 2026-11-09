@@ -349,7 +349,7 @@ test "tokened completion freezes target before recycling slot" {
             self.state.append(.deinit, self.id);
         }
 
-        fn releasePresentationOwnership(self: *@This()) void {
+        pub fn releasePresentationOwnership(self: *@This()) void {
             self.state.append(.release_presentation_ownership, self.id);
         }
     };
