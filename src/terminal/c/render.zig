@@ -2047,11 +2047,8 @@ test "render: OSC dynamic color resets follow later C API defaults" {
     try testing.expectEqual(Result.success, terminal_c.new(
         &lib.alloc.test_allocator,
         &terminal,
-        .{
-            .cols = 80,
-            .rows = 24,
-            .max_scrollback = 10_000,
-        },
+        80,
+        24,
     ));
     defer terminal_c.free(terminal);
 

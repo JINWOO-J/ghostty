@@ -21,7 +21,6 @@ pub const Backend = @import("renderer/backend.zig").Backend;
 pub const GenericRenderer = @import("renderer/generic.zig").Renderer;
 pub const Metal = @import("renderer/Metal.zig");
 pub const OpenGL = @import("renderer/OpenGL.zig");
-pub const WebGL = @import("renderer/WebGL.zig");
 pub const Options = @import("renderer/Options.zig");
 pub const Overlay = @import("renderer/Overlay.zig");
 pub const Thread = @import("renderer/Thread.zig");
@@ -207,10 +206,11 @@ test "metal frame resources expose destructive disposal" {
 
 /// The implementation to use for the renderer. This is comptime chosen
 /// so that every build has exactly one renderer implementation.
-pub const Renderer = switch (build_config.renderer) {
-    .metal => GenericRenderer(Metal),
-    .opengl => GenericRenderer(OpenGL),
-    .webgl => WebGL,
+pub const Renderer = GenericRenderer(GraphicsAPI);
+
+const GraphicsAPI = switch (build_config.renderer) {
+    .metal => Metal,
+    .opengl => OpenGL,
 };
 
 /// The health status of a renderer. These must be shared across all

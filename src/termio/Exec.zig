@@ -613,14 +613,15 @@ pub const Config = struct {
     rt_post_fork_info: Command.RtPostForkInfo,
 };
 
+// cmux: TIOCSCTTY needs sys/ioctl.h, which posix_c does not include and
+// MinGW does not have.
+const ioctl_c = if (builtin.os.tag != .windows)
+    @cImport(@cInclude("sys/ioctl.h"))
+else
+    struct {};
+
 const Subprocess = struct {
-    const c = @cImport({
-        @cInclude("errno.h");
-        @cInclude("signal.h");
-        // MinGW has no sys/ioctl.h; the ioctl users are POSIX-only.
-        if (builtin.os.tag != .windows) @cInclude("sys/ioctl.h");
-        @cInclude("unistd.h");
-    });
+    const c = @import("posix_c");
 
     arena: std.heap.ArenaAllocator,
     cwd: ?[:0]const u8,
@@ -688,7 +689,7 @@ const Subprocess = struct {
 
             // Assume that the resources directory is adjacent to the terminfo
             // database
-            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
             const dir = try std.fmt.bufPrint(&buf, "{s}/terminfo", .{
                 std.fs.path.dirname(base) orelse unreachable,
             });
@@ -716,7 +717,7 @@ const Subprocess = struct {
                 break :ghostty_path;
             }
 
-            var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+            var exe_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
             const exe_bin_path = exe_buf[0 .. std.process.executablePath(
                 global.io(),
                 &exe_buf,
@@ -732,7 +733,7 @@ const Subprocess = struct {
         if (comptime builtin.target.os.tag.isDarwin()) darwin: {
             const resources_dir = cfg.resources_dir orelse break :darwin;
 
-            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
 
             const xdg_data_dir_key = "XDG_DATA_DIRS";
             if (std.fmt.bufPrint(&buf, "{s}/..", .{resources_dir})) |data_dir| {
@@ -3017,7 +3018,7 @@ test "subprocess stop kills a distinct foreground process group" {
         _ = posix.system.close(pty.master);
         _ = posix.system.close(ready_pipe[0]);
         if (c.setsid() < 0) c._exit(1);
-        if (c.ioctl(pty.slave, c.TIOCSCTTY, @as(c_ulong, 0)) < 0) c._exit(1);
+        if (ioctl_c.ioctl(pty.slave, ioctl_c.TIOCSCTTY, @as(c_ulong, 0)) < 0) c._exit(1);
 
         const job_pid = posix.system.fork();
         switch (posix.errno(job_pid)) {
@@ -3134,7 +3135,7 @@ test "subprocess stop never signals the caller's own process group" {
     };
     if (child_pid == 0) {
         if (c.setsid() < 0) c._exit(10);
-        if (c.ioctl(pty.slave, c.TIOCSCTTY, @as(c_ulong, 0)) < 0) c._exit(12);
+        if (ioctl_c.ioctl(pty.slave, ioctl_c.TIOCSCTTY, @as(c_ulong, 0)) < 0) c._exit(12);
         const own_pgid = c.getpgrp();
         const foreground = pty.getProcessInfo(.foreground_pid) orelse c._exit(13);
         if (foreground != @as(u64, @intCast(own_pgid))) c._exit(14);

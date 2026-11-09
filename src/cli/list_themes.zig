@@ -886,7 +886,11 @@ const Preview = struct {
                             self.mode = .help;
                         if (key.matches('/', .{}))
                             self.mode = .search;
-                        if (key.matchesAny(&.{ vaxis.Key.enter, vaxis.Key.kp_enter }, .{})) {
+                        // The save screen shows the selected theme, so there
+                        // must be one to select.
+                        if (key.matchesAny(&.{ vaxis.Key.enter, vaxis.Key.kp_enter }, .{}) and
+                            self.filtered.items.len > 0)
+                        {
                             if (self.cmux != null) {
                                 try self.applyCmuxSelectionForCurrentTheme();
                                 self.outcome = .apply;
@@ -905,7 +909,7 @@ const Preview = struct {
                             try self.applyCmuxSelectionForCurrentTheme();
                         }
                         if (key.matchesAny(&.{ vaxis.Key.end, vaxis.Key.kp_end, 'G' }, .{})) {
-                            self.current = self.filtered.items.len - 1;
+                            self.current = self.filtered.items.len -| 1;
                             try self.applyCmuxSelectionForCurrentTheme();
                         }
                         if (key.matches('n', .{ .ctrl = true }) or
@@ -1302,7 +1306,7 @@ const Preview = struct {
                     .{ .keys = "PgUp", .help = "Move up 20 themes." },
                     .{ .keys = "^N, j, ↓", .help = "Move down 1 theme." },
                     .{ .keys = "ScrollDown", .help = "Move down 1 theme." },
-                    .{ .keys = "PgDown", .help = "Move down 20 themes." },
+                    .{ .keys = "PgDown, ^D", .help = "Move down 20 themes." },
                     .{ .keys = "h, x", .help = "Show palette numbers in hexadecimal." },
                     .{ .keys = "d", .help = "Show palette numbers in decimal." },
                     .{ .keys = "c", .help = "Copy theme name to the clipboard." },

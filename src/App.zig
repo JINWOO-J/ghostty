@@ -431,7 +431,6 @@ fn drainMailbox(self: *App, rt_app: *apprt.App) !void {
         if (comptime std.log.logEnabled(.debug, .app)) {
             switch (message) {
                 // these tend to be way too verbose for normal debugging
-                .redraw_surface => {},
                 else => log.debug("mailbox message={t}", .{message}),
             }
         }

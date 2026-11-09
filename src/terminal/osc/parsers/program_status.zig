@@ -16,9 +16,11 @@
 //! In libghostty-vt, that is the `program_status` effect of
 //! `stream_terminal.Handler`.
 //!
-//! A program checks whether the terminal supports the protocol by sending
-//! `?` as the body. A terminal that supports it replies with the same
-//! sequence. See `Command.query`.
+//! A program can check whether the terminal supports the protocol by
+//! sending `?` as the body. A terminal that supports it replies with `?`
+//! and may list the states and kinds it accepts. See `Command.query` and
+//! `query_reply`. Checking is optional, so a program may also send
+//! reports without asking first.
 //!
 //! Example:
 //!
@@ -81,6 +83,43 @@ pub const max_id_bytes = 128;
 pub const max_id_segment_bytes = 32;
 pub const max_id_depth = 8;
 
+/// The body of the reply to a support query.
+///
+/// A program asks whether the terminal supports the protocol by sending
+/// `?` as the body. A terminal that does answers with another OSC 7501
+/// whose body is this value, ended with the same terminator the query
+/// used:
+///
+/// ```
+/// program:  ESC ] 7501 ; ? ESC \
+/// terminal: ESC ] 7501 ; ?:states=idle,working,done,blocked,error:kinds=permission,question,auth ESC \
+/// ```
+///
+/// The specification only requires the `?`. The rest lists the states
+/// and kinds this parser accepts. `clear` is left out because it isn't a
+/// state. A program that wants a state or kind from a later revision of
+/// the specification checks these lists and falls back to one that is
+/// present. The lists come from `State` and `Kind`, so adding a value to
+/// either updates the reply.
+pub const query_reply = "?:states=" ++
+    names(State, &.{.clear}) ++
+    ":kinds=" ++
+    names(Kind, &.{});
+
+/// The names of the values of `E`, comma separated, leaving out `skip`.
+fn names(comptime E: type, comptime skip: []const E) []const u8 {
+    comptime {
+        var result: []const u8 = "";
+        for (@typeInfo(E).@"enum".fields) |field| {
+            const value = @field(E, field.name);
+            if (std.mem.indexOfScalar(E, skip, value) != null) continue;
+            if (result.len > 0) result = result ++ ",";
+            result = result ++ field.name;
+        }
+        return result;
+    }
+}
+
 /// A parsed OSC 7501 sequence: either a support query or a report.
 pub const Command = union(enum) {
     pub const C = void;
@@ -90,10 +129,11 @@ pub const Command = union(enum) {
     pub const Option = program_status.Option;
 
     /// The program asked whether the terminal supports the protocol by
-    /// sending `OSC 7501 ; ? ST`. A terminal that supports it sends the
-    /// same sequence back, ended with this terminator so the program
-    /// recognizes it. A program that gets no reply assumes the protocol
-    /// is unsupported.
+    /// sending `OSC 7501 ; ? ST`. A terminal that supports it answers
+    /// with `query_reply`, ended with this terminator so the program
+    /// recognizes it. A program that gets no reply treats the protocol as
+    /// unsupported. Asking is optional, so reports may arrive without a
+    /// query first.
     query: Terminator,
 
     /// A valid status report for one record.
@@ -212,10 +252,14 @@ pub const Report = struct {
 /// - `kind`: what a blocked program needs from the user. Only read when
 ///   the state is `blocked`. An unknown kind reads as null.
 /// - `progress`: how far along the work is, from 0 to 100. Only read when
-///   the state is `working` or `blocked`. A value outside that range
-///   reads as null.
+///   the state is `working` or `blocked`. Null means indeterminate: the
+///   program is busy but has no percentage to report. A value outside
+///   that range reads as null too.
 /// - `app`: a stable name for the program that a machine can match on,
-///   such as `cargo` or `terraform`.
+///   such as `cargo`, `terraform`, or `claude-code`. It is a key for
+///   grouping, filtering, choosing an icon, and so on, not a label. The
+///   label is `title`. A record without `app` takes it from its nearest
+///   ancestor that has one.
 /// - `title`: a short label for the record, meant for people. Programs
 ///   that report several records use this to tell them apart.
 /// - `msg`: one line of text for people, saying what the record is
@@ -308,15 +352,6 @@ fn validate(data: []const u8) error{
         const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
         const key = std.mem.trim(u8, pair[0..eq], &std.ascii.whitespace);
         if (key.len > max_key_bytes) return error.TooLong;
-        const value = std.mem.trim(u8, pair[eq + 1 ..], &std.ascii.whitespace);
-        if (std.mem.eql(u8, key, "id")) try validateId(value);
-        inline for (.{
-            .{ "app", max_app_bytes },
-            .{ "title", max_title_encoded_bytes },
-            .{ "msg", max_msg_encoded_bytes },
-        }) |limit| {
-            if (std.mem.eql(u8, key, limit[0]) and value.len > limit[1]) return error.TooLong;
-        }
     }
 
     // Every value is checked against its limit, even one a later pair
@@ -333,12 +368,10 @@ fn validate(data: []const u8) error{
     }
 
     var buf: [max_msg_bytes]u8 = undefined;
-    var titles: kitty_metadata.ValueIterator("title", value_bytes) = .init(data);
-    while (titles.next()) |value| {
-        if ((try decodeText(value, &buf)).len > max_title_bytes) return error.TooLong;
+    if (lastValue("title", data)) |v| {
+        if ((try decodeText(v, &buf)).len > max_title_bytes) return error.TooLong;
     }
-    var messages: kitty_metadata.ValueIterator("msg", value_bytes) = .init(data);
-    while (messages.next()) |value| _ = try decodeText(value, &buf);
+    if (lastValue("msg", data)) |v| _ = try decodeText(v, &buf);
 
     // An unknown state discards the report rather than guessing, so a
     // state added in a later revision never turns into something else.
@@ -426,6 +459,18 @@ test "OSC 7501: query" {
     p.reset();
     p.nextSlice("7501;?");
     try testing.expectEqual(Terminator.bel, p.end(0x07).?.program_status.query);
+}
+
+test "OSC 7501: query reply lists every state and kind" {
+    const testing = std.testing;
+
+    // The specification fixes these lists for the states and kinds it
+    // defines. A new state or kind must be added to the specification
+    // before it can appear here.
+    try testing.expectEqualStrings(
+        "?:states=idle,working,done,blocked,error:kinds=permission,question,auth",
+        query_reply,
+    );
 }
 
 test "OSC 7501: minimal report" {

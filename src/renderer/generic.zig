@@ -38,8 +38,11 @@ const macos = switch (builtin.os.tag) {
     else => void,
 };
 
+/// The display link used to pace drawing to the display's refresh
+/// rate. Only macOS has one. Everywhere else this is void and the
+/// display link code paths compile away.
 const DisplayLink = switch (builtin.os.tag) {
-    .macos => *macos.video.DisplayLink,
+    .macos => @import("DisplayLink.zig"),
     else => void,
 };
 
@@ -316,7 +319,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// The CVDisplayLink used to drive the rendering loop in
         /// sync with the display. This is void on platforms that
         /// don't support a display link.
-        display_link: ?DisplayLink = null,
+        display_link: if (DisplayLink != void) ?*DisplayLink else void =
+            if (DisplayLink != void) null else {},
+
+        /// The display the embedder created the surface on. The display
+        /// link is bound to it when it is created lazily, until the
+        /// embedder reports another display with `setMacOSDisplayID`.
+        initial_display_id: u32 = 0,
 
         /// Health of the most recently completed frame.
         health: std.atomic.Value(Health) = .{ .raw = .healthy },
@@ -952,37 +961,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
             };
 
-            const display_link: ?DisplayLink = switch (builtin.os.tag) {
-                .macos => if (options.config.vsync) display_link: {
-                    // term-mesh fork: bind the display link to the display the
-                    // surface is created on when the embedder provides one;
-                    // fall back to the active-displays link on failure.
-                    if (options.macos_display_id != 0) {
-                        if (macos.video.DisplayLink.createWithCGDisplay(
-                            options.macos_display_id,
-                        )) |display_specific| {
-                            break :display_link display_specific;
-                        } else |err| {
-                            log.warn(
-                                "error creating display link for display id={} err={}, falling back to active displays",
-                                .{ options.macos_display_id, err },
-                            );
-                        }
-                    }
-                    break :display_link macos.video.DisplayLink.createWithActiveCGDisplays() catch |err| {
-                        log.warn(
-                            "error creating display link, falling back to non-vsync renderer loop err={}",
-                            .{err},
-                        );
-                        break :display_link null;
-                    };
-                } else null,
-                else => null,
-            };
-            errdefer if (display_link) |v| v.release();
-
             var result: Self = .{
                 .alloc = alloc,
+                .initial_display_id = if (comptime DisplayLink != void)
+                    options.macos_display_id
+                else
+                    0,
                 .config = options.config,
                 .surface_mailbox = options.surface_mailbox,
                 .grid_metrics = font_critical.metrics,
@@ -1094,12 +1078,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.api.finishFrameGeneration();
             }
 
-            if (DisplayLink != void) {
-                if (self.display_link) |display_link| {
-                    display_link.stop() catch {};
-                    display_link.release();
-                }
-            }
+            self.closeDisplayLink();
 
             self.cells.deinit(self.alloc);
 
@@ -1206,11 +1185,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // If we don't support a display link we have no work to do.
             if (comptime DisplayLink == void) return;
 
-            // Stop our display link. If this fails its okay it just means
-            // that we either never started it or the view its attached to
-            // is gone which is fine.
+            // Ask the display link to stop. The stop itself happens on
+            // the main thread shortly after. `deinit` later stops the
+            // link for certain before anything the display link callback
+            // references is freed.
             const display_link = self.display_link orelse return;
-            display_link.stop() catch {};
+            display_link.setRunning(false);
         }
 
         /// This is called by the GTK apprt after the surface is
@@ -1288,6 +1268,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 defer self.draw_mutex.unlock(global.io());
                 drained.dispose(true);
                 self.shaders.deinit(self.alloc);
+            }
+        }
+
+        /// Stop and release the display link. Surfaces are destroyed on
+        /// the main thread, where `close` stops the link before returning.
+        /// After this the display link callback is never invoked again, so
+        /// `renderer.Thread` can free the `draw_now` handle it points at.
+        /// `Surface.deinit` calls this directly when it skips the GPU
+        /// teardown in `deinit`. Calling it twice is safe.
+        pub fn closeDisplayLink(self: *Self) void {
+            if (comptime DisplayLink == void) return;
+            if (self.display_link) |display_link| {
+                display_link.close();
+                self.display_link = null;
             }
         }
 
@@ -1417,8 +1411,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.syncDisplayLink(null, null);
         }
 
-        /// Create or update the display link and match it to the current
-        /// surface state.
+        /// Create the display link if needed, then ask it to match the
+        /// current surface state. Must be called on the render thread.
+        /// This never blocks: the display link applies the requested state
+        /// on the main thread, because starting and stopping a CVDisplayLink
+        /// anywhere else can deadlock against CoreVideo's own display
+        /// reconfiguration handling. See `renderer/DisplayLink.zig`.
         fn syncDisplayLink(
             self: *Self,
             display_id: ?u32,
@@ -1429,43 +1427,35 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const display_link = self.display_link orelse display_link: {
                 if (!self.config.vsync) return;
                 const callback = draw_now orelse return;
-                const result = macos.video.DisplayLink.createWithActiveCGDisplays() catch |err| {
-                    // A locked macOS session can temporarily have no active
-                    // displays. Rendering can continue without vsync and a
-                    // later display update will retry this method.
-                    log.warn("error creating display link; using fallback rendering err={}", .{err});
-                    return;
-                };
-                result.setOutputCallback(
+                const result = DisplayLink.create(
+                    self.alloc,
                     xev.Async,
                     &displayLinkCallback,
                     callback,
                 ) catch |err| {
-                    log.warn("error configuring display link err={}", .{err});
-                    result.release();
+                    // A locked macOS session can temporarily have no active
+                    // displays. Rendering continues without vsync and the
+                    // next call to this function tries again.
+                    log.warn("error creating display link; using fallback rendering err={}", .{err});
                     return;
                 };
 
                 self.display_link = result;
+                // term-mesh fork: bind to the display the surface was
+                // created on until the embedder reports another one.
+                if (display_id == null) result.setDisplay(self.initial_display_id);
                 log.info("created display link", .{});
                 break :display_link result;
             };
 
-            if (display_id) |id| {
-                log.info("updating display link display id={}", .{id});
-                display_link.setCurrentCGDisplay(id) catch |err| {
-                    log.warn("error setting display link display id err={}", .{err});
-                };
-            }
+            if (display_id) |id| display_link.setDisplay(id);
 
             // If we're not visible, then we want to stop the display link
             // because it is a waste of resources and we can move to pure
             // change-driven updates.
-            if (self.visible and self.focused) {
-                display_link.start() catch {};
-            } else {
-                display_link.stop() catch {};
-            }
+            // The start or stop itself happens on the main thread; see
+            // `renderer/DisplayLink.zig`.
+            display_link.setRunning(self.visible and self.focused);
         }
 
         /// Set the new font grid.
@@ -4009,7 +3999,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 @intCast(cp.codepoint),
                 .regular,
                 .text,
-                .{ .grid_metrics = self.grid_metrics },
+                .{
+                    .grid_metrics = self.grid_metrics,
+                    .thicken = self.config.font_thicken,
+                    .thicken_strength = self.config.font_thicken_strength,
+                },
             ) catch |err| {
                 log.warn("error rendering preedit glyph err={}", .{err});
                 return;
